@@ -17,6 +17,33 @@ from diff_gaussian_rasterization_residual import GaussianRasterizationSettings_R
 from diff_gaussian_rasterization_fast import GaussianRasterizationSettings_Fast, GaussianRasterizer_Fast
 from scene.gaussian_model import GaussianModel
 from utils.pose_utils import get_camera_from_tensor, quadmultiply
+from utils.sg_utils import evaluate_spherical_gaussians
+
+
+def _compute_illumination(feat, ob_view, ob_dist, cat_with_dist, cat_without_dist, pc: GaussianModel):
+    if pc.illumination_mode == "sg" and pc.use_sg_illumination and pc.sg_illumination_available:
+        sg_input = cat_with_dist if pc.add_illumination_dist else cat_without_dist
+        sg_raw = pc.get_sg_illumination_mlp(sg_input)
+        illumination, sg_stats = evaluate_spherical_gaussians(
+            sg_raw,
+            ob_view,
+            pc.n_offsets,
+            pc.sg_lobes,
+            pc.sg_lambda_min,
+        )
+        illumination_feat = illumination.view(feat.shape[0], pc.n_offsets)
+        return illumination, illumination_feat, sg_stats
+
+    if pc.illumination_mode != "legacy":
+        raise RuntimeError("SG illumination is required for the active decomposition mode.")
+
+    if pc.add_illumination_dist:
+        illumination_feat = pc.get_illumination_mlp(cat_with_dist)
+    else:
+        illumination_feat = pc.get_illumination_mlp(cat_without_dist)
+    illumination = torch.nn.Sigmoid()(illumination_feat)
+    illumination = illumination.reshape([feat.shape[0] * pc.n_offsets, 1])
+    return illumination, illumination_feat, None
 
 
 
@@ -56,8 +83,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
 
     cat_local_view = torch.cat([feat, ob_view, ob_dist], dim=1) # [N, c+3+1]
     cat_local_view_wodist = torch.cat([feat, ob_view], dim=1) # [N, c+3]
-    cat_local_view_woview = torch.cat([feat, ob_dist], dim=1) # [N, c+1]
-    cat_local_view_woview_wodist = torch.cat([feat], dim=1) # [N, c]
+    reflectance_base = pc.get_reflectance[visible_mask]
 
     ## for illumination
     cat_local_view_illumination = torch.cat([feat[:, pc.feat_dim//2:], ob_view, ob_dist], dim=1) # [N, c+3+1]
@@ -110,14 +136,14 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
 
     # else:
         # noise = pc.get_noise_net(cat_local_view)
-    if pc.add_illumination_dist:
-        illumination_feat = pc.get_illumination_mlp(cat_local_view_illumination)
-        illumination = torch.nn.Sigmoid()(illumination_feat)
-
-    else:
-        
-        illumination_feat = pc.get_illumination_mlp(cat_local_view_illumination_wodist)
-        illumination = torch.nn.Sigmoid()(illumination_feat)
+    illumination, illumination_feat, sg_stats = _compute_illumination(
+        feat,
+        ob_view,
+        ob_dist,
+        cat_local_view_illumination,
+        cat_local_view_illumination_wodist,
+        pc,
+    )
     illumination_enhanced = pc.get_enhancement_net(torch.cat([feat.detach(), illumination_feat.detach()], dim=1))
     if pc.use_residual and pc.appearance_residual_dim>0:
         if pc.add_residual_dist:
@@ -131,12 +157,15 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
         else:
             color_residual = pc.get_residual_net(cat_local_view_wodist_residual)
         color_residual = color_residual.reshape([anchor.shape[0]*pc.n_offsets_residual, 3]) # [mask]
-    # get offset's reflectance
-
-    if pc.add_reflectance_dist:
-        reflectance = pc.get_reflectance_mlp(cat_local_view_woview)
+    if pc.legacy_compatibility_mode:
+        cat_local_view_woview = torch.cat([feat, ob_dist], dim=1) # [N, c+1]
+        cat_local_view_woview_wodist = torch.cat([feat], dim=1) # [N, c]
+        if pc.add_reflectance_dist:
+            reflectance = pc.mlp_reflectance(cat_local_view_woview)
+        else:
+            reflectance = pc.mlp_reflectance(cat_local_view_woview_wodist)
     else:
-        reflectance = pc.get_reflectance_mlp(cat_local_view_woview_wodist)
+        reflectance = repeat(reflectance_base, 'n c -> (n k) c', k=pc.n_offsets)
 
     # color = illumination.repeat(1, 1, 3) * reflectance
     # color = color.reshape([anchor.shape[0]*pc.n_offsets, 3])# [mask] 
@@ -224,9 +253,9 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     # feat_downsampled = feat_repeated.detach()
 
     if is_training:
-        return xyz, reflectance, illumination, illumination_enhanced, opacity, scaling, rot, neural_opacity, mask, xyz_residual, color_residual, scaling_residual, rot_residual, opacity_residual
+        return xyz, reflectance, illumination, illumination_enhanced, opacity, scaling, rot, neural_opacity, mask, xyz_residual, color_residual, scaling_residual, rot_residual, opacity_residual, sg_stats
     else:
-        return xyz, reflectance, illumination, illumination_enhanced, opacity, scaling, rot, xyz_residual, color_residual, scaling_residual, rot_residual, opacity_residual
+        return xyz, reflectance, illumination, illumination_enhanced, opacity, scaling, rot, xyz_residual, color_residual, scaling_residual, rot_residual, opacity_residual, sg_stats
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, kernel_size: float, scaling_modifier = 1.0, visible_mask=None, retain_grad=False, camera_pose=None):
     """
@@ -238,9 +267,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # is_enhancing = pc.render_enhancement
         
     if is_training:
-        xyz, reflectance, illumination, illumination_enhanced, opacity, scaling, rot, neural_opacity, mask, xyz_residual, color_residual, scaling_residual, rot_residual, opacity_residual = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
+        xyz, reflectance, illumination, illumination_enhanced, opacity, scaling, rot, neural_opacity, mask, xyz_residual, color_residual, scaling_residual, rot_residual, opacity_residual, sg_stats = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
     else:
-        xyz, reflectance, illumination, illumination_enhanced, opacity, scaling, rot, xyz_residual, color_residual, scaling_residual, rot_residual, opacity_residual = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
+        xyz, reflectance, illumination, illumination_enhanced, opacity, scaling, rot, xyz_residual, color_residual, scaling_residual, rot_residual, opacity_residual, sg_stats = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
     
     # print("ill_shape:", illumination.shape)
     # print("ref_shape:", reflectance.shape)
@@ -488,7 +517,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                     "selection_mask": mask,
                     "neural_opacity": neural_opacity,
                     "scaling": scaling,
-                    "scaling_residual":scaling_residual
+                    "scaling_residual":scaling_residual,
+                    "sg_stats": sg_stats,
                     }
         else:
             return {"render": rendered_reflectance * rendered_illumination,
@@ -505,6 +535,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                     "viewspace_points": screenspace_points,
                     "visibility_filter" : radii > 0,
                     "radii": radii,
+                    "sg_stats": sg_stats,
                     }
 
     # rendered_image, radii, depth_map = rasterizer(
@@ -619,6 +650,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 "selection_mask": mask,
                 "neural_opacity": neural_opacity,
                 "scaling": scaling,
+                "sg_stats": sg_stats,
                 }
     else:
         return {"render": rendered_reflectance * rendered_illumination,
@@ -633,6 +665,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 "viewspace_points": screenspace_points,
                 "visibility_filter" : radii > 0,
                 "radii": radii,
+                "sg_stats": sg_stats,
                 }
 
 
@@ -659,10 +692,10 @@ def generate_neural_gaussians_fast(viewpoint_camera, pc : GaussianModel, visible
     # cat_local_view = torch.cat([feat, ob_view, ob_dist], dim=1) # [N, c+3+1]
     cat_local_view_wodist = torch.cat([feat, ob_view], dim=1) # [N, c+3]
     # cat_local_view_woview = torch.cat([feat, ob_dist], dim=1) # [N, c+1]
-    cat_local_view_woview_wodist = torch.cat([feat], dim=1) # [N, c]
+    reflectance_base = pc.get_reflectance[visible_mask]
 
     ## for illumination
-    # cat_local_view_illumination = torch.cat([feat[:, pc.feat_dim//2:], ob_view, ob_dist], dim=1) # [N, c+3+1]
+    cat_local_view_illumination = torch.cat([feat[:, pc.feat_dim//2:], ob_view, ob_dist], dim=1) # [N, c+3+1]
     cat_local_view_illumination_wodist = torch.cat([feat[:, pc.feat_dim//2:], ob_view], dim=1) # [N, c+3]
 
 
@@ -687,14 +720,22 @@ def generate_neural_gaussians_fast(viewpoint_camera, pc : GaussianModel, visible
 
 
 
-    illumination_feat = pc.get_illumination_mlp(cat_local_view_illumination_wodist)
-    illumination = torch.nn.Sigmoid()(illumination_feat)
+    illumination, illumination_feat, sg_stats = _compute_illumination(
+        feat,
+        ob_view,
+        ob_dist,
+        cat_local_view_illumination,
+        cat_local_view_illumination_wodist,
+        pc,
+    )
     illumination_enhanced = pc.get_enhancement_net(torch.cat([feat.detach(), illumination_feat.detach()], dim=1))
 
 
-    # get offset's reflectance
-
-    reflectance = pc.get_reflectance_mlp(cat_local_view_woview_wodist)
+    if pc.legacy_compatibility_mode:
+        cat_local_view_woview_wodist = torch.cat([feat], dim=1) # [N, c]
+        reflectance = pc.mlp_reflectance(cat_local_view_woview_wodist)
+    else:
+        reflectance = repeat(reflectance_base, 'n c -> (n k) c', k=pc.n_offsets)
 
     # color = illumination.repeat(1, 1, 3) * reflectance
     # color = color.reshape([anchor.shape[0]*pc.n_offsets, 3])# [mask] 
@@ -732,9 +773,9 @@ def generate_neural_gaussians_fast(viewpoint_camera, pc : GaussianModel, visible
 
 
     if is_training:
-        return xyz, reflectance*illumination_enhanced, opacity, scaling, rot, neural_opacity, mask
+        return xyz, reflectance*illumination_enhanced, opacity, scaling, rot, neural_opacity, mask, sg_stats
     else:
-        return xyz, reflectance*illumination_enhanced, opacity, scaling, rot
+        return xyz, reflectance*illumination_enhanced, opacity, scaling, rot, sg_stats
 
 def render_fast(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, kernel_size: float, scaling_modifier = 1.0, visible_mask=None, retain_grad=False, camera_pose=None):
     """
@@ -743,9 +784,10 @@ def render_fast(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Ten
     Background tensor (bg_color) must be on GPU!
     """
     is_training = False
+    previous_use_residual = pc.use_residual
     pc.use_residual = False
-
-    xyz, color, opacity, scaling, rot = generate_neural_gaussians_fast(viewpoint_camera, pc, visible_mask, is_training=is_training)
+    xyz, color, opacity, scaling, rot, sg_stats = generate_neural_gaussians_fast(viewpoint_camera, pc, visible_mask, is_training=is_training)
+    pc.use_residual = previous_use_residual
     
     # print("ill_shape:", illumination.shape)
     # print("ref_shape:", reflectance.shape)
@@ -825,7 +867,7 @@ def render_fast(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Ten
         rotations = gaussians_rot_trans,
         cov3D_precomp = None)  
        
-    return {"render": rendering}
+    return {"render": rendering, "sg_stats": sg_stats}
 
 
 

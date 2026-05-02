@@ -11,8 +11,14 @@
 
 import os
 import numpy as np
+import sys
+import importlib.util
 
 import subprocess
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
 cmd = 'nvidia-smi -q -d Memory |grep -A4 GPU|grep Used'
 result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).stdout.decode().split('\n')
 os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in result[:-1]]))
@@ -30,7 +36,6 @@ from os import makedirs
 import shutil, pathlib
 from pathlib import Path
 from PIL import Image
-import sys
 import torchvision.transforms.functional as tf
 
 sys.modules['torchvision.transforms.functional_tensor'] = tf
@@ -41,7 +46,7 @@ sys.path.append("./submodules/Depth-Anything-V2")
 # from lpipsPyTorch import lpips
 import lpips
 from random import randint
-from utils.loss_utils import l1_loss, ssim, l1_plus_loss, L_Smooth, L_Illu, L_Gray, L_Depth_similarity, L_Reflectance_Smooth, L_Depth_Smooth, pearson_depth_loss
+from utils.loss_utils import l1_loss, ssim, l1_plus_loss, L_Smooth, L_Illu, L_Gray, L_Depth_similarity, L_Reflectance_Smooth, L_Depth_Smooth, pearson_depth_loss, L_Reflectance_Consistency, L_SG_Energy, L_SG_Sharpness
 from gaussian_renderer import prefilter_voxel, render, network_gui
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -49,13 +54,25 @@ import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr, Camera_Reprojection, Camera_Reprojection_inverse
 from argparse import ArgumentParser, Namespace
-from arguments import ModelParams, PipelineParams, OptimizationParams
 from utils.visualize_utils import minmax_normalize, visualize_camera_trajectories, visualize_anchor_with_camera, visualize_heatmap, plot_point_cloud_projection, visualize_cmap
 import numpy as np
 import cv2
 from utils.pose_utils import save_pose, load_pose
 from torchvision import transforms
 import matplotlib.cm as cm
+
+try:
+    from arguments import ModelParams, PipelineParams, OptimizationParams
+except ImportError:
+    arguments_path = os.path.join(PROJECT_ROOT, "arguments", "__init__.py")
+    spec = importlib.util.spec_from_file_location("arguments", arguments_path)
+    arguments_module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules["arguments"] = arguments_module
+    spec.loader.exec_module(arguments_module)
+    ModelParams = arguments_module.ModelParams
+    PipelineParams = arguments_module.PipelineParams
+    OptimizationParams = arguments_module.OptimizationParams
 
 from depth_anything_v2.dpt import DepthAnythingV2
 from utils.StableSR_utlis import get_SRModel,SD_refine
@@ -153,7 +170,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     tb_writer = prepare_output_and_logger(dataset)
 
     gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
-                              dataset.appearance_residual_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_reflectance_dist, dataset.add_illumination_dist, dataset.add_residual_dist, dataset.use_residual, dataset.use_3D_filter)
+                              dataset.appearance_residual_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_reflectance_dist, dataset.add_illumination_dist, dataset.add_residual_dist, dataset.use_residual, dataset.use_3D_filter,
+                              use_sg_illumination=dataset.use_sg_illumination, illumination_mode=dataset.illumination_mode, sg_lobes=dataset.sg_lobes, sg_lambda_min=dataset.sg_lambda_min)
     depth_piror_model = depth_piror_Model()
     if mode == "warmuped":
         scene = Scene(dataset, gaussians, depth_piror_model, ply_path=ply_path, shuffle=False, load_iteration=-1 , only_ply=True)
@@ -314,7 +332,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         t1 = time.time()
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe,background, dataset.kernel_size, camera_pose=pose)
         retain_grad = (iteration < opt.update_until and iteration >= 0)
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background, kernel_size=dataset.kernel_size, visible_mask=voxel_visible_mask, retain_grad=retain_grad, camera_pose=pose)  
+        render_pkg = render(viewpoint_cam, gaussians, pipe, background, kernel_size=dataset.kernel_size, visible_mask=voxel_visible_mask, retain_grad=retain_grad, camera_pose=pose)
         timing_stats['render_time'] = timing_stats.get('render_time', 0) + (time.time() - t1)
 
         t1 = time.time()
@@ -342,29 +360,38 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         Ll1 = torch.abs(Ll1_value).mean()
         L_smooth =  L_Smooth(illumination_image, gt_image, kernel_size=9) * 1e-3
         L_illu = L_Illu(gt_image, illumination_image) 
+        L_reflectance_smooth = L_Reflectance_Smooth(reflectance_image, illumination_image) * 5e-4
         L_depth_similarity = (L_Depth_similarity(1 - minmax_normalize(depth_image).squeeze(0), depth_piror_norm.squeeze(0), 128, 0.5) ) * 0.15
         
         if FUSED_SSIM_AVAILABLE:
-            ssim_loss = fused_ssim((reflectance_image * illumination_image).unsqueeze(0), gt_image.unsqueeze(0))
+            ssim_loss = fused_ssim(image_tmp.unsqueeze(0), gt_image.unsqueeze(0))
         else:
-            ssim_loss = ssim(reflectance_image * illumination_image, gt_image)
+            ssim_loss = ssim(image_tmp, gt_image)
         ssim_loss = 1.0 - ssim_loss
         scaling_reg = scaling.prod(dim=1).mean()
+        sg_stats = render_pkg.get("sg_stats")
+        L_sg_energy = L_SG_Energy(sg_stats)
+        L_sg_sharpness = L_SG_Sharpness(sg_stats)
+        L_reflectance_consistency = L_Reflectance_Consistency(reflectance_image)
 
         if torch.isnan(scaling_reg) or torch.isinf(scaling_reg):
             print("Warning: scaling_reg is nan or inf")
             print("scaling_reg:", scaling_reg.item())
 
         if mode == "warmup":
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + L_illu + 0.01 * scaling_reg 
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + L_illu + 0.01 * scaling_reg
             if iteration >= opt.update_from:
                 loss += L_smooth * 0.1 +  L_depth_similarity 
+            loss += dataset.reflectance_consistency_reg * (L_reflectance_consistency + L_reflectance_smooth)
         else:
             loss = (1.0 - opt.lambda_dssim ) * Ll1 + opt.lambda_dssim *  ssim_loss + L_illu + 0.01 * scaling_reg  
 
             
             if iteration >= opt.update_from:
                 loss +=  L_smooth + L_depth_similarity
+                loss += dataset.sg_energy_reg * L_sg_energy
+                loss += dataset.sg_smooth_reg * L_sg_sharpness
+                loss += dataset.reflectance_consistency_reg * (L_reflectance_consistency + L_reflectance_smooth)
 
             L_diff = 0
             if iteration >= opt.update_from:
@@ -376,7 +403,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 loss += L_diff
             if dataset.use_residual:
                 scaling_residual_reg = scaling_residual.prod(dim=1).mean()
-                L_residual_reg = torch.mean(residual_image) * weight_scheduler(iteration)  
+                L_residual_reg = torch.mean(torch.abs(residual_image)) * weight_scheduler(iteration)
                 loss += L_residual_reg + 0.05 * scaling_residual_reg 
  
         timing_stats['loss_time'] = timing_stats.get('loss_time', 0) + (time.time() - t2)
@@ -392,16 +419,32 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         with torch.no_grad():
 
             if mode=="warmup" or not dataset.use_residual:
-                wandb.log({'loss':loss, 'iteration':iteration})
+                wandb.log({'loss':loss, 'iteration':iteration,
+                           'illumination_mean': illumination_image.mean(),
+                           'sg_energy': L_sg_energy,
+                           'sg_lambda_mean': L_sg_sharpness,
+                           'reflectance_consistency': L_reflectance_consistency})
             else:
-                wandb.log({'loss':loss, 'iteration':iteration})
+                wandb.log({'loss':loss, 'iteration':iteration,
+                           'illumination_mean': illumination_image.mean(),
+                           'sg_energy': L_sg_energy,
+                           'sg_lambda_mean': L_sg_sharpness,
+                           'reflectance_consistency': L_reflectance_consistency})
             if (iteration - 1) % 600 == 0:
                 gt_image = torch.clamp(gt_image * enhance_ratio, 0.0, 1.0)
                 image = torch.clamp(image_tmp * enhance_ratio, 0.0, 1.0)
                 enhanced_image = torch.clamp(reflectance_image * illumination_image * enhance_ratio, 0.0, 1.0)
                 illumination_image = torch.clamp(illumination_image * enhance_ratio, 0.0, 1.0)
-                if not dataset.use_residual or mode=="warmup" : residual_image = torch.zeros_like(image)
-                residual_image = torch.clamp(residual_image * enhance_ratio, 0.0, 1.0)
+                if not dataset.use_residual or mode=="warmup":
+                    residual_image = torch.zeros_like(image)
+                residual_scaled = residual_image * enhance_ratio
+                residual_image_raw = torch.clamp(residual_scaled, 0.0, 1.0)
+                residual_abs = residual_scaled.abs()
+                residual_abs_max = residual_abs.max()
+                if residual_abs_max.item() > 0:
+                    residual_image_vis = residual_abs / (residual_abs_max + 1e-6)
+                else:
+                    residual_image_vis = torch.zeros_like(residual_abs)
                 enhanced_image_pil = torchvision.transforms.ToPILImage()(enhanced_image)
                 
 
@@ -409,7 +452,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         'gt_image':wandb.Image(torchvision.transforms.ToPILImage()(gt_image)),
                         'image':wandb.Image(torchvision.transforms.ToPILImage()(image)),
                         'depth':wandb.Image(1-minmax_normalize(depth_image)),
-                        'residual_image':wandb.Image(torchvision.transforms.ToPILImage()(residual_image)),
+                        'residual_image':wandb.Image(torchvision.transforms.ToPILImage()(residual_image_vis)),
+                        'residual_image_raw':wandb.Image(torchvision.transforms.ToPILImage()(residual_image_raw)),
+                        'residual_abs_mean': residual_abs.mean(),
                         'illumination':wandb.Image(torchvision.transforms.ToPILImage()(illumination_image)),
                         'reflectance':wandb.Image(torchvision.transforms.ToPILImage()(reflectance_image)),
                         'depth_piror_image':wandb.Image(torchvision.transforms.ToPILImage()(depth_piror_norm)),
@@ -423,7 +468,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             if iteration % 600 == 0:
                 print("reflectance_image", reflectance_image.mean())
                 print("illumination_image", illumination_image.mean())
-                print("residual_image", residual_image.mean())
+                print("sg_energy", L_sg_energy)
+                print("sg_lambda_mean", L_sg_sharpness)
+                print("residual_image_raw_mean", residual_image_raw.mean())
+                print("residual_abs_mean", residual_abs.mean())
                 print("image", image.mean())
                 print("gt_image", gt_image.mean())
 
@@ -433,9 +481,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
             if iteration % 10 == 0:
                 if mode=="warmup" or not dataset.use_residual:
-                    progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{4}f}","L1": f"{Ll1:.{4}f}", "L_smooth": f"{L_smooth:.{5}f}","L_depth_similarity": f"{L_depth_similarity:.{5}f}"})
+                    progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{4}f}","L1": f"{Ll1:.{4}f}", "L_smooth": f"{L_smooth:.{5}f}","L_depth_similarity": f"{L_depth_similarity:.{5}f}", "L_sg": f"{L_sg_energy:.{5}f}"})
                 else:
-                    progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{4}f}","L1": f"{Ll1:.{4}f}", "L_illu": f"{L_illu:.{5}f}", "L_smooth": f"{L_smooth:.{5}f}","L_depth_similarity": f"{L_depth_similarity:.{5}f}", "L_residual_reg": f"{L_residual_reg:.{5}f}"})
+                    progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{4}f}","L1": f"{Ll1:.{4}f}", "L_illu": f"{L_illu:.{5}f}", "L_smooth": f"{L_smooth:.{5}f}","L_depth_similarity": f"{L_depth_similarity:.{5}f}", "L_residual_reg": f"{L_residual_reg:.{5}f}", "L_sg": f"{L_sg_energy:.{5}f}"})
                 progress_bar.update(10)
             
 
@@ -800,7 +848,8 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
     with torch.no_grad():
 
         gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
-                                dataset.appearance_residual_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_reflectance_dist, dataset.add_illumination_dist, dataset.add_residual_dist, dataset.use_residual, dataset.use_3D_filter)
+                                dataset.appearance_residual_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_reflectance_dist, dataset.add_illumination_dist, dataset.add_residual_dist, dataset.use_residual, dataset.use_3D_filter,
+                                use_sg_illumination=dataset.use_sg_illumination, illumination_mode=dataset.illumination_mode, sg_lobes=dataset.sg_lobes, sg_lambda_min=dataset.sg_lambda_min)
         scene = Scene(dataset, gaussians, depth_piror_model=None, load_iteration=iteration, shuffle=False)
         # gaussians.train()
         gaussians.eval()

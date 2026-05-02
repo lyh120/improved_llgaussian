@@ -183,6 +183,25 @@ def L_Reflectance_Smooth(reflectance_image, illumination_image):
 
     return grad_image.mean()
 
+
+def L_Reflectance_Consistency(reflectance_image):
+    """Encourage locally stable reflectance so low-light noise stays in illumination."""
+    grad_x = torch.abs(reflectance_image[:, :-1, :-1] - reflectance_image[:, 1:, :-1])
+    grad_y = torch.abs(reflectance_image[:, :-1, :-1] - reflectance_image[:, :-1, 1:])
+    return torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-10).mean()
+
+
+def L_SG_Energy(sg_stats):
+    if not sg_stats or "sg_energy" not in sg_stats:
+        return torch.tensor(0.0, device="cuda")
+    return sg_stats["sg_energy"]
+
+
+def L_SG_Sharpness(sg_stats):
+    if not sg_stats or "sg_lambda_mean" not in sg_stats:
+        return torch.tensor(0.0, device="cuda")
+    return sg_stats["sg_lambda_mean"]
+
 def L_Feat_Smooth(feature_image, image, mask, depth_image):
     image = image.detach()
     # 将图像转换为灰度图像

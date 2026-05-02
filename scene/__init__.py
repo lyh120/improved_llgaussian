@@ -1,4 +1,4 @@
-#
+﻿#
 # Copyright (C) 2023, Inria
 # GRAPHDECO research group, https://team.inria.fr/graphdeco
 # All rights reserved.
@@ -12,14 +12,29 @@
 import os
 import random
 import json
+import importlib.util
+import sys
+import torch
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
-from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 import cv2
 from utils.visualize_utils import minmax_normalize, visualize_anchor
 from utils.pose_utils import load_pose
+
+
+try:
+    from arguments import ModelParams
+except ImportError:
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    arguments_path = os.path.join(project_root, "arguments", "__init__.py")
+    spec = importlib.util.spec_from_file_location("arguments", arguments_path)
+    arguments_module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules["arguments"] = arguments_module
+    spec.loader.exec_module(arguments_module)
+    ModelParams = arguments_module.ModelParams
 
 class Scene:
 
@@ -125,14 +140,22 @@ class Scene:
     
     def depth_piror_generator(self, source_path):
         depth_piror_dict = dict()
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         for camera in self.getTrainCameras().copy():
             gt_path = os.path.join(source_path, 'images', camera.image_name + '.*')
             import glob
-            gt_path = glob.glob(gt_path)[0]  # 获取匹配的第一个文件路径
+            gt_path = glob.glob(gt_path)[0]
             gt_image = cv2.imread(gt_path)
-            depth_piror = self.depth_piror_model.infer_image(gt_image).unsqueeze(0)
+            depth_piror = self.depth_piror_model.infer_image(gt_image)
+            if not isinstance(depth_piror, torch.Tensor):
+                depth_piror = torch.as_tensor(depth_piror, dtype=torch.float32)
+            else:
+                depth_piror = depth_piror.float()
+            if depth_piror.ndim == 2:
+                depth_piror = depth_piror.unsqueeze(0)
+            depth_piror = depth_piror.to(device)
             idx = camera.uid
             depth_piror_dict[idx] = minmax_normalize(depth_piror)
-            # depth_piror_dict[idx] = depth_piror
         return depth_piror_dict
     
+

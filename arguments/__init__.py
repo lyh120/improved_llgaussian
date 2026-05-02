@@ -82,6 +82,13 @@ class ModelParams(ParamGroup):
         self.add_residual_dist = False
         self.use_residual = False
         self.use_3D_filter = False
+        self.use_sg_illumination = True
+        self.illumination_mode = "sg"
+        self.sg_lobes = 4
+        self.sg_lambda_min = 1.0
+        self.sg_energy_reg = 1e-4
+        self.sg_smooth_reg = 1e-4
+        self.reflectance_consistency_reg = 1e-4
         self.prune_ratio = 0.05
         self.beta = 1.0
         
@@ -177,6 +184,31 @@ class OptimizationParams(ParamGroup):
 
         super().__init__(parser, "Optimization Parameters")
 
+
+def _backfill_model_compatibility(merged_dict):
+    """Fill newly introduced model arguments and map legacy names."""
+    legacy_to_new = {
+        "num_sg": "sg_lobes",
+        "use_sg": "use_sg_illumination",
+    }
+    for legacy_key, new_key in legacy_to_new.items():
+        if new_key not in merged_dict and legacy_key in merged_dict:
+            merged_dict[new_key] = merged_dict[legacy_key]
+
+    defaults = {
+        "use_sg_illumination": True,
+        "illumination_mode": "sg",
+        "sg_lobes": 4,
+        "sg_lambda_min": 1.0,
+        "sg_energy_reg": 1e-4,
+        "sg_smooth_reg": 1e-4,
+        "reflectance_consistency_reg": 1e-4,
+    }
+    for key, value in defaults.items():
+        merged_dict.setdefault(key, value)
+
+    return merged_dict
+
 def get_combined_args(parser : ArgumentParser):
     cmdlne_string = sys.argv[1:]
     cfgfile_string = "Namespace()"
@@ -197,4 +229,5 @@ def get_combined_args(parser : ArgumentParser):
     for k,v in vars(args_cmdline).items():
         if v != None:
             merged_dict[k] = v
+    merged_dict = _backfill_model_compatibility(merged_dict)
     return Namespace(**merged_dict)

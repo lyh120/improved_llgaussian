@@ -85,6 +85,10 @@ class GaussianModel:
                  use_residual : bool = False,
                  use_3D_filter : bool = False,
                  use_undependent_illumination : bool = False,
+                 use_sg_illumination: bool = True,
+                 illumination_mode: str = "sg",
+                 sg_lobes: int = 4,
+                 sg_lambda_min: float = 1.0,
                  ):
 
         self.feat_dim = feat_dim
@@ -107,6 +111,12 @@ class GaussianModel:
         self.use_3D_filter = use_3D_filter
 
         self.use_undependent_illumination = use_undependent_illumination
+        self.use_sg_illumination = use_sg_illumination
+        self.illumination_mode = illumination_mode
+        self.sg_lobes = sg_lobes
+        self.sg_lambda_min = sg_lambda_min
+        self.sg_illumination_available = use_sg_illumination
+        self.legacy_compatibility_mode = illumination_mode == "legacy"
         
         ## residual
         self.use_residual = use_residual
@@ -116,6 +126,7 @@ class GaussianModel:
         self._anchor = torch.empty(0)
         self._offset = torch.empty(0)
         self._anchor_feat = torch.empty(0)
+        self._base_log_reflectance = torch.empty(0)
 
         
         self.opacity_accum = torch.empty(0)
@@ -181,7 +192,7 @@ class GaussianModel:
                 nn.ReLU(True),
                 nn.Linear(feat_dim, 7*self.n_offsets_residual),
             ).cuda()
-        self.reflectance_dist_dim = 1 if self.add_reflectance_dist else 0 # take distant as input or not
+        self.reflectance_dist_dim = 1 if self.add_reflectance_dist else 0 # legacy only
         self.mlp_reflectance = nn.Sequential(
             nn.Linear(feat_dim + self.reflectance_dist_dim, feat_dim),
             nn.ReLU(),
@@ -193,6 +204,11 @@ class GaussianModel:
             nn.Linear(feat_dim// 2+3+self.illumination_dist_dim, feat_dim // 2),
             nn.ReLU(True),
             nn.Linear(feat_dim// 2, 1*self.n_offsets)
+        ).cuda()
+        self.mlp_sg_illumination = nn.Sequential(
+            nn.Linear(feat_dim// 2+3+self.illumination_dist_dim, feat_dim // 2),
+            nn.ReLU(True),
+            nn.Linear(feat_dim // 2, self.n_offsets * self.sg_lobes * 5)
         ).cuda()
         if self.use_residual:
             self.residual_dist_dim = 1 if self.add_residual_dist else 0 # take distant as input or not
@@ -214,8 +230,10 @@ class GaussianModel:
         self.mlp_opacity.eval()
         self.mlp_cov.eval()
         # self.mlp_color.eval()
-        self.mlp_illumination.eval()
-        self.mlp_reflectance.eval()
+        if self.illumination_mode == "legacy":
+            self.mlp_illumination.eval()
+        if self.use_sg_illumination:
+            self.mlp_sg_illumination.eval()
         self.enhancement_net.eval()
         if self.use_residual:
             self.residual_net.eval()
@@ -230,8 +248,10 @@ class GaussianModel:
         self.mlp_opacity.train()
         self.mlp_cov.train()
         # self.mlp_color.train()
-        self.mlp_illumination.train()
-        self.mlp_reflectance.train()
+        if self.illumination_mode == "legacy":
+            self.mlp_illumination.train()
+        if self.use_sg_illumination:
+            self.mlp_sg_illumination.train()
         self.enhancement_net.train()
         if self.use_residual:
             self.residual_net.train()
@@ -246,10 +266,11 @@ class GaussianModel:
         if self.use_residual:
             return (
                 self._anchor,
+                self._anchor_feat,
+                self._base_log_reflectance,
                 self._anchor_feat_residual,
                 self._offset,
                 self._offset_residual,
-                self._local, # ?
                 self._scaling,
                 self._scaling_residual,
                 self._rotation,
@@ -262,8 +283,9 @@ class GaussianModel:
         else:
             return (
                 self._anchor,
+                self._anchor_feat,
+                self._base_log_reflectance,
                 self._offset,
-                self._local, 
                 self._scaling,
                 self._rotation,
                 self._opacity,
@@ -275,38 +297,89 @@ class GaussianModel:
     
     def restore(self, model_args, training_args):
         if self.use_residual:
-            (self.active_sh_degree, 
-            self._anchor, 
-            self._anchor_feat_residual,
-            self._offset,
-            self._offset_residual,
-            self._local,
-            self._scaling, 
-            self._scaling_residual,
-            self._rotation, 
-            self._opacity,
-            self.max_radii2D, 
-            denom,
-            opt_dict, 
-            self.spatial_lr_scale) = model_args
+            has_b0 = len(model_args) == 14
+            if has_b0:
+                (self._anchor,
+                self._anchor_feat,
+                self._base_log_reflectance,
+                self._anchor_feat_residual,
+                self._offset,
+                self._offset_residual,
+                self._scaling,
+                self._scaling_residual,
+                self._rotation,
+                self._opacity,
+                self.max_radii2D,
+                denom,
+                opt_dict,
+                self.spatial_lr_scale) = model_args
+            else:
+                (self._anchor,
+                self._anchor_feat_residual,
+                self._offset,
+                self._offset_residual,
+                _unused_local,
+                self._scaling,
+                self._scaling_residual,
+                self._rotation,
+                self._opacity,
+                self.max_radii2D,
+                denom,
+                opt_dict,
+                self.spatial_lr_scale) = model_args
+                self._anchor_feat = nn.Parameter(
+                    torch.zeros((self._anchor.shape[0], self.feat_dim), device="cuda", dtype=torch.float).requires_grad_(True)
+                )
+                self._base_log_reflectance = nn.Parameter(
+                    torch.zeros((self._anchor.shape[0], 3), device="cuda", dtype=torch.float).requires_grad_(True)
+                )
+                self.illumination_mode = "legacy"
+                self.legacy_compatibility_mode = True
             self.training_setup(training_args)
             self.denom = denom
-            self.optimizer.load_state_dict(opt_dict)
+            try:
+                self.optimizer.load_state_dict(opt_dict)
+            except ValueError:
+                print("Optimizer checkpoint is not compatible with SG parameter groups; optimizer state is reinitialized.")
         else:
-            (self.active_sh_degree, 
-            self._anchor, 
-            self._offset,
-            self._local,
-            self._scaling, 
-            self._rotation, 
-            self._opacity,
-            self.max_radii2D, 
-            denom,
-            opt_dict, 
-            self.spatial_lr_scale) = model_args
+            has_b0 = len(model_args) == 10
+            if has_b0:
+                (self._anchor,
+                self._anchor_feat,
+                self._base_log_reflectance,
+                self._offset,
+                self._scaling,
+                self._rotation,
+                self._opacity,
+                self.max_radii2D,
+                denom,
+                opt_dict,
+                self.spatial_lr_scale) = model_args
+            else:
+                (self._anchor,
+                self._offset,
+                _unused_local,
+                self._scaling,
+                self._rotation,
+                self._opacity,
+                self.max_radii2D,
+                denom,
+                opt_dict,
+                self.spatial_lr_scale) = model_args
+                self._anchor_feat = nn.Parameter(
+                    torch.zeros((self._anchor.shape[0], self.feat_dim), device="cuda", dtype=torch.float).requires_grad_(True)
+                )
+                self._base_log_reflectance = nn.Parameter(
+                    torch.zeros((self._anchor.shape[0], 3), device="cuda", dtype=torch.float).requires_grad_(True)
+                )
+                self.illumination_mode = "legacy"
+                self.legacy_compatibility_mode = True
             self.training_setup(training_args)
             self.denom = denom
-            self.optimizer.load_state_dict(opt_dict)
+            try:
+                self.optimizer.load_state_dict(opt_dict)
+            except ValueError:
+                print("Optimizer checkpoint is not compatible with SG parameter groups; optimizer state is reinitialized.")
 
     def set_appearance_residual(self, num_cameras):
         if self.appearance_residual_dim > 0:
@@ -375,8 +448,12 @@ class GaussianModel:
     #     return self.mlp_color
 
     @property
-    def get_reflectance_mlp(self):
-        return self.mlp_reflectance
+    def get_base_log_reflectance(self):
+        return self._base_log_reflectance
+
+    @property
+    def get_reflectance(self):
+        return torch.exp(self._base_log_reflectance)
 
     @property
     def get_enhancement_net(self):
@@ -385,6 +462,10 @@ class GaussianModel:
     @property
     def get_illumination_mlp(self):
         return self.mlp_illumination
+
+    @property
+    def get_sg_illumination_mlp(self):
+        return self.mlp_sg_illumination
     
     @property
     def get_residual_net(self):
@@ -629,11 +710,13 @@ class GaussianModel:
             anchors_feat_residual = torch.zeros((fused_point_cloud.shape[0], self.feat_dim)).float().cuda()
             offsets_residual = torch.zeros((fused_point_cloud.shape[0], self.n_offsets_residual, 3)).float().cuda()
             scales_residual = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 6) 
+        base_log_reflectance = torch.zeros((fused_point_cloud.shape[0], 3), dtype=torch.float, device="cuda")
 
 
         self._anchor = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._offset = nn.Parameter(offsets.requires_grad_(True))
         self._anchor_feat = nn.Parameter(anchors_feat.requires_grad_(True))
+        self._base_log_reflectance = nn.Parameter(base_log_reflectance.requires_grad_(True))
         if self.use_residual:
             self._anchor_feat_residual = nn.Parameter(anchors_feat_residual.requires_grad_(True))
             self._offset_residual = nn.Parameter(offsets_residual.requires_grad_(True))
@@ -663,6 +746,7 @@ class GaussianModel:
                 {'params': [self._anchor], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "anchor"},
                 {'params': [self._offset], 'lr': training_args.offset_lr_init * self.spatial_lr_scale, "name": "offset"},
                 {'params': [self._anchor_feat], 'lr': training_args.feature_lr, "name": "anchor_feat"},
+                {'params': [self._base_log_reflectance], 'lr': training_args.feature_lr, "name": "base_log_reflectance"},
                 {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
                 {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
                 {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
@@ -670,9 +754,7 @@ class GaussianModel:
                 {'params': self.mlp_opacity.parameters(), 'lr': training_args.mlp_opacity_lr_init, "name": "mlp_opacity"},
                 {'params': self.mlp_feature_bank.parameters(), 'lr': training_args.mlp_featurebank_lr_init, "name": "mlp_featurebank"},
                 {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
-                # {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
-                {'params': self.mlp_reflectance.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_reflectance"},
-                {'params': self.mlp_illumination.parameters(), 'lr': training_args.mlp_color_lr_init , "name": "mlp_illumination"},
+                {'params': self.mlp_sg_illumination.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_sg_illumination"},
                 {'params': self.enhancement_net.parameters(), 'lr': training_args.mlp_enhance_lr_init  , "name": "enhancement_net"},
                 # {'params': self.embedding_appearance.parameters(), 'lr': training_args.appearance_lr_init, "name": "embedding_appearance"},
             ]
@@ -681,15 +763,14 @@ class GaussianModel:
                 {'params': [self._anchor], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "anchor"},
                 {'params': [self._offset], 'lr': training_args.offset_lr_init * self.spatial_lr_scale, "name": "offset"},
                 {'params': [self._anchor_feat], 'lr': training_args.feature_lr, "name": "anchor_feat"},
+                {'params': [self._base_log_reflectance], 'lr': training_args.feature_lr, "name": "base_log_reflectance"},
                 {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
                 {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
                 {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
 
                 {'params': self.mlp_opacity.parameters(), 'lr': training_args.mlp_opacity_lr_init, "name": "mlp_opacity"},
                 {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
-                # {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
-                {'params': self.mlp_reflectance.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_reflectance"},
-                {'params': self.mlp_illumination.parameters(), 'lr': training_args.mlp_color_lr_init , "name": "mlp_illumination"},
+                {'params': self.mlp_sg_illumination.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_sg_illumination"},
                 {'params': self.enhancement_net.parameters(), 'lr': training_args.mlp_enhance_lr_init , "name": "enhancement_net"},
                 {'params': self.embedding_appearance.parameters(), 'lr': training_args.appearance_lr_init, "name": "embedding_appearance"},
             ]
@@ -698,15 +779,14 @@ class GaussianModel:
                 {'params': [self._anchor], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "anchor"},
                 {'params': [self._offset], 'lr': training_args.offset_lr_init * self.spatial_lr_scale, "name": "offset"},
                 {'params': [self._anchor_feat], 'lr': training_args.feature_lr, "name": "anchor_feat"},
+                {'params': [self._base_log_reflectance], 'lr': training_args.feature_lr, "name": "base_log_reflectance"},
                 {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
                 {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
                 {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
 
                 {'params': self.mlp_opacity.parameters(), 'lr': training_args.mlp_opacity_lr_init, "name": "mlp_opacity"},
                 {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
-                # {'params': self.mlp_color.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_color"},
-                {'params': self.mlp_reflectance.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_reflectance"},
-                {'params': self.mlp_illumination.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_illumination"},
+                {'params': self.mlp_sg_illumination.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_sg_illumination"},
                 {'params': self.enhancement_net.parameters(), 'lr': training_args.mlp_enhance_lr_init  , "name": "enhancement_net"},
             ]
         if self.use_residual:
@@ -746,12 +826,8 @@ class GaussianModel:
         #                                             lr_final=training_args.mlp_color_lr_final,
         #                                             lr_delay_mult=training_args.mlp_color_lr_delay_mult,
         #                                             max_steps=training_args.mlp_color_lr_max_steps)
-        self.mlp_reflectance_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_color_lr_init ,
+        self.mlp_sg_illumination_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_color_lr_init,
                                                     lr_final=training_args.mlp_color_lr_final,
-                                                    lr_delay_mult=training_args.mlp_color_lr_delay_mult,
-                                                    max_steps=training_args.mlp_color_lr_max_steps)
-        self.mlp_illumination_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_color_lr_init ,
-                                                    lr_final=training_args.mlp_color_lr_final ,
                                                     lr_delay_mult=training_args.mlp_color_lr_delay_mult,
                                                     max_steps=training_args.mlp_color_lr_max_steps)
         self.enhancement_net_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_enhance_lr_init ,
@@ -807,11 +883,8 @@ class GaussianModel:
             # if param_group["name"] == "mlp_color":
             #     lr = self.mlp_color_scheduler_args(iteration)
             #     param_group['lr'] = lr
-            if param_group["name"] == "mlp_reflectance":
-                lr = self.mlp_reflectance_scheduler_args(iteration)
-                param_group['lr'] = lr
-            if param_group["name"] == "mlp_illumination":
-                lr = self.mlp_illumination_scheduler_args(iteration)
+            if param_group["name"] == "mlp_sg_illumination":
+                lr = self.mlp_sg_illumination_scheduler_args(iteration)
                 param_group['lr'] = lr
             if param_group["name"] == "enhancement_net":
                 lr = self.enhancement_net_scheduler_args(iteration)
@@ -841,7 +914,7 @@ class GaussianModel:
 
     def freeze(self):
         for param_group in self.optimizer.param_groups:
-            if param_group["name"] != "enhancement_net" and param_group["name"] != "mlp_reflectance":
+            if param_group["name"] != "enhancement_net" and param_group["name"] != "base_log_reflectance":
                 param_group['lr'] = 0
 
                 
@@ -853,6 +926,8 @@ class GaussianModel:
             l.append('f_offset_{}'.format(i))
         for i in range(self._anchor_feat.shape[1]):
             l.append('f_anchor_feat_{}'.format(i))
+        for i in range(self._base_log_reflectance.shape[1]):
+            l.append('b0_{}'.format(i))
         l.append('opacity')
         for i in range(self._scaling.shape[1]):
             l.append('scale_{}'.format(i))
@@ -873,6 +948,7 @@ class GaussianModel:
         anchor = self._anchor.detach().cpu().numpy()
         normals = np.zeros_like(anchor)
         anchor_feat = self._anchor_feat.detach().cpu().numpy()
+        base_log_reflectance = self._base_log_reflectance.detach().cpu().numpy()
         offset = self._offset.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
@@ -887,9 +963,9 @@ class GaussianModel:
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(anchor.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((anchor, normals, offset, anchor_feat, opacities, scale, rotation, filter_3D), axis=1)
+        attributes = np.concatenate((anchor, normals, offset, anchor_feat, base_log_reflectance, opacities, scale, rotation, filter_3D), axis=1)
         if self.use_residual:
-            attributes = np.concatenate((anchor, normals, offset, anchor_feat, opacities, scale, rotation, filter_3D, anchor_feat_residual, scale_residual, offset_residual), axis=1)
+            attributes = np.concatenate((anchor, normals, offset, anchor_feat, base_log_reflectance, opacities, scale, rotation, filter_3D, anchor_feat_residual, scale_residual, offset_residual), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -921,6 +997,16 @@ class GaussianModel:
         anchor_feats = np.zeros((anchor.shape[0], len(anchor_feat_names)))
         for idx, attr_name in enumerate(anchor_feat_names):
             anchor_feats[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32)
+        b0_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("b0_")]
+        b0_names = sorted(b0_names, key = lambda x: int(x.split('_')[-1]))
+        if len(b0_names) > 0:
+            base_log_reflectance = np.zeros((anchor.shape[0], len(b0_names)))
+            for idx, attr_name in enumerate(b0_names):
+                base_log_reflectance[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32)
+        else:
+            base_log_reflectance = np.zeros((anchor.shape[0], 3), dtype=np.float32)
+            self.illumination_mode = "legacy"
+            self.legacy_compatibility_mode = True
 
         offset_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_offset")]
         offset_names = sorted(offset_names, key = lambda x: int(x.split('_')[-1]))
@@ -954,6 +1040,7 @@ class GaussianModel:
             
 
         self._anchor_feat = nn.Parameter(torch.tensor(anchor_feats, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._base_log_reflectance = nn.Parameter(torch.tensor(base_log_reflectance, dtype=torch.float, device="cuda").requires_grad_(True))
 
         self._offset = nn.Parameter(torch.tensor(offsets, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._anchor = nn.Parameter(torch.tensor(anchor, dtype=torch.float, device="cuda").requires_grad_(True))
@@ -1091,6 +1178,7 @@ class GaussianModel:
         self._anchor = optimizable_tensors["anchor"]
         self._offset = optimizable_tensors["offset"]
         self._anchor_feat = optimizable_tensors["anchor_feat"]
+        self._base_log_reflectance = optimizable_tensors["base_log_reflectance"]
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
@@ -1166,6 +1254,14 @@ class GaussianModel:
                 new_feat = self._anchor_feat.unsqueeze(dim=1).repeat([1, self.n_offsets, 1]).view([-1, self.feat_dim])[candidate_mask]
             
                 new_feat = scatter_max(new_feat, inverse_indices.unsqueeze(1).expand(-1, new_feat.size(1)), dim=0)[0][remove_duplicates] # ues the big grad anchors to grow the new feature of the new anchors
+                new_base_log_reflectance = torch.zeros((candidate_anchor.shape[0], 3), dtype=torch.float, device="cuda")
+                if candidate_mask.any():
+                    repeated_b0 = self._base_log_reflectance.unsqueeze(dim=1).repeat([1, self.n_offsets, 1]).view([-1, 3])[candidate_mask]
+                    new_base_log_reflectance = scatter_max(
+                        repeated_b0,
+                        inverse_indices.unsqueeze(1).expand(-1, repeated_b0.size(1)),
+                        dim=0,
+                    )[0][remove_duplicates]
 
                 new_offsets = torch.zeros_like(candidate_anchor).unsqueeze(dim=1).repeat([1,self.n_offsets,1]).float().cuda()
 
@@ -1182,6 +1278,7 @@ class GaussianModel:
                     "scaling": new_scaling,
                     "rotation": new_rotation,
                     "anchor_feat": new_feat,
+                    "base_log_reflectance": new_base_log_reflectance,
                     "offset": new_offsets,
                     "opacity": new_opacities,
                 }
@@ -1205,6 +1302,7 @@ class GaussianModel:
                 self._scaling = optimizable_tensors["scaling"]
                 self._rotation = optimizable_tensors["rotation"]
                 self._anchor_feat = optimizable_tensors["anchor_feat"]
+                self._base_log_reflectance = optimizable_tensors["base_log_reflectance"]
                 self._offset = optimizable_tensors["offset"]
                 self._opacity = optimizable_tensors["opacity"]
                 if self.use_residual:
@@ -1300,16 +1398,21 @@ class GaussianModel:
             # color_mlp.save(os.path.join(path, 'color_mlp.pt'))
             # self.mlp_color.train()
 
-            self.mlp_reflectance.eval()
-            reflectance_mlp = torch.jit.trace(self.mlp_reflectance, (torch.rand(1, self.feat_dim + self.reflectance_dist_dim).cuda()))
-            reflectance_mlp.save(os.path.join(path, 'reflectance_mlp.pt'))
-            self.mlp_reflectance.train()
+            if self.use_sg_illumination:
+                self.mlp_sg_illumination.eval()
+                sg_illumination_mlp = torch.jit.trace(self.mlp_sg_illumination, (torch.rand(1, self.feat_dim//2+3+self.illumination_dist_dim).cuda()))
+                sg_illumination_mlp.save(os.path.join(path, 'sg_illumination_mlp.pt'))
+                self.mlp_sg_illumination.train()
+            if self.illumination_mode == "legacy":
+                self.mlp_reflectance.eval()
+                reflectance_mlp = torch.jit.trace(self.mlp_reflectance, (torch.rand(1, self.feat_dim + self.reflectance_dist_dim).cuda()))
+                reflectance_mlp.save(os.path.join(path, 'reflectance_mlp.pt'))
+                self.mlp_reflectance.train()
 
-            self.mlp_illumination.eval()
-            illumination_mlp = torch.jit.trace(self.mlp_illumination, (torch.rand(1, self.feat_dim//2+3+self.illumination_dist_dim).cuda()))
-            illumination_mlp.save(os.path.join(path, 'illumination_mlp.pt'))
-            self.mlp_illumination.train()
-
+                self.mlp_illumination.eval()
+                illumination_mlp = torch.jit.trace(self.mlp_illumination, (torch.rand(1, self.feat_dim//2+3+self.illumination_dist_dim).cuda()))
+                illumination_mlp.save(os.path.join(path, 'illumination_mlp.pt'))
+                self.mlp_illumination.train()
 
             self.enhancement_net.eval()
             enhancement_net = torch.jit.trace(self.enhancement_net, (torch.rand(1, self.feat_dim + self.n_offsets).cuda()))
@@ -1346,44 +1449,53 @@ class GaussianModel:
 
         elif mode == 'unite':
             if self.use_feat_bank:
-                torch.save({
+                checkpoint = {
                     'opacity_mlp': self.mlp_opacity.state_dict(),
                     'cov_mlp': self.mlp_cov.state_dict(),
-                    # 'color_mlp': self.mlp_color.state_dict(),
-                    'reflectance_mlp': self.mlp_reflectance.state_dict(),
-                    'illumination_mlp': self.mlp_illumination.state_dict(),
+                    'sg_illumination_mlp': self.mlp_sg_illumination.state_dict(),
                     'enhancement_net': self.enhancement_net.state_dict(),
                     'residual_net': self.residual_net.state_dict(),
                     'cov_residual_mlp': self.mlp_cov_residual.state_dict(),
                     'opacity_residual_mlp': self.mlp_opacity_residual.state_dict(),
                     'feature_bank_mlp': self.mlp_feature_bank.state_dict(),
-                    'appearance': self.embedding_appearance.state_dict()
-                    }, os.path.join(path, 'checkpoints.pth'))
+                    'appearance': self.embedding_appearance.state_dict(),
+                    'illumination_mode': self.illumination_mode,
+                    }
+                if self.illumination_mode == "legacy":
+                    checkpoint['reflectance_mlp'] = self.mlp_reflectance.state_dict()
+                    checkpoint['illumination_mlp'] = self.mlp_illumination.state_dict()
+                torch.save(checkpoint, os.path.join(path, 'checkpoints.pth'))
             elif self.appearance_residual_dim > 0:
-                torch.save({
+                checkpoint = {
                     'opacity_mlp': self.mlp_opacity.state_dict(),
                     'cov_mlp': self.mlp_cov.state_dict(),
-                    # 'color_mlp': self.mlp_color.state_dict(),
-                    'reflectance_mlp': self.mlp_reflectance.state_dict(),
-                    'illumination_mlp': self.mlp_illumination.state_dict(),
+                    'sg_illumination_mlp': self.mlp_sg_illumination.state_dict(),
                     'enhancement_net': self.enhancement_net.state_dict(),
                     'residual_net': self.residual_net.state_dict(),
                     'cov_residual_mlp': self.mlp_cov_residual.state_dict(),
                     'opacity_residual_mlp': self.mlp_opacity_residual.state_dict(),
-                    'appearance': self.embedding_appearance.state_dict()
-                    }, os.path.join(path, 'checkpoints.pth'))
+                    'appearance': self.embedding_appearance.state_dict(),
+                    'illumination_mode': self.illumination_mode,
+                    }
+                if self.illumination_mode == "legacy":
+                    checkpoint['reflectance_mlp'] = self.mlp_reflectance.state_dict()
+                    checkpoint['illumination_mlp'] = self.mlp_illumination.state_dict()
+                torch.save(checkpoint, os.path.join(path, 'checkpoints.pth'))
             else:
-                torch.save({
+                checkpoint = {
                     'opacity_mlp': self.mlp_opacity.state_dict(),
                     'cov_mlp': self.mlp_cov.state_dict(),
-                    # 'color_mlp': self.mlp_color.state_dict(),
-                    'reflectance_mlp': self.mlp_reflectance.state_dict(),
-                    'illumination_mlp': self.mlp_illumination.state_dict(),
+                    'sg_illumination_mlp': self.mlp_sg_illumination.state_dict(),
                     'enhancement_net': self.enhancement_net.state_dict(),
                     'residual_net': self.residual_net.state_dict(),
                     'cov_residual_mlp': self.mlp_cov_residual.state_dict(),
                     'opacity_residual_mlp': self.mlp_opacity_residual.state_dict(),
-                    }, os.path.join(path, 'checkpoints.pth'))
+                    'illumination_mode': self.illumination_mode,
+                    }
+                if self.illumination_mode == "legacy":
+                    checkpoint['reflectance_mlp'] = self.mlp_reflectance.state_dict()
+                    checkpoint['illumination_mlp'] = self.mlp_illumination.state_dict()
+                torch.save(checkpoint, os.path.join(path, 'checkpoints.pth'))
         else:
             raise NotImplementedError
 
@@ -1392,9 +1504,23 @@ class GaussianModel:
         if mode == 'split':
             self.mlp_opacity = torch.jit.load(os.path.join(path, 'opacity_mlp.pt')).cuda()
             self.mlp_cov = torch.jit.load(os.path.join(path, 'cov_mlp.pt')).cuda()
-            # self.mlp_color = torch.jit.load(os.path.join(path, 'color_mlp.pt')).cuda()
-            self.mlp_reflectance = torch.jit.load(os.path.join(path, 'reflectance_mlp.pt')).cuda()
-            self.mlp_illumination = torch.jit.load(os.path.join(path, 'illumination_mlp.pt')).cuda()
+            sg_path = os.path.join(path, 'sg_illumination_mlp.pt')
+            legacy_reflectance_path = os.path.join(path, 'reflectance_mlp.pt')
+            legacy_illumination_path = os.path.join(path, 'illumination_mlp.pt')
+            if self.use_sg_illumination and os.path.exists(sg_path):
+                self.mlp_sg_illumination = torch.jit.load(sg_path).cuda()
+                self.sg_illumination_available = True
+                self.illumination_mode = "sg"
+                self.legacy_compatibility_mode = False
+            else:
+                self.sg_illumination_available = False
+                self.illumination_mode = "legacy"
+                self.legacy_compatibility_mode = True
+                print("SG illumination checkpoint not found; entering legacy compatibility mode.")
+            if self.legacy_compatibility_mode and os.path.exists(legacy_reflectance_path):
+                self.mlp_reflectance = torch.jit.load(legacy_reflectance_path).cuda()
+            if self.legacy_compatibility_mode and os.path.exists(legacy_illumination_path):
+                self.mlp_illumination = torch.jit.load(legacy_illumination_path).cuda()
             self.enhancement_net = torch.jit.load(os.path.join(path, 'enhancement_net.pt')).cuda()
             if self.use_residual:
                 self.residual_net = torch.jit.load(os.path.join(path, 'residual_net.pt')).cuda()
@@ -1408,9 +1534,20 @@ class GaussianModel:
             checkpoint = torch.load(os.path.join(path, 'checkpoints.pth'))
             self.mlp_opacity.load_state_dict(checkpoint['opacity_mlp'])
             self.mlp_cov.load_state_dict(checkpoint['cov_mlp'])
-            # self.mlp_color.load_state_dict(checkpoint['color_mlp'])
-            self.mlp_reflectance.load_state_dict(checkpoint['reflectance_mlp'])
-            self.mlp_illumination.load_state_dict(checkpoint['illumination_mlp'])
+            if self.use_sg_illumination and 'sg_illumination_mlp' in checkpoint:
+                self.mlp_sg_illumination.load_state_dict(checkpoint['sg_illumination_mlp'])
+                self.sg_illumination_available = True
+                self.illumination_mode = checkpoint.get('illumination_mode', 'sg')
+                self.legacy_compatibility_mode = self.illumination_mode == "legacy"
+            else:
+                self.sg_illumination_available = False
+                self.illumination_mode = "legacy"
+                self.legacy_compatibility_mode = True
+                print("SG illumination checkpoint not found; entering legacy compatibility mode.")
+            if self.legacy_compatibility_mode and 'reflectance_mlp' in checkpoint:
+                self.mlp_reflectance.load_state_dict(checkpoint['reflectance_mlp'])
+            if self.legacy_compatibility_mode and 'illumination_mlp' in checkpoint:
+                self.mlp_illumination.load_state_dict(checkpoint['illumination_mlp'])
             self.enhancement_net.load_state_dict(checkpoint['enhancement_net'])
             if self.use_residual:
                 self.residual_net.load_state_dict(checkpoint['residual_net'])
