@@ -191,6 +191,23 @@ def L_Reflectance_Consistency(reflectance_image):
     return torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-10).mean()
 
 
+def L_Reflectance_Highlight(reflectance_image, threshold=0.6):
+    """Penalize bright and highly chromatic reflectance regions to push colored highlights out of R."""
+    value = reflectance_image.mean(dim=0, keepdim=True)
+    chroma = torch.abs(reflectance_image - value).mean(dim=0, keepdim=True)
+    bright_mask = torch.clamp((value - threshold) / max(1e-6, 1.0 - threshold), 0.0, 1.0)
+    return (chroma * bright_mask).mean()
+
+
+def L_Residual_Chroma_Boost(residual_image, reflectance_image, threshold=0.6):
+    """Encourage residual to carry a small amount of chroma in bright reflectance regions."""
+    reflectance_value = reflectance_image.mean(dim=0, keepdim=True).detach()
+    bright_mask = torch.clamp((reflectance_value - threshold) / max(1e-6, 1.0 - threshold), 0.0, 1.0)
+    residual_value = residual_image.mean(dim=0, keepdim=True)
+    residual_chroma = torch.abs(residual_image - residual_value).mean(dim=0, keepdim=True)
+    return -(residual_chroma * bright_mask).mean()
+
+
 def L_SG_Energy(sg_stats):
     if not sg_stats or "sg_energy" not in sg_stats:
         return torch.tensor(0.0, device="cuda")

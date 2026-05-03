@@ -271,3 +271,22 @@ python render.py -m /home/liuyuhao/ll_further/LL-Gaussian-sg/outputs/chair_sg_ex
 - `train.py`：新增 `residual_abs_mean_raw` 和 `residual_abs_mean_used` 两组诊断量，区分 residual 前向原始量级与真正进入主重建损失的 residual 量级，避免误判 residual 是否已经介入训练。
 - `train.py`：debug 输出同步改为打印 `residual_abs_mean_raw` 与 `residual_abs_mean_used`，保留旧 `residual_image_raw_mean` 便于横向对比。
 - `scene/gaussian_model.py`：补充 `import torch.nn.functional as F`，修复 `_estimate_initial_b0()` 中使用 `F.avg_pool2d(...)` 时的 `NameError: name 'F' is not defined`，这是第二轮去糊初始化改动后的必要导入。
+
+### 2026-05-03 灰度 L 前提下的亮斑疏导修正
+
+- `arguments/__init__.py`：将默认 `reflectance_consistency_reg` 与 `reflectance_smooth_reg` 进一步下调到 `5e-5`，继续减轻 R 的过度低频化。
+- `arguments/__init__.py`：新增 `highlight_reflectance_reg = 1e-4`，用于抑制“亮且彩”的 reflectance 高亮斑区域。
+- `utils/loss_utils.py`：新增 `L_Reflectance_Highlight(...)`，通过亮度阈值和色彩偏离度联合惩罚 reflectance 中的高亮彩色异常项。
+- `scene/gaussian_model.py`：将 `_estimate_initial_b0()` 中 detail 注入系数从 `0.25` 提高到 `0.4`，继续增强单帧 B0 初始化的局部对比保留能力。
+- `train.py`：接入 `L_Reflectance_Highlight`，在 warmup 和 normal train 中都以 `dataset.highlight_reflectance_reg` 的权重加入 loss。
+- `train.py`：将 `L_diff` 第二项（`illumination_enhanced.detach() * reflectance`）权重从 `0.05` 继续下调到 `0.02`，进一步减弱 StableSR 伪 GT 对 reflectance 的平滑牵引。
+- `train.py`：新增 `reflectance_highlight_mean` 和 `residual_chroma_mean` 日志，用于观察彩色亮斑是否从 R 向 residual 转移。
+- `train.py`：保留灰度 illumination 主结构不变，不做 RGB illumination 改造。
+
+### 2026-05-03 亮斑从 R 向 Residual 疏导（增强版）
+
+- `arguments/__init__.py`：将默认 `highlight_reflectance_reg` 从 `1e-4` 提高到 `5e-4`，增强对 reflectance 中“亮且彩”异常项的压制力度。
+- `arguments/__init__.py`：新增 `residual_chroma_reg = 5e-5`，用于给 residual 一个非常轻的亮区彩度补偿引导。
+- `utils/loss_utils.py`：新增 `L_Residual_Chroma_Boost(...)`，在 reflectance 亮区对 residual 的彩度给予弱鼓励，帮助彩色亮斑从 R 向 residual 迁移。
+- `train.py`：在 residual 已启用时接入 `L_Residual_Chroma_Boost`，以 `dataset.residual_chroma_reg` 的权重加入总 loss。
+- `train.py`：新增 `residual_chroma_boost` 日志和 debug 输出，用于区分 residual 当前是在被动吸误差，还是已经开始主动承担亮区彩度补偿。

@@ -602,7 +602,7 @@ class GaussianModel:
         reflectance_map_bchw = reflectance_map.unsqueeze(0)
         reflectance_map_blur = F.avg_pool2d(reflectance_map_bchw, kernel_size=5, stride=1, padding=2).squeeze(0)
         detail = reflectance_map - reflectance_map_blur
-        reflectance_map = (reflectance_map + 0.25 * detail).clamp(1e-3, 1.0)
+        reflectance_map = (reflectance_map + 0.4 * detail).clamp(1e-3, 1.0)
         log_reflectance_map = torch.log(reflectance_map)
         global_mean_b0 = log_reflectance_map.mean(dim=(1, 2))
 

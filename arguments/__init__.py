@@ -88,8 +88,10 @@ class ModelParams(ParamGroup):
         self.sg_lambda_min = 1.0
         self.sg_energy_reg = 1e-4
         self.sg_smooth_reg = 5e-5
-        self.reflectance_consistency_reg = 2e-4
-        self.reflectance_smooth_reg = 1e-4
+        self.reflectance_consistency_reg = 5e-5
+        self.reflectance_smooth_reg = 5e-5
+        self.highlight_reflectance_reg = 5e-4
+        self.residual_chroma_reg = 5e-5
         self.b0_spatial_smooth_reg = 0.0
         self.prune_ratio = 0.05
         self.beta = 1.0
@@ -206,8 +208,10 @@ def _backfill_model_compatibility(merged_dict):
         "sg_lambda_min": 1.0,
         "sg_energy_reg": 1e-4,
         "sg_smooth_reg": 5e-5,
-        "reflectance_consistency_reg": 2e-4,
-        "reflectance_smooth_reg": 1e-4,
+        "reflectance_consistency_reg": 5e-5,
+        "reflectance_smooth_reg": 5e-5,
+        "highlight_reflectance_reg": 5e-4,
+        "residual_chroma_reg": 5e-5,
         "b0_lr": 0.001,
         "b0_spatial_smooth_reg": 0.0,
         "residual_start_iter": 12_000,
