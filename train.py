@@ -46,7 +46,7 @@ sys.path.append("./submodules/Depth-Anything-V2")
 # from lpipsPyTorch import lpips
 import lpips
 from random import randint
-from utils.loss_utils import l1_loss, ssim, l1_plus_loss, L_Smooth, L_Illu, L_Gray, L_Depth_similarity, L_Reflectance_Smooth, L_Depth_Smooth, pearson_depth_loss, L_Reflectance_Consistency, L_Reflectance_Highlight, L_Residual_Chroma_Boost, L_SG_Energy, L_SG_Sharpness, L_B0_Spatial_Smooth
+from utils.loss_utils import l1_loss, ssim, l1_plus_loss, L_Smooth, L_Illu, L_Gray, L_Depth_similarity, L_Reflectance_Smooth, L_Depth_Smooth, pearson_depth_loss, L_Reflectance_Consistency, L_Reflectance_Edge, L_Reflectance_Highlight, L_Residual_Chroma_Boost, L_SG_Energy, L_SG_Sharpness, L_B0_Spatial_Smooth
 from gaussian_renderer import prefilter_voxel, render, network_gui
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -429,8 +429,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         L_sg_energy = L_SG_Energy(sg_stats)
         L_sg_sharpness = L_SG_Sharpness(sg_stats)
         L_reflectance_consistency = L_Reflectance_Consistency(reflectance_image)
+        L_reflectance_edge = L_Reflectance_Edge(reflectance_image, gt_image)
         L_reflectance_highlight = L_Reflectance_Highlight(reflectance_image)
         L_b0_spatial_smooth = L_B0_Spatial_Smooth(gaussians._base_log_reflectance, gaussians.get_anchor)
+        L_reflectance_detail = torch.mean(torch.abs(torch.tanh(gaussians._reflectance_offset_delta)))
         L_residual_reg = torch.tensor(0.0, device=gt_image.device)
         residual_chroma_mean = torch.tensor(0.0, device=gt_image.device)
         L_residual_chroma_boost = torch.tensor(0.0, device=gt_image.device)
@@ -444,7 +446,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             if iteration >= opt.update_from:
                 loss += L_smooth * 0.1 +  L_depth_similarity 
             loss += dataset.reflectance_consistency_reg * (L_reflectance_consistency + L_reflectance_smooth)
+            loss += dataset.reflectance_edge_reg * L_reflectance_edge
             loss += dataset.highlight_reflectance_reg * L_reflectance_highlight
+            loss += dataset.reflectance_detail_reg * L_reflectance_detail
             loss += dataset.b0_spatial_smooth_reg * L_b0_spatial_smooth
         else:
             loss = (1.0 - opt.lambda_dssim ) * Ll1 + opt.lambda_dssim *  ssim_loss + L_illu + 0.01 * scaling_reg  
@@ -454,7 +458,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 loss += dataset.sg_energy_reg * L_sg_energy
                 loss += dataset.sg_smooth_reg * L_sg_sharpness
                 loss += dataset.reflectance_consistency_reg * (L_reflectance_consistency + L_reflectance_smooth)
+                loss += dataset.reflectance_edge_reg * L_reflectance_edge
                 loss += dataset.highlight_reflectance_reg * L_reflectance_highlight
+                loss += dataset.reflectance_detail_reg * L_reflectance_detail
                 loss += dataset.b0_spatial_smooth_reg * L_b0_spatial_smooth
 
             L_diff = 0
@@ -489,7 +495,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                            'sg_energy': L_sg_energy,
                            'sg_lambda_mean': L_sg_sharpness,
                            'reflectance_consistency': L_reflectance_consistency,
+                           'reflectance_edge_mean': L_reflectance_edge,
                            'reflectance_highlight_mean': L_reflectance_highlight,
+                           'reflectance_detail_mean': L_reflectance_detail,
                            'residual_chroma_boost': L_residual_chroma_boost})
             else:
                 residual_chroma_mean = torch.abs(residual_image_for_loss - residual_image_for_loss.mean(dim=0, keepdim=True)).mean()
@@ -498,7 +506,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                            'sg_energy': L_sg_energy,
                            'sg_lambda_mean': L_sg_sharpness,
                            'reflectance_consistency': L_reflectance_consistency,
+                           'reflectance_edge_mean': L_reflectance_edge,
                            'reflectance_highlight_mean': L_reflectance_highlight,
+                           'reflectance_detail_mean': L_reflectance_detail,
                            'residual_chroma_mean': residual_chroma_mean,
                            'residual_chroma_boost': L_residual_chroma_boost,
                            'residual_enabled': float(residual_active)})
@@ -532,6 +542,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         'residual_abs_mean_raw': residual_abs.mean(),
                         'residual_abs_mean_used': residual_abs_used.mean(),
                         'residual_abs_mean': residual_abs.mean(),
+                        'reflectance_edge_mean': L_reflectance_edge,
+                        'reflectance_detail_mean': L_reflectance_detail,
                         'reflectance_highlight_mean': L_reflectance_highlight,
                         'residual_chroma_mean': residual_chroma_mean,
                         'residual_chroma_boost': L_residual_chroma_boost,
@@ -553,6 +565,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 print("residual_image_raw_mean", residual_image_raw.mean())
                 print("residual_abs_mean_raw", residual_abs.mean())
                 print("residual_abs_mean_used", residual_abs_used.mean())
+                print("reflectance_edge_mean", L_reflectance_edge)
+                print("reflectance_detail_mean", L_reflectance_detail)
                 print("reflectance_highlight_mean", L_reflectance_highlight)
                 print("residual_chroma_mean", residual_chroma_mean)
                 print("residual_chroma_boost", L_residual_chroma_boost)

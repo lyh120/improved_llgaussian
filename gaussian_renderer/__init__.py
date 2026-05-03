@@ -9,7 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 import torch
-from einops import repeat
+from einops import rearrange, repeat
 
 import math
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
@@ -83,7 +83,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
 
     cat_local_view = torch.cat([feat, ob_view, ob_dist], dim=1) # [N, c+3+1]
     cat_local_view_wodist = torch.cat([feat, ob_view], dim=1) # [N, c+3]
-    reflectance_base = pc.get_reflectance[visible_mask]
+    reflectance_base = pc.get_reflectance_with_detail[visible_mask]
 
     ## for illumination
     cat_local_view_illumination = torch.cat([feat[:, pc.feat_dim//2:], ob_view, ob_dist], dim=1) # [N, c+3+1]
@@ -165,7 +165,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
         else:
             reflectance = pc.mlp_reflectance(cat_local_view_woview_wodist)
     else:
-        reflectance = repeat(reflectance_base, 'n c -> (n k) c', k=pc.n_offsets)
+        reflectance = rearrange(reflectance_base, 'n k c -> (n k) c')
 
     # color = illumination.repeat(1, 1, 3) * reflectance
     # color = color.reshape([anchor.shape[0]*pc.n_offsets, 3])# [mask] 
@@ -692,7 +692,7 @@ def generate_neural_gaussians_fast(viewpoint_camera, pc : GaussianModel, visible
     # cat_local_view = torch.cat([feat, ob_view, ob_dist], dim=1) # [N, c+3+1]
     cat_local_view_wodist = torch.cat([feat, ob_view], dim=1) # [N, c+3]
     # cat_local_view_woview = torch.cat([feat, ob_dist], dim=1) # [N, c+1]
-    reflectance_base = pc.get_reflectance[visible_mask]
+    reflectance_base = pc.get_reflectance_with_detail[visible_mask]
 
     ## for illumination
     cat_local_view_illumination = torch.cat([feat[:, pc.feat_dim//2:], ob_view, ob_dist], dim=1) # [N, c+3+1]
@@ -735,7 +735,7 @@ def generate_neural_gaussians_fast(viewpoint_camera, pc : GaussianModel, visible
         cat_local_view_woview_wodist = torch.cat([feat], dim=1) # [N, c]
         reflectance = pc.mlp_reflectance(cat_local_view_woview_wodist)
     else:
-        reflectance = repeat(reflectance_base, 'n c -> (n k) c', k=pc.n_offsets)
+        reflectance = rearrange(reflectance_base, 'n k c -> (n k) c')
 
     # color = illumination.repeat(1, 1, 3) * reflectance
     # color = color.reshape([anchor.shape[0]*pc.n_offsets, 3])# [mask] 

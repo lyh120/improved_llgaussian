@@ -290,3 +290,27 @@ python render.py -m /home/liuyuhao/ll_further/LL-Gaussian-sg/outputs/chair_sg_ex
 - `utils/loss_utils.py`£ºĞÂÔö `L_Residual_Chroma_Boost(...)`£¬ÔÚ reflectance ÁÁÇø¶Ô residual µÄ²Ê¶È¸øÓèÈõ¹ÄÀø£¬°ïÖú²ÊÉ«ÁÁ°ß´Ó R Ïò residual Ç¨ÒÆ¡£
 - `train.py`£ºÔÚ residual ÒÑÆôÓÃÊ±½ÓÈë `L_Residual_Chroma_Boost`£¬ÒÔ `dataset.residual_chroma_reg` µÄÈ¨ÖØ¼ÓÈë×Ü loss¡£
 - `train.py`£ºĞÂÔö `residual_chroma_boost` ÈÕÖ¾ºÍ debug Êä³ö£¬ÓÃÓÚÇø·Ö residual µ±Ç°ÊÇÔÚ±»¶¯ÎüÎó²î£¬»¹ÊÇÒÑ¾­¿ªÊ¼Ö÷¶¯³Ğµ£ÁÁÇø²Ê¶È²¹³¥¡£
+
+### 2026-05-03 Reflectance ÇåÎú¶ÈÔöÇ¿ÓëÁÁ°ßÇ¨ÒÆÔÙ¼ÓÇ¿
+
+- `arguments/__init__.py`£º½«Ä¬ÈÏ `reflectance_smooth_reg` ÉèÎª `0.0`£¬½øÒ»²½½â³ı R µÄÍ¼ÏñÆ½»¬Êø¸¿£»½« `reflectance_consistency_reg` ÏÂµ÷µ½ `2e-5`£¬½ö±£Áô¼«ÈõÎÈ¶¨×÷ÓÃ¡£
+- `arguments/__init__.py`£ºĞÂÔö `reflectance_edge_reg = 2e-4`£¬ÓÃÓÚ¹ÄÀø R ±£ÁôÊäÈëÍ¼ÏñÖĞµÄ½á¹¹±ßÔµ¡£
+- `arguments/__init__.py`£º½«Ä¬ÈÏ `highlight_reflectance_reg` Ìá¸ßµ½ `1e-3`£¬½« `residual_chroma_reg` Ìá¸ßµ½ `5e-4`£¬ÔöÇ¿²ÊÉ«ÁÁ°ß´Ó R Ïò residual Ç¨ÒÆµÄÇı¶¯Á¦¡£
+- `utils/loss_utils.py`£ºĞÂÔö `L_Reflectance_Edge(...)`£¬ÓÃ reflectance »Ò¶ÈÌİ¶ÈÓëµÍ¹âÍ¼»Ò¶ÈÌİ¶ÈµÄ¹éÒ»»¯²îÒì×öÈõ½á¹¹¼à¶½£¬±ÜÃâÖ»¿¿¼õ smooth ÈÔÈ»ÎŞ·¨±äÇåÎú¡£
+- `train.py`£º½ÓÈë `L_Reflectance_Edge`£¬ÔÚ warmup ºÍ normal train ÖĞ¶¼ÒÔ `dataset.reflectance_edge_reg` ¼ÓÈë×Ü loss¡£
+- `train.py`£ºĞÂÔö `reflectance_edge_mean` µ½ wandb ºÍ debug Êä³ö£¬±ãÓÚ¹Û²ì R µÄ½á¹¹±ßÔµ¼à¶½ÊÇ·ñÉúĞ§¡£
+
+### 2026-05-03 Reflectance è¡¨è¾¾ç²’åº¦å‡çº§ï¼ˆanchor åº•è‰² + offset ç»†èŠ‚ï¼‰
+
+- `scene/gaussian_model.py`ï¼šåœ¨ä¿ç•™ `R = exp(B0)` ä¸»è·¯å¾„ä¸å˜çš„å‰æä¸‹ï¼Œæ–°å¢ `_reflectance_offset_delta`ï¼Œå°† reflectance è¡¨è¾¾å‡çº§ä¸ºâ€œanchor çº§åº•è‰² + offset çº§ log-detailâ€ï¼Œç”¨äºæå‡å±€éƒ¨çº¹ç†å’Œè¾¹ç¼˜æ¸…æ™°åº¦ã€‚
+- `scene/gaussian_model.py`ï¼š`get_reflectance_with_detail` ä½¿ç”¨ `exp(B0 + 0.35 * tanh(detail))` æ„é€ æœ€ç»ˆ reflectanceï¼Œæ—¢å¢åŠ å±€éƒ¨è¡¨è¾¾èƒ½åŠ›ï¼Œåˆé™åˆ¶ç»†èŠ‚åˆ†æ”¯è¿‡åº¦å¸æ”¶å½©è‰²äº®æ–‘ã€‚
+- `scene/gaussian_model.py`ï¼š`capture/restore`ã€`create_from_pcd`ã€optimizer å‚æ•°ç»„ã€å­¦ä¹ ç‡è°ƒåº¦ã€anchor growingã€anchor pruneã€PLY ä¿å­˜/åŠ è½½ å‡å·²æ¥å…¥ `_reflectance_offset_delta`ï¼Œæ—§ checkpoint å’Œæ—§ PLY ç¼ºå°‘è¯¥å­—æ®µæ—¶è‡ªåŠ¨ä»¥å…¨é›¶ detail å…¼å®¹æ¢å¤ã€‚
+- `gaussian_renderer/__init__.py`ï¼šä¸»æ¸²æŸ“è·¯å¾„å’Œ fast è·¯å¾„ä¸å†ç®€å•é‡å¤ anchor çº§ `R`ï¼Œè€Œæ˜¯æ”¹ä¸ºä½¿ç”¨ `get_reflectance_with_detail` çš„ offset çº§ reflectanceã€‚
+- `arguments/__init__.py`ï¼šæ–°å¢ `reflectance_offset_lr=0.002`ï¼Œç”¨äºå•ç‹¬æ§åˆ¶ reflectance detail çš„å­¦ä¹ é€Ÿåº¦ï¼›æ–°å¢ `reflectance_detail_reg=1e-5`ï¼Œç”¨äºçº¦æŸ detail åˆ†æ”¯ä¸è¿‡åº¦æ”¾å¤§ã€‚
+- `train.py`ï¼šæ–°å¢ `L_reflectance_detail`ï¼Œå¯¹ `tanh(_reflectance_offset_delta)` çš„å¹…åº¦åšè½»é‡æ­£åˆ™ï¼Œæ—¢å…è®¸ R å˜æ¸…æ™°ï¼Œåˆé™åˆ¶ detail é‡æ–°å­¦å›å½©è‰²äº®æ–‘ã€‚
+- `train.py`ï¼šæ–°å¢ `reflectance_detail_mean` æ—¥å¿—ï¼Œä¾¿äºè§‚å¯Ÿ offset çº§ reflectance detail æ˜¯å¦çœŸæ­£å¼€å§‹æ‰¿æ‹…æ¸…æ™°åº¦è€Œä¸æ˜¯ç»§ç»­ç”± residual æˆ– illumination ä»£å¿ã€‚
+
+### 2026-05-03 Reflectance detail PLY å…¼å®¹ä¿®æ­£
+
+- `scene/gaussian_model.py`ï¼šä¿®æ­£ `load_ply_sparse_gaussian()` è¯»å– `b0_*` å­—æ®µæ—¶çš„åŒ¹é…æ¡ä»¶ï¼Œ`b0_detail_*` ä¸å†è¢«è¯¯å¹¶å…¥ `base_log_reflectance`ï¼Œé¿å…åŠ è½½æ–° PLY å `B0` é€šé“æ•°é”™è¯¯è†¨èƒ€ã€‚
+- `scene/gaussian_model.py`ï¼š`get_reflectance_with_detail` å¢åŠ é˜²å¾¡å¼å…¼å®¹å¤„ç†ï¼›è‹¥å†å²ä¸­é—´äº§ç‰©å¯¼è‡´ `base_log_reflectance` é€šé“æ•°å¼‚å¸¸å¤§äº 3ï¼Œåˆ™ä»…å–å‰ 3 é€šé“å‚ä¸ `exp(B0 + detail)`ï¼Œé¿å…è®­ç»ƒåè‡ªåŠ¨æ¸²æŸ“é˜¶æ®µç›´æ¥ shape mismatch å´©æºƒã€‚

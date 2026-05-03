@@ -118,6 +118,7 @@ class GaussianModel:
         self.sg_lambda_min = sg_lambda_min
         self.sg_illumination_available = use_sg_illumination
         self.legacy_compatibility_mode = illumination_mode == "legacy"
+        self.reflectance_detail_scale = 0.35
         
         ## residual
         self.use_residual = use_residual
@@ -128,6 +129,7 @@ class GaussianModel:
         self._offset = torch.empty(0)
         self._anchor_feat = torch.empty(0)
         self._base_log_reflectance = torch.empty(0)
+        self._reflectance_offset_delta = torch.empty(0)
 
         
         self.opacity_accum = torch.empty(0)
@@ -269,6 +271,7 @@ class GaussianModel:
                 self._anchor,
                 self._anchor_feat,
                 self._base_log_reflectance,
+                self._reflectance_offset_delta,
                 self._anchor_feat_residual,
                 self._offset,
                 self._offset_residual,
@@ -286,6 +289,7 @@ class GaussianModel:
                 self._anchor,
                 self._anchor_feat,
                 self._base_log_reflectance,
+                self._reflectance_offset_delta,
                 self._offset,
                 self._scaling,
                 self._rotation,
@@ -298,8 +302,25 @@ class GaussianModel:
     
     def restore(self, model_args, training_args):
         if self.use_residual:
+            has_reflectance_detail = len(model_args) == 15
             has_b0 = len(model_args) == 14
-            if has_b0:
+            if has_reflectance_detail:
+                (self._anchor,
+                self._anchor_feat,
+                self._base_log_reflectance,
+                self._reflectance_offset_delta,
+                self._anchor_feat_residual,
+                self._offset,
+                self._offset_residual,
+                self._scaling,
+                self._scaling_residual,
+                self._rotation,
+                self._opacity,
+                self.max_radii2D,
+                denom,
+                opt_dict,
+                self.spatial_lr_scale) = model_args
+            elif has_b0:
                 (self._anchor,
                 self._anchor_feat,
                 self._base_log_reflectance,
@@ -314,6 +335,9 @@ class GaussianModel:
                 denom,
                 opt_dict,
                 self.spatial_lr_scale) = model_args
+                self._reflectance_offset_delta = nn.Parameter(
+                    torch.zeros((self._anchor.shape[0], self.n_offsets, 3), device="cuda", dtype=torch.float).requires_grad_(True)
+                )
             else:
                 (self._anchor,
                 self._anchor_feat_residual,
@@ -333,6 +357,9 @@ class GaussianModel:
                 )
                 self._base_log_reflectance = nn.Parameter(
                     torch.zeros((self._anchor.shape[0], 3), device="cuda", dtype=torch.float).requires_grad_(True)
+                )
+                self._reflectance_offset_delta = nn.Parameter(
+                    torch.zeros((self._anchor.shape[0], self.n_offsets, 3), device="cuda", dtype=torch.float).requires_grad_(True)
                 )
                 self.illumination_mode = "legacy"
                 self.legacy_compatibility_mode = True
@@ -343,8 +370,22 @@ class GaussianModel:
             except ValueError:
                 print("Optimizer checkpoint is not compatible with SG parameter groups; optimizer state is reinitialized.")
         else:
-            has_b0 = len(model_args) == 10
-            if has_b0:
+            has_reflectance_detail = len(model_args) == 12
+            has_b0 = len(model_args) == 11
+            if has_reflectance_detail:
+                (self._anchor,
+                self._anchor_feat,
+                self._base_log_reflectance,
+                self._reflectance_offset_delta,
+                self._offset,
+                self._scaling,
+                self._rotation,
+                self._opacity,
+                self.max_radii2D,
+                denom,
+                opt_dict,
+                self.spatial_lr_scale) = model_args
+            elif has_b0:
                 (self._anchor,
                 self._anchor_feat,
                 self._base_log_reflectance,
@@ -356,6 +397,9 @@ class GaussianModel:
                 denom,
                 opt_dict,
                 self.spatial_lr_scale) = model_args
+                self._reflectance_offset_delta = nn.Parameter(
+                    torch.zeros((self._anchor.shape[0], self.n_offsets, 3), device="cuda", dtype=torch.float).requires_grad_(True)
+                )
             else:
                 (self._anchor,
                 self._offset,
@@ -372,6 +416,9 @@ class GaussianModel:
                 )
                 self._base_log_reflectance = nn.Parameter(
                     torch.zeros((self._anchor.shape[0], 3), device="cuda", dtype=torch.float).requires_grad_(True)
+                )
+                self._reflectance_offset_delta = nn.Parameter(
+                    torch.zeros((self._anchor.shape[0], self.n_offsets, 3), device="cuda", dtype=torch.float).requires_grad_(True)
                 )
                 self.illumination_mode = "legacy"
                 self.legacy_compatibility_mode = True
@@ -455,6 +502,15 @@ class GaussianModel:
     @property
     def get_reflectance(self):
         return torch.exp(self._base_log_reflectance)
+
+    @property
+    def get_reflectance_with_detail(self):
+        if self._base_log_reflectance.shape[-1] != 3:
+            base = self._base_log_reflectance[..., :3]
+        else:
+            base = self._base_log_reflectance
+        detail = self.reflectance_detail_scale * torch.tanh(self._reflectance_offset_delta)
+        return torch.exp(base.unsqueeze(1) + detail)
 
     @property
     def get_enhancement_net(self):
@@ -748,12 +804,14 @@ class GaussianModel:
             offsets_residual = torch.zeros((fused_point_cloud.shape[0], self.n_offsets_residual, 3)).float().cuda()
             scales_residual = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 6) 
         base_log_reflectance = self._estimate_initial_b0(fused_point_cloud, cameras)
+        reflectance_offset_delta = torch.zeros((fused_point_cloud.shape[0], self.n_offsets, 3), dtype=torch.float, device="cuda")
 
 
         self._anchor = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._offset = nn.Parameter(offsets.requires_grad_(True))
         self._anchor_feat = nn.Parameter(anchors_feat.requires_grad_(True))
         self._base_log_reflectance = nn.Parameter(base_log_reflectance.requires_grad_(True))
+        self._reflectance_offset_delta = nn.Parameter(reflectance_offset_delta.requires_grad_(True))
         if self.use_residual:
             self._anchor_feat_residual = nn.Parameter(anchors_feat_residual.requires_grad_(True))
             self._offset_residual = nn.Parameter(offsets_residual.requires_grad_(True))
@@ -784,6 +842,7 @@ class GaussianModel:
                 {'params': [self._offset], 'lr': training_args.offset_lr_init * self.spatial_lr_scale, "name": "offset"},
                 {'params': [self._anchor_feat], 'lr': training_args.feature_lr, "name": "anchor_feat"},
                 {'params': [self._base_log_reflectance], 'lr': training_args.b0_lr, "name": "base_log_reflectance"},
+                {'params': [self._reflectance_offset_delta], 'lr': training_args.reflectance_offset_lr, "name": "reflectance_offset_delta"},
                 {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
                 {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
                 {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
@@ -801,6 +860,7 @@ class GaussianModel:
                 {'params': [self._offset], 'lr': training_args.offset_lr_init * self.spatial_lr_scale, "name": "offset"},
                 {'params': [self._anchor_feat], 'lr': training_args.feature_lr, "name": "anchor_feat"},
                 {'params': [self._base_log_reflectance], 'lr': training_args.b0_lr, "name": "base_log_reflectance"},
+                {'params': [self._reflectance_offset_delta], 'lr': training_args.reflectance_offset_lr, "name": "reflectance_offset_delta"},
                 {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
                 {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
                 {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
@@ -817,6 +877,7 @@ class GaussianModel:
                 {'params': [self._offset], 'lr': training_args.offset_lr_init * self.spatial_lr_scale, "name": "offset"},
                 {'params': [self._anchor_feat], 'lr': training_args.feature_lr, "name": "anchor_feat"},
                 {'params': [self._base_log_reflectance], 'lr': training_args.b0_lr, "name": "base_log_reflectance"},
+                {'params': [self._reflectance_offset_delta], 'lr': training_args.reflectance_offset_lr, "name": "reflectance_offset_delta"},
                 {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
                 {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
                 {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
@@ -873,6 +934,10 @@ class GaussianModel:
                                                     max_steps=training_args.mlp_color_lr_max_steps)
         self.b0_scheduler_args = get_expon_lr_func(lr_init=training_args.b0_lr,
                                                     lr_final=training_args.b0_lr * 0.01,
+                                                    lr_delay_mult=0.01,
+                                                    max_steps=training_args.position_lr_max_steps)
+        self.reflectance_offset_scheduler_args = get_expon_lr_func(lr_init=training_args.reflectance_offset_lr,
+                                                    lr_final=training_args.reflectance_offset_lr * 0.01,
                                                     lr_delay_mult=0.01,
                                                     max_steps=training_args.position_lr_max_steps)
         if self.use_residual:
@@ -933,6 +998,9 @@ class GaussianModel:
             if param_group["name"] == "base_log_reflectance":
                 lr = self.b0_scheduler_args(iteration)
                 param_group['lr'] = lr
+            if param_group["name"] == "reflectance_offset_delta":
+                lr = self.reflectance_offset_scheduler_args(iteration)
+                param_group['lr'] = lr
             if self.use_feat_bank and param_group["name"] == "mlp_featurebank":
                 lr = self.mlp_featurebank_scheduler_args(iteration)
                 param_group['lr'] = lr
@@ -958,7 +1026,7 @@ class GaussianModel:
 
     def freeze(self):
         for param_group in self.optimizer.param_groups:
-            if param_group["name"] != "enhancement_net" and param_group["name"] != "base_log_reflectance":
+            if param_group["name"] != "enhancement_net" and param_group["name"] != "base_log_reflectance" and param_group["name"] != "reflectance_offset_delta":
                 param_group['lr'] = 0
 
                 
@@ -972,6 +1040,8 @@ class GaussianModel:
             l.append('f_anchor_feat_{}'.format(i))
         for i in range(self._base_log_reflectance.shape[1]):
             l.append('b0_{}'.format(i))
+        for i in range(self._reflectance_offset_delta.shape[1] * self._reflectance_offset_delta.shape[2]):
+            l.append('b0_detail_{}'.format(i))
         l.append('opacity')
         for i in range(self._scaling.shape[1]):
             l.append('scale_{}'.format(i))
@@ -993,6 +1063,7 @@ class GaussianModel:
         normals = np.zeros_like(anchor)
         anchor_feat = self._anchor_feat.detach().cpu().numpy()
         base_log_reflectance = self._base_log_reflectance.detach().cpu().numpy()
+        reflectance_offset_delta = self._reflectance_offset_delta.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         offset = self._offset.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
@@ -1007,9 +1078,9 @@ class GaussianModel:
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(anchor.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((anchor, normals, offset, anchor_feat, base_log_reflectance, opacities, scale, rotation, filter_3D), axis=1)
+        attributes = np.concatenate((anchor, normals, offset, anchor_feat, base_log_reflectance, reflectance_offset_delta, opacities, scale, rotation, filter_3D), axis=1)
         if self.use_residual:
-            attributes = np.concatenate((anchor, normals, offset, anchor_feat, base_log_reflectance, opacities, scale, rotation, filter_3D, anchor_feat_residual, scale_residual, offset_residual), axis=1)
+            attributes = np.concatenate((anchor, normals, offset, anchor_feat, base_log_reflectance, reflectance_offset_delta, opacities, scale, rotation, filter_3D, anchor_feat_residual, scale_residual, offset_residual), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -1041,7 +1112,10 @@ class GaussianModel:
         anchor_feats = np.zeros((anchor.shape[0], len(anchor_feat_names)))
         for idx, attr_name in enumerate(anchor_feat_names):
             anchor_feats[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32)
-        b0_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("b0_")]
+        b0_names = [
+            p.name for p in plydata.elements[0].properties
+            if p.name.startswith("b0_") and not p.name.startswith("b0_detail_")
+        ]
         b0_names = sorted(b0_names, key = lambda x: int(x.split('_')[-1]))
         if len(b0_names) > 0:
             base_log_reflectance = np.zeros((anchor.shape[0], len(b0_names)))
@@ -1051,6 +1125,15 @@ class GaussianModel:
             base_log_reflectance = np.zeros((anchor.shape[0], 3), dtype=np.float32)
             self.illumination_mode = "legacy"
             self.legacy_compatibility_mode = True
+        b0_detail_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("b0_detail_")]
+        b0_detail_names = sorted(b0_detail_names, key=lambda x: int(x.split('_')[-1]))
+        if len(b0_detail_names) > 0:
+            reflectance_offset_delta = np.zeros((anchor.shape[0], len(b0_detail_names)), dtype=np.float32)
+            for idx, attr_name in enumerate(b0_detail_names):
+                reflectance_offset_delta[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32)
+            reflectance_offset_delta = reflectance_offset_delta.reshape((anchor.shape[0], 3, self.n_offsets)).transpose(0, 2, 1)
+        else:
+            reflectance_offset_delta = np.zeros((anchor.shape[0], self.n_offsets, 3), dtype=np.float32)
 
         offset_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_offset")]
         offset_names = sorted(offset_names, key = lambda x: int(x.split('_')[-1]))
@@ -1085,6 +1168,7 @@ class GaussianModel:
 
         self._anchor_feat = nn.Parameter(torch.tensor(anchor_feats, dtype=torch.float, device="cuda").requires_grad_(True))
         self._base_log_reflectance = nn.Parameter(torch.tensor(base_log_reflectance, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._reflectance_offset_delta = nn.Parameter(torch.tensor(reflectance_offset_delta, dtype=torch.float, device="cuda").requires_grad_(True))
 
         self._offset = nn.Parameter(torch.tensor(offsets, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._anchor = nn.Parameter(torch.tensor(anchor, dtype=torch.float, device="cuda").requires_grad_(True))
@@ -1223,6 +1307,7 @@ class GaussianModel:
         self._offset = optimizable_tensors["offset"]
         self._anchor_feat = optimizable_tensors["anchor_feat"]
         self._base_log_reflectance = optimizable_tensors["base_log_reflectance"]
+        self._reflectance_offset_delta = optimizable_tensors["reflectance_offset_delta"]
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
@@ -1306,6 +1391,7 @@ class GaussianModel:
                         inverse_indices.unsqueeze(1).expand(-1, repeated_b0.size(1)),
                         dim=0,
                     )[remove_duplicates]
+                new_reflectance_offset_delta = torch.zeros((candidate_anchor.shape[0], self.n_offsets, 3), dtype=torch.float, device="cuda")
 
                 new_offsets = torch.zeros_like(candidate_anchor).unsqueeze(dim=1).repeat([1,self.n_offsets,1]).float().cuda()
 
@@ -1323,6 +1409,7 @@ class GaussianModel:
                     "rotation": new_rotation,
                     "anchor_feat": new_feat,
                     "base_log_reflectance": new_base_log_reflectance,
+                    "reflectance_offset_delta": new_reflectance_offset_delta,
                     "offset": new_offsets,
                     "opacity": new_opacities,
                 }
@@ -1347,6 +1434,7 @@ class GaussianModel:
                 self._rotation = optimizable_tensors["rotation"]
                 self._anchor_feat = optimizable_tensors["anchor_feat"]
                 self._base_log_reflectance = optimizable_tensors["base_log_reflectance"]
+                self._reflectance_offset_delta = optimizable_tensors["reflectance_offset_delta"]
                 self._offset = optimizable_tensors["offset"]
                 self._opacity = optimizable_tensors["opacity"]
                 if self.use_residual:

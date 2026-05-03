@@ -199,6 +199,26 @@ def L_Reflectance_Highlight(reflectance_image, threshold=0.6):
     return (chroma * bright_mask).mean()
 
 
+def L_Reflectance_Edge(reflectance_image, gt_image, threshold=0.03):
+    """Encourage reflectance edges to keep image structure without matching color highlights."""
+    gt_image = gt_image.detach()
+    reflectance_gray = reflectance_image.mean(dim=0, keepdim=True)
+    gt_gray = 0.299 * gt_image[0:1] + 0.587 * gt_image[1:2] + 0.114 * gt_image[2:3]
+
+    ref_dx = reflectance_gray[:, 1:, :-1] - reflectance_gray[:, :-1, :-1]
+    ref_dy = reflectance_gray[:, :-1, 1:] - reflectance_gray[:, :-1, :-1]
+    gt_dx = gt_gray[:, 1:, :-1] - gt_gray[:, :-1, :-1]
+    gt_dy = gt_gray[:, :-1, 1:] - gt_gray[:, :-1, :-1]
+
+    ref_grad = torch.sqrt(ref_dx ** 2 + ref_dy ** 2 + 1e-8)
+    gt_grad = torch.sqrt(gt_dx ** 2 + gt_dy ** 2 + 1e-8).detach()
+    edge_mask = torch.clamp((gt_grad - threshold) / max(1e-6, 1.0 - threshold), 0.0, 1.0).detach()
+
+    ref_grad_norm = ref_grad / (ref_grad.mean().detach() + 1e-6)
+    gt_grad_norm = gt_grad / (gt_grad.mean().detach() + 1e-6)
+    return (torch.abs(ref_grad_norm - gt_grad_norm) * edge_mask).mean()
+
+
 def L_Residual_Chroma_Boost(residual_image, reflectance_image, threshold=0.6):
     """Encourage residual to carry a small amount of chroma in bright reflectance regions."""
     reflectance_value = reflectance_image.mean(dim=0, keepdim=True).detach()
