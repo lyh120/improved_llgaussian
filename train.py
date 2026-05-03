@@ -46,7 +46,7 @@ sys.path.append("./submodules/Depth-Anything-V2")
 # from lpipsPyTorch import lpips
 import lpips
 from random import randint
-from utils.loss_utils import l1_loss, ssim, l1_plus_loss, L_Smooth, L_Illu, L_Gray, L_Depth_similarity, L_Reflectance_Smooth, L_Depth_Smooth, pearson_depth_loss, L_Reflectance_Consistency, L_Reflectance_Edge, L_Reflectance_Edge_Uplift, L_Reflectance_Highlight, L_Reflectance_LocalContrast, L_Residual_Chroma_Boost, L_SG_Energy, L_SG_Sharpness, L_B0_Spatial_Smooth, build_residual_hard_mask
+from utils.loss_utils import l1_loss, ssim, l1_plus_loss, L_Smooth, L_Illu, L_Gray, L_Depth_similarity, L_Reflectance_Smooth, L_Depth_Smooth, pearson_depth_loss, L_Reflectance_Consistency, L_Reflectance_Edge, L_Reflectance_Edge_Uplift, L_Reflectance_Highlight, L_Reflectance_LocalContrast, L_Reflectance_HighFreq, L_Residual_Chroma_Boost, L_SG_Energy, L_SG_Sharpness, L_B0_Spatial_Smooth, build_residual_hard_mask
 from gaussian_renderer import prefilter_voxel, render, network_gui
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -401,6 +401,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             residual_mix_weight = min(1.0, float(iteration - opt.residual_start_iter + 1) / float(ramp_iters))
         residual_hard_mask = torch.zeros_like(gt_image[:1])
         residual_hardmask_coverage = torch.tensor(0.0, device=gt_image.device)
+        residual_error_mask_coverage = torch.tensor(0.0, device=gt_image.device)
+        residual_highlight_mask_coverage = torch.tensor(0.0, device=gt_image.device)
 
         if mode == "warmup":
             residual_image = torch.zeros_like(gt_image)
@@ -411,7 +413,12 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 scaling_residual = render_pkg["scaling_residual"]
                 residual_image = render_pkg["render_residual"]
                 if residual_active:
-                    residual_hard_mask = build_residual_hard_mask(base_image, gt_image, percentile=dataset.residual_hardmask_percentile)
+                    residual_hard_mask, residual_error_mask_coverage, residual_highlight_mask_coverage = build_residual_hard_mask(
+                        base_image,
+                        gt_image,
+                        higherror_percentile=dataset.residual_higherror_percentile,
+                        highlight_percentile=dataset.residual_highlight_percentile,
+                    )
                     residual_hardmask_coverage = residual_hard_mask.mean()
                     residual_image_for_loss = residual_image * residual_mix_weight * residual_hard_mask
                 else:
@@ -444,6 +451,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         L_reflectance_edge = L_Reflectance_Edge(reflectance_image, gt_image)
         L_reflectance_edge_uplift = L_Reflectance_Edge_Uplift(reflectance_image, gt_image)
         L_reflectance_contrast = L_Reflectance_LocalContrast(reflectance_image, gt_image)
+        L_reflectance_highfreq = L_Reflectance_HighFreq(reflectance_image, gt_image)
         L_reflectance_highlight = L_Reflectance_Highlight(reflectance_image)
         L_b0_spatial_smooth = L_B0_Spatial_Smooth(gaussians._base_log_reflectance, gaussians.get_anchor)
         L_reflectance_detail = torch.mean(torch.abs(torch.tanh(gaussians._reflectance_offset_delta)))
@@ -465,6 +473,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             loss += dataset.reflectance_edge_reg * L_reflectance_edge
             loss += dataset.reflectance_edge_uplift_reg * L_reflectance_edge_uplift
             loss += dataset.reflectance_contrast_reg * L_reflectance_contrast
+            loss += dataset.reflectance_highfreq_reg * L_reflectance_highfreq
             loss += dataset.highlight_reflectance_reg * L_reflectance_highlight
             loss += dataset.reflectance_detail_reg * L_reflectance_detail
             loss += dataset.reflectance_decoder_reg * L_reflectance_decoder
@@ -480,6 +489,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 loss += dataset.reflectance_edge_reg * L_reflectance_edge
                 loss += dataset.reflectance_edge_uplift_reg * L_reflectance_edge_uplift
                 loss += dataset.reflectance_contrast_reg * L_reflectance_contrast
+                loss += dataset.reflectance_highfreq_reg * L_reflectance_highfreq
                 loss += dataset.highlight_reflectance_reg * L_reflectance_highlight
                 loss += dataset.reflectance_detail_reg * L_reflectance_detail
                 loss += dataset.reflectance_decoder_reg * L_reflectance_decoder
@@ -493,7 +503,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             if iteration >= opt.update_from * 2:
                 L_diff = torch.abs(illumination_enhanced_image * reflectance_image.detach() - refined_image_dict[viewpoint_cam.uid].cuda()).mean()
                 guidance_progress = min(1.0, max(0.0, float(iteration - opt.update_from * 2) / float(max(1, opt.iterations - opt.update_from * 2))))
-                enhancement_guidance_weight = 1.0 - 0.7 * guidance_progress
+                enhancement_guidance_weight = 1.0 - 0.9 * guidance_progress
                 loss += enhancement_guidance_weight * L_diff
             if dataset.use_residual and residual_active:
                 scaling_residual_reg = scaling_residual.prod(dim=1).mean()
@@ -522,6 +532,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                            'reflectance_edge_mean': L_reflectance_edge,
                            'reflectance_edge_uplift_mean': L_reflectance_edge_uplift,
                            'reflectance_contrast_mean': L_reflectance_contrast,
+                           'reflectance_highfreq_mean': L_reflectance_highfreq,
                            'reflectance_highlight_mean': L_reflectance_highlight,
                            'reflectance_detail_mean': L_reflectance_detail,
                            'reflectance_decoder_mean': L_reflectance_decoder,
@@ -537,11 +548,14 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                            'reflectance_edge_mean': L_reflectance_edge,
                            'reflectance_edge_uplift_mean': L_reflectance_edge_uplift,
                            'reflectance_contrast_mean': L_reflectance_contrast,
+                           'reflectance_highfreq_mean': L_reflectance_highfreq,
                            'reflectance_highlight_mean': L_reflectance_highlight,
                            'reflectance_detail_mean': L_reflectance_detail,
                            'reflectance_decoder_mean': L_reflectance_decoder,
                            'residual_mix_weight': residual_mix_weight,
                            'residual_hardmask_coverage': residual_hardmask_coverage,
+                           'residual_error_mask_coverage': residual_error_mask_coverage,
+                           'residual_highlight_mask_coverage': residual_highlight_mask_coverage,
                            'residual_chroma_mean': residual_chroma_mean,
                            'residual_chroma_boost': L_residual_chroma_boost,
                            'residual_enabled': float(residual_active),
@@ -579,10 +593,13 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         'reflectance_edge_mean': L_reflectance_edge,
                         'reflectance_edge_uplift_mean': L_reflectance_edge_uplift,
                         'reflectance_contrast_mean': L_reflectance_contrast,
+                        'reflectance_highfreq_mean': L_reflectance_highfreq,
                         'reflectance_detail_mean': L_reflectance_detail,
                         'reflectance_decoder_mean': L_reflectance_decoder,
                         'reflectance_highlight_mean': L_reflectance_highlight,
                         'residual_hardmask_coverage': residual_hardmask_coverage,
+                        'residual_error_mask_coverage': residual_error_mask_coverage,
+                        'residual_highlight_mask_coverage': residual_highlight_mask_coverage,
                         'residual_chroma_mean': residual_chroma_mean,
                         'residual_mix_weight': residual_mix_weight,
                         'residual_chroma_boost': L_residual_chroma_boost,
@@ -607,12 +624,15 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 print("reflectance_edge_mean", L_reflectance_edge)
                 print("reflectance_edge_uplift_mean", L_reflectance_edge_uplift)
                 print("reflectance_contrast_mean", L_reflectance_contrast)
+                print("reflectance_highfreq_mean", L_reflectance_highfreq)
                 print("reflectance_detail_mean", L_reflectance_detail)
                 print("reflectance_decoder_mean", L_reflectance_decoder)
                 print("reflectance_highlight_mean", L_reflectance_highlight)
                 print("residual_chroma_mean", residual_chroma_mean)
                 print("residual_mix_weight", residual_mix_weight)
                 print("residual_hardmask_coverage", residual_hardmask_coverage)
+                print("residual_error_mask_coverage", residual_error_mask_coverage)
+                print("residual_highlight_mask_coverage", residual_highlight_mask_coverage)
                 print("residual_chroma_boost", L_residual_chroma_boost)
                 print("image", image.mean())
                 print("gt_image", gt_image.mean())

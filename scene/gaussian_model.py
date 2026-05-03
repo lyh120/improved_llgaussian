@@ -525,7 +525,7 @@ class GaussianModel:
         feat_repeated = feat.unsqueeze(1).expand(-1, self.n_offsets, -1)
         decoder_input = torch.cat([feat_repeated, offsets], dim=-1).reshape(-1, self.feat_dim + 3)
         decoder_out = self.mlp_reflectance_decoder(decoder_input).reshape(-1, self.n_offsets, 3)
-        decoder_refine = 1.0 + 0.25 * torch.tanh(decoder_out)
+        decoder_refine = 1.0 + 0.15 * torch.tanh(decoder_out)
         self._last_reflectance_decoder_mean = torch.abs(torch.tanh(decoder_out)).mean()
         return torch.clamp(reflectance * decoder_refine, 1e-3, 1.0)
 

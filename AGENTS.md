@@ -345,3 +345,13 @@ python render.py -m /home/liuyuhao/ll_further/LL-Gaussian-sg/outputs/chair_sg_ex
 - `train.py`：enhancement 的 `L_diff` 第一项改为阶段性衰减权重，继续保持第二项为 `0.0`，降低 StableSR 伪 GT 对 reflectance 的长期平滑牵引。
 - `train.py`：residual 混入改为 `residual * residual_mix_weight * hard_mask`，默认更早启用（`residual_start_iter=3000`、`residual_ramp_iters=2500`），但只在局部困难区域吸收误差，避免重新参与整图低频拟合。
 - `arguments/__init__.py`：新增 `reflectance_decoder_lr=0.004`、`reflectance_decoder_reg=1e-5`、`reflectance_contrast_reg=2e-3`、`residual_hardmask_percentile=0.8`，并同步更新兼容回填默认值。
+
+### 2026-05-03 fix11 Reflectance 清晰度优先修正
+
+- `utils/loss_utils.py`：重写 `build_residual_hard_mask(...)`，不再使用会退化为整图覆盖的单阈值逻辑；改为高重建误差区域与亮区高彩度区域两个 top-k mask 的并集，并返回 `error/highlight` 两类覆盖率。
+- `utils/loss_utils.py`：新增 `L_Reflectance_HighFreq(...)`，基于灰度 Laplacian 高频响应做 one-sided 结构补强，直接推动 reflectance 从“模糊重建感”向更清晰纹理移动。
+- `train.py`：residual 混入仍保持 `residual * residual_mix_weight * hard_mask`，但现在显式记录 `residual_error_mask_coverage`、`residual_highlight_mask_coverage`，用于检查 residual 是否真的只在局部困难区域介入。
+- `train.py`：新增 `reflectance_highfreq_mean` 日志，并将 `reflectance_highfreq_reg` 接入 warmup 与 normal train 的 reflectance 结构监督链。
+- `train.py`：enhancement 第一项的衰减曲线从尾值 `0.3` 调低到 `0.1`，进一步减少 StableSR 伪 GT 对 reflectance 的长期拖软。
+- `scene/gaussian_model.py`：将 reflectance decoder refinement 缩放从 `0.25` 下调到 `0.15`，把 decoder 从大幅补偿器收紧为局部微调器，避免 decoder 饱和却不产出有效结构。
+- `arguments/__init__.py`：新增 `reflectance_highfreq_reg=3e-3`、`residual_higherror_percentile=0.8`、`residual_highlight_percentile=0.9`，并将 `reflectance_decoder_lr` 从 `0.004` 下调到 `0.002`、`reflectance_decoder_reg` 从 `1e-5` 上调到 `2e-5`，同步写入兼容回填默认值。

@@ -93,11 +93,14 @@ class ModelParams(ParamGroup):
         self.reflectance_edge_reg = 2e-4
         self.reflectance_edge_uplift_reg = 3e-3
         self.reflectance_contrast_reg = 2e-3
+        self.reflectance_highfreq_reg = 3e-3
         self.highlight_reflectance_reg = 1e-3
         self.residual_chroma_reg = 5e-4
         self.reflectance_detail_reg = 1e-6
-        self.reflectance_decoder_reg = 1e-5
+        self.reflectance_decoder_reg = 2e-5
         self.residual_hardmask_percentile = 0.8
+        self.residual_higherror_percentile = 0.8
+        self.residual_highlight_percentile = 0.9
         self.b0_spatial_smooth_reg = 0.0
         self.prune_ratio = 0.05
         self.beta = 1.0
@@ -182,7 +185,7 @@ class OptimizationParams(ParamGroup):
         self.lambda_dssim = 0.3
         self.b0_lr = 0.001
         self.reflectance_offset_lr = 0.008
-        self.reflectance_decoder_lr = 0.004
+        self.reflectance_decoder_lr = 0.002
         
         # for anchor densification
         self.start_stat = 500
@@ -222,14 +225,17 @@ def _backfill_model_compatibility(merged_dict):
         "reflectance_edge_reg": 2e-4,
         "reflectance_edge_uplift_reg": 3e-3,
         "reflectance_contrast_reg": 2e-3,
+        "reflectance_highfreq_reg": 3e-3,
         "highlight_reflectance_reg": 1e-3,
         "residual_chroma_reg": 5e-4,
         "reflectance_detail_reg": 1e-6,
-        "reflectance_decoder_reg": 1e-5,
+        "reflectance_decoder_reg": 2e-5,
         "b0_lr": 0.001,
         "reflectance_offset_lr": 0.008,
-        "reflectance_decoder_lr": 0.004,
+        "reflectance_decoder_lr": 0.002,
         "residual_hardmask_percentile": 0.8,
+        "residual_higherror_percentile": 0.8,
+        "residual_highlight_percentile": 0.9,
         "b0_spatial_smooth_reg": 0.0,
         "residual_start_iter": 3_000,
         "residual_ramp_iters": 2_500,
