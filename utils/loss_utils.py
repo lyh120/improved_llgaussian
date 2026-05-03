@@ -239,6 +239,29 @@ def L_Reflectance_Edge_Uplift(reflectance_image, gt_image, threshold=0.15, targe
     return (F.relu(target - ref_grad_norm) * edge_mask).mean()
 
 
+def _local_std(gray_image, kernel_size=5):
+    gray_image = gray_image.unsqueeze(0)
+    mean = F.avg_pool2d(gray_image, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
+    mean_sq = F.avg_pool2d(gray_image * gray_image, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
+    var = torch.clamp(mean_sq - mean * mean, min=0.0)
+    return torch.sqrt(var + 1e-6).squeeze(0)
+
+
+def L_Reflectance_LocalContrast(reflectance_image, gt_image, threshold=0.1, target_ratio=0.8):
+    """Encourage reflectance to recover local grayscale contrast without copying highlight colors."""
+    gt_image = gt_image.detach()
+    reflectance_gray = reflectance_image.mean(dim=0, keepdim=True)
+    gt_gray = 0.299 * gt_image[0:1] + 0.587 * gt_image[1:2] + 0.114 * gt_image[2:3]
+
+    reflectance_std = _local_std(reflectance_gray)
+    gt_std = _local_std(gt_gray).detach()
+    reflectance_std_norm = reflectance_std / (reflectance_std.mean().detach() + 1e-6)
+    gt_std_norm = gt_std / (gt_std.mean().detach() + 1e-6)
+    texture_mask = torch.clamp(gt_std_norm - threshold, 0.0, 1.0).detach()
+    target = target_ratio * gt_std_norm
+    return (F.relu(target - reflectance_std_norm) * texture_mask).mean()
+
+
 def L_Residual_Chroma_Boost(residual_image, reflectance_image, threshold=0.6):
     """Encourage residual to carry a small amount of chroma in bright reflectance regions."""
     reflectance_value = reflectance_image.mean(dim=0, keepdim=True).detach()
@@ -246,6 +269,27 @@ def L_Residual_Chroma_Boost(residual_image, reflectance_image, threshold=0.6):
     residual_value = residual_image.mean(dim=0, keepdim=True)
     residual_chroma = torch.abs(residual_image - residual_value).mean(dim=0, keepdim=True)
     return -(residual_chroma * bright_mask).mean()
+
+
+def build_residual_hard_mask(base_image, gt_image, percentile=0.8, bright_threshold=0.6):
+    """Build a sparse residual mask from hard reconstruction regions and bright chromatic highlights."""
+    gt_image = gt_image.detach()
+    base_image = base_image.detach()
+    recon_error = torch.abs(gt_image - base_image).mean(dim=0, keepdim=True)
+    error_threshold = torch.quantile(recon_error.flatten(), percentile)
+    error_mask = (recon_error >= error_threshold).float()
+
+    gt_value = gt_image.mean(dim=0, keepdim=True)
+    gt_chroma = torch.abs(gt_image - gt_value).mean(dim=0, keepdim=True)
+    bright_mask = torch.clamp((gt_value - bright_threshold) / max(1e-6, 1.0 - bright_threshold), 0.0, 1.0)
+    chroma_score = gt_chroma * bright_mask
+    chroma_threshold = torch.quantile(chroma_score.flatten(), percentile)
+    chroma_mask = (chroma_score >= chroma_threshold).float()
+
+    hard_mask = torch.clamp(error_mask + chroma_mask, 0.0, 1.0)
+    if hard_mask.mean().item() <= 0:
+        return error_mask
+    return hard_mask
 
 
 def L_SG_Energy(sg_stats):

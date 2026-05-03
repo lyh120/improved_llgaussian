@@ -334,3 +334,14 @@ python render.py -m /home/liuyuhao/ll_further/LL-Gaussian-sg/outputs/chair_sg_ex
 - `utils/loss_utils.py`：重写 `L_Reflectance_Edge_Uplift(...)`，改为基于归一化梯度的 one-sided hinge；只惩罚 R 边缘弱于 GT 结构边缘的区域，避免因为原始梯度量级过小导致补边损失长期几乎为零。
 - `train.py`：将 residual 从“到点硬开”改为“更早启用、线性爬坡”，通过 `residual_mix_weight` 控制 `render_residual` 进入 `image_tmp` 的比例，减轻一启用就出现的大幅 spike。
 - `train.py`：新增 `residual_mix_weight` 到 wandb 与 debug 输出，便于检查 residual 介入时机和爬坡状态是否合理。
+
+### 2026-05-03 fix10 反射率优先锐化
+
+- `scene/gaussian_model.py`：新增 view-independent `mlp_reflectance_decoder`，输入仅使用 anchor 特征与 offset 局部几何，不接 view direction、不接 illumination；最终 reflectance 改为 `exp(B0 + detail) * (1 + 0.25 * tanh(decoder_out))` 后再 clamp。
+- `scene/gaussian_model.py`：将 reflectance decoder 接入 `eval/train`、optimizer 参数组、学习率调度、freeze 逻辑，以及 split/unite checkpoint 的保存与恢复链路。
+- `gaussian_renderer/__init__.py`：主渲染路径与 fast 路径统一改为使用 decoder-refined reflectance，不再仅依赖 `B0 + offset-detail` 的参数表表达。
+- `utils/loss_utils.py`：新增 `L_Reflectance_LocalContrast(...)`，使用 GT 灰度局部对比度对 reflectance 做单边补强；新增 `build_residual_hard_mask(...)`，从高重建误差区域与高彩度亮区构造 residual 的局部补偿 mask。
+- `train.py`：接入 `reflectance_contrast_reg` 与 `reflectance_decoder_reg` 两个新损失；新增 `reflectance_contrast_mean`、`reflectance_decoder_mean`、`residual_hardmask_coverage` 日志。
+- `train.py`：enhancement 的 `L_diff` 第一项改为阶段性衰减权重，继续保持第二项为 `0.0`，降低 StableSR 伪 GT 对 reflectance 的长期平滑牵引。
+- `train.py`：residual 混入改为 `residual * residual_mix_weight * hard_mask`，默认更早启用（`residual_start_iter=3000`、`residual_ramp_iters=2500`），但只在局部困难区域吸收误差，避免重新参与整图低频拟合。
+- `arguments/__init__.py`：新增 `reflectance_decoder_lr=0.004`、`reflectance_decoder_reg=1e-5`、`reflectance_contrast_reg=2e-3`、`residual_hardmask_percentile=0.8`，并同步更新兼容回填默认值。

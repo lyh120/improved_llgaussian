@@ -83,7 +83,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
 
     cat_local_view = torch.cat([feat, ob_view, ob_dist], dim=1) # [N, c+3+1]
     cat_local_view_wodist = torch.cat([feat, ob_view], dim=1) # [N, c+3]
-    reflectance_base = pc.get_reflectance_with_detail[visible_mask]
+    reflectance_base = pc.get_reflectance_with_decoder(feat, grid_offsets, visible_mask)
 
     ## for illumination
     cat_local_view_illumination = torch.cat([feat[:, pc.feat_dim//2:], ob_view, ob_dist], dim=1) # [N, c+3+1]
@@ -692,7 +692,7 @@ def generate_neural_gaussians_fast(viewpoint_camera, pc : GaussianModel, visible
     # cat_local_view = torch.cat([feat, ob_view, ob_dist], dim=1) # [N, c+3+1]
     cat_local_view_wodist = torch.cat([feat, ob_view], dim=1) # [N, c+3]
     # cat_local_view_woview = torch.cat([feat, ob_dist], dim=1) # [N, c+1]
-    reflectance_base = pc.get_reflectance_with_detail[visible_mask]
+    reflectance_base = pc.get_reflectance_with_decoder(feat, grid_offsets, visible_mask)
 
     ## for illumination
     cat_local_view_illumination = torch.cat([feat[:, pc.feat_dim//2:], ob_view, ob_dist], dim=1) # [N, c+3+1]
