@@ -325,3 +325,12 @@ python render.py -m /home/liuyuhao/ll_further/LL-Gaussian-sg/outputs/chair_sg_ex
 - `train.py`：将 `L_diff` 第二项系数从 `0.02` 改为 `0.0`，默认不再让 StableSR 伪 GT 直接回传梯度到 reflectance，只保留增强光照分支监督。
 - `train.py`：新增 `reflectance_edge_uplift_mean` 到 wandb 与 debug 输出，便于观察 R 的边缘补强是否真正生效。
 - 训练建议：8k 诊断训练中将 `residual_start_iter` 推迟到 `6000`，让 `R * L` 先承担主要结构重建，再允许 residual 做少量补偿。
+
+### 2026-05-03 fix8.1 Reflectance 补边增强与 Residual 线性爬坡
+
+- `arguments/__init__.py`：将 `reflectance_edge_uplift_reg` 从 `1e-3` 提高到 `3e-3`，将 `reflectance_detail_reg` 从 `2e-6` 继续降到 `1e-6`，并将 `reflectance_offset_lr` 从 `0.006` 提高到 `0.008`，进一步放大 offset-detail 对 R 清晰度的贡献。
+- `arguments/__init__.py`：新增 `residual_ramp_iters = 2000`，用于控制 residual 从启用到全量参与主重建的线性爬坡时长。
+- `scene/gaussian_model.py`：将 `reflectance_detail_scale` 从 `0.8` 提高到 `1.1`，增强 `exp(B0 + scale * tanh(detail))` 中 detail 对 reflectance 局部对比和纹理的影响。
+- `utils/loss_utils.py`：重写 `L_Reflectance_Edge_Uplift(...)`，改为基于归一化梯度的 one-sided hinge；只惩罚 R 边缘弱于 GT 结构边缘的区域，避免因为原始梯度量级过小导致补边损失长期几乎为零。
+- `train.py`：将 residual 从“到点硬开”改为“更早启用、线性爬坡”，通过 `residual_mix_weight` 控制 `render_residual` 进入 `image_tmp` 的比例，减轻一启用就出现的大幅 spike。
+- `train.py`：新增 `residual_mix_weight` 到 wandb 与 debug 输出，便于检查 residual 介入时机和爬坡状态是否合理。

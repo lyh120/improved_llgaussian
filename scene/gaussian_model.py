@@ -118,7 +118,7 @@ class GaussianModel:
         self.sg_lambda_min = sg_lambda_min
         self.sg_illumination_available = use_sg_illumination
         self.legacy_compatibility_mode = illumination_mode == "legacy"
-        self.reflectance_detail_scale = 0.8
+        self.reflectance_detail_scale = 1.1
         
         ## residual
         self.use_residual = use_residual

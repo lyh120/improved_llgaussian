@@ -394,6 +394,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         depth_piror_norm = depth_piror_dict[viewpoint_cam.uid]
 
         residual_active = dataset.use_residual and mode != "warmup" and iteration >= opt.residual_start_iter
+        residual_mix_weight = 0.0
+        if residual_active:
+            ramp_iters = max(1, opt.residual_ramp_iters)
+            residual_mix_weight = min(1.0, float(iteration - opt.residual_start_iter + 1) / float(ramp_iters))
 
         if mode == "warmup":
             residual_image = torch.zeros_like(gt_image)
@@ -403,7 +407,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             if "render_residual" in render_pkg:
                 scaling_residual = render_pkg["scaling_residual"]
                 residual_image = render_pkg["render_residual"]
-                residual_image_for_loss = residual_image if residual_active else torch.zeros_like(residual_image)
+                residual_image_for_loss = residual_image * residual_mix_weight if residual_active else torch.zeros_like(residual_image)
                 image_tmp = torch.clamp(reflectance_image * illumination_image + residual_image_for_loss, 0.0, 1.0)
             else:
                 residual_image = torch.zeros_like(gt_image)
@@ -502,6 +506,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                            'reflectance_edge_uplift_mean': L_reflectance_edge_uplift,
                            'reflectance_highlight_mean': L_reflectance_highlight,
                            'reflectance_detail_mean': L_reflectance_detail,
+                           'residual_mix_weight': residual_mix_weight,
                            'residual_chroma_boost': L_residual_chroma_boost})
             else:
                 residual_chroma_mean = torch.abs(residual_image_for_loss - residual_image_for_loss.mean(dim=0, keepdim=True)).mean()
@@ -514,6 +519,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                            'reflectance_edge_uplift_mean': L_reflectance_edge_uplift,
                            'reflectance_highlight_mean': L_reflectance_highlight,
                            'reflectance_detail_mean': L_reflectance_detail,
+                           'residual_mix_weight': residual_mix_weight,
                            'residual_chroma_mean': residual_chroma_mean,
                            'residual_chroma_boost': L_residual_chroma_boost,
                            'residual_enabled': float(residual_active)})
@@ -552,6 +558,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         'reflectance_detail_mean': L_reflectance_detail,
                         'reflectance_highlight_mean': L_reflectance_highlight,
                         'residual_chroma_mean': residual_chroma_mean,
+                        'residual_mix_weight': residual_mix_weight,
                         'residual_chroma_boost': L_residual_chroma_boost,
                         'illumination':wandb.Image(torchvision.transforms.ToPILImage()(illumination_image)),
                         'reflectance':wandb.Image(torchvision.transforms.ToPILImage()(reflectance_image)),
@@ -576,6 +583,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 print("reflectance_detail_mean", L_reflectance_detail)
                 print("reflectance_highlight_mean", L_reflectance_highlight)
                 print("residual_chroma_mean", residual_chroma_mean)
+                print("residual_mix_weight", residual_mix_weight)
                 print("residual_chroma_boost", L_residual_chroma_boost)
                 print("image", image.mean())
                 print("gt_image", gt_image.mean())

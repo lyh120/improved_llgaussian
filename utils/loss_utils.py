@@ -219,8 +219,8 @@ def L_Reflectance_Edge(reflectance_image, gt_image, threshold=0.03):
     return (torch.abs(ref_grad_norm - gt_grad_norm) * edge_mask).mean()
 
 
-def L_Reflectance_Edge_Uplift(reflectance_image, gt_image, threshold=0.03, target_ratio=0.75):
-    """Only penalize reflectance edges that are weaker than image structure edges."""
+def L_Reflectance_Edge_Uplift(reflectance_image, gt_image, threshold=0.15, target_ratio=0.85):
+    """Only penalize reflectance edges that are weaker than normalized image structure edges."""
     gt_image = gt_image.detach()
     reflectance_gray = reflectance_image.mean(dim=0, keepdim=True)
     gt_gray = 0.299 * gt_image[0:1] + 0.587 * gt_image[1:2] + 0.114 * gt_image[2:3]
@@ -232,9 +232,11 @@ def L_Reflectance_Edge_Uplift(reflectance_image, gt_image, threshold=0.03, targe
 
     ref_grad = torch.sqrt(ref_dx ** 2 + ref_dy ** 2 + 1e-8)
     gt_grad = torch.sqrt(gt_dx ** 2 + gt_dy ** 2 + 1e-8).detach()
-    edge_mask = torch.clamp((gt_grad - threshold) / max(1e-6, 1.0 - threshold), 0.0, 1.0).detach()
-    target = target_ratio * gt_grad
-    return (F.relu(target - ref_grad) * edge_mask).mean()
+    ref_grad_norm = ref_grad / (ref_grad.mean().detach() + 1e-6)
+    gt_grad_norm = gt_grad / (gt_grad.mean().detach() + 1e-6)
+    edge_mask = torch.clamp(gt_grad_norm - threshold, 0.0, 1.0).detach()
+    target = target_ratio * gt_grad_norm
+    return (F.relu(target - ref_grad_norm) * edge_mask).mean()
 
 
 def L_Residual_Chroma_Boost(residual_image, reflectance_image, threshold=0.6):
