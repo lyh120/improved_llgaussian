@@ -349,3 +349,33 @@ def L_Gray(image):
     GB = (image[2]-image[0]) ** 2
     k = torch.sqrt(RG + GB + RB + 1e-8)
     return k.mean()
+
+
+def L_B0_Spatial_Smooth(base_log_reflectance, anchor_positions, knn=8):
+    """3D spatial smoothness for B0 (base_log_reflectance).
+    Encourages nearby anchors in 3D space to have similar B0 values.
+    Uses random pair sampling with distance weighting for efficiency.
+    """
+    from simple_knn._C import distCUDA2
+    N = anchor_positions.shape[0]
+    if N < 2:
+        return torch.tensor(0.0, device=anchor_positions.device)
+
+    dist2 = torch.clamp_min(distCUDA2(anchor_positions).float().cuda(), 1e-10)
+    median_dist = dist2.median().clamp(min=1e-6)
+
+    num_pairs = min(N * knn, 100000)
+    idx_i = torch.randint(0, N, (num_pairs,), device=anchor_positions.device)
+    idx_j = torch.randint(0, N, (num_pairs,), device=anchor_positions.device)
+
+    pos_i = anchor_positions[idx_i]
+    pos_j = anchor_positions[idx_j]
+    b0_i = base_log_reflectance[idx_i]
+    b0_j = base_log_reflectance[idx_j]
+
+    dist_sq = ((pos_i - pos_j) ** 2).sum(dim=-1, keepdim=True)
+    weight = torch.exp(-dist_sq / (2 * median_dist ** 2))
+
+    diff = (b0_i - b0_j) ** 2
+    loss = (weight * diff).sum() / (weight.sum() + 1e-8)
+    return loss

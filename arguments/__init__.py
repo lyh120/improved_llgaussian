@@ -87,8 +87,10 @@ class ModelParams(ParamGroup):
         self.sg_lobes = 4
         self.sg_lambda_min = 1.0
         self.sg_energy_reg = 1e-4
-        self.sg_smooth_reg = 1e-4
-        self.reflectance_consistency_reg = 1e-4
+        self.sg_smooth_reg = 5e-5
+        self.reflectance_consistency_reg = 2e-4
+        self.reflectance_smooth_reg = 1e-4
+        self.b0_spatial_smooth_reg = 0.0
         self.prune_ratio = 0.05
         self.beta = 1.0
         
@@ -170,6 +172,7 @@ class OptimizationParams(ParamGroup):
 
         self.percent_dense = 0.01
         self.lambda_dssim = 0.3
+        self.b0_lr = 0.001
         
         # for anchor densification
         self.start_stat = 500
@@ -177,6 +180,7 @@ class OptimizationParams(ParamGroup):
         self.update_interval = 100
         self.update_until = 15_000
         self.enhancement_from = 10_000
+        self.residual_start_iter = 12_000
         
         self.min_opacity = 0.005
         self.success_threshold = 0.8
@@ -201,8 +205,12 @@ def _backfill_model_compatibility(merged_dict):
         "sg_lobes": 4,
         "sg_lambda_min": 1.0,
         "sg_energy_reg": 1e-4,
-        "sg_smooth_reg": 1e-4,
-        "reflectance_consistency_reg": 1e-4,
+        "sg_smooth_reg": 5e-5,
+        "reflectance_consistency_reg": 2e-4,
+        "reflectance_smooth_reg": 1e-4,
+        "b0_lr": 0.001,
+        "b0_spatial_smooth_reg": 0.0,
+        "residual_start_iter": 12_000,
     }
     for key, value in defaults.items():
         merged_dict.setdefault(key, value)

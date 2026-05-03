@@ -46,7 +46,7 @@ sys.path.append("./submodules/Depth-Anything-V2")
 # from lpipsPyTorch import lpips
 import lpips
 from random import randint
-from utils.loss_utils import l1_loss, ssim, l1_plus_loss, L_Smooth, L_Illu, L_Gray, L_Depth_similarity, L_Reflectance_Smooth, L_Depth_Smooth, pearson_depth_loss, L_Reflectance_Consistency, L_SG_Energy, L_SG_Sharpness
+from utils.loss_utils import l1_loss, ssim, l1_plus_loss, L_Smooth, L_Illu, L_Gray, L_Depth_similarity, L_Reflectance_Smooth, L_Depth_Smooth, pearson_depth_loss, L_Reflectance_Consistency, L_SG_Energy, L_SG_Sharpness, L_B0_Spatial_Smooth
 from gaussian_renderer import prefilter_voxel, render, network_gui
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -165,6 +165,56 @@ class LinearDecayWeight:
         return max(weight, self.final)  # 确保不低于最终值
 
 
+def _visible_count_value(visible_count):
+    if visible_count is None:
+        return 0.0
+    if isinstance(visible_count, (int, float)):
+        return float(visible_count)
+    if torch.is_tensor(visible_count):
+        if visible_count.numel() == 0:
+            return 0.0
+        return float(visible_count.float().mean().item())
+    if isinstance(visible_count, (list, tuple)):
+        if len(visible_count) == 0:
+            return 0.0
+        values = []
+        for item in visible_count:
+            if torch.is_tensor(item):
+                values.append(float(item.detach().float().item()))
+            else:
+                values.append(float(item))
+        return float(sum(values) / len(values))
+    return float(visible_count)
+
+
+def _visible_count_per_view(visible_count, image_names):
+    if visible_count is None:
+        return {name: 0.0 for name in image_names}
+    if isinstance(visible_count, (int, float)):
+        return {name: float(visible_count) for name in image_names}
+    if torch.is_tensor(visible_count):
+        values = visible_count.detach().flatten().float().cpu().tolist()
+    elif isinstance(visible_count, (list, tuple)):
+        values = []
+        for item in visible_count:
+            if torch.is_tensor(item):
+                values.append(float(item.detach().float().item()))
+            else:
+                values.append(float(item))
+    else:
+        return {name: float(visible_count) for name in image_names}
+
+    if len(values) == 0:
+        return {name: 0.0 for name in image_names}
+    if len(values) == 1 and len(image_names) > 1:
+        values = values * len(image_names)
+
+    return {
+        name: float(values[min(idx, len(values) - 1)])
+        for idx, name in enumerate(image_names)
+    }
+
+
 def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb=None, logger=None, ply_path=None, mode="train"):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -209,7 +259,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     if mode=="warmup":
         gaussians.P.requires_grad_(False)
 
-    weight_scheduler = LinearDecayWeight(initial_weight=2, final_weight=0.5,total_steps=opt.iterations)
+    weight_scheduler = LinearDecayWeight(initial_weight=2, final_weight=1.0,total_steps=opt.iterations)
     weight_scheduler2 = LinearDecayWeight(initial_weight=5e-4, final_weight=1e-3,total_steps=opt.update_until)
 
     if mode == "warmup":
@@ -343,24 +393,30 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         gt_image = viewpoint_cam.original_image.cuda()
         depth_piror_norm = depth_piror_dict[viewpoint_cam.uid]
 
+        residual_active = dataset.use_residual and mode != "warmup" and iteration >= opt.residual_start_iter
+
         if mode == "warmup":
+            residual_image = torch.zeros_like(gt_image)
+            residual_image_for_loss = residual_image
             image_tmp = torch.clamp(reflectance_image * illumination_image, 0.0, 1.0)
         else:
             if "render_residual" in render_pkg:
                 scaling_residual = render_pkg["scaling_residual"]
                 residual_image = render_pkg["render_residual"]
-                image_tmp = torch.clamp(reflectance_image * illumination_image + residual_image, 0.0, 1.0) # edit
+                residual_image_for_loss = residual_image if residual_active else torch.zeros_like(residual_image)
+                image_tmp = torch.clamp(reflectance_image * illumination_image + residual_image_for_loss, 0.0, 1.0)
             else:
-                residual_image = torch.zeros_like(gt_image) 
+                residual_image = torch.zeros_like(gt_image)
+                residual_image_for_loss = residual_image
                 image_tmp = torch.clamp(reflectance_image * illumination_image, 0.0, 1.0)
         timing_stats["data_time"] = timing_stats.get("data_time", 0) + (time.time() - t1)
         t2 = time.time()
 
         Ll1_value = l1_plus_loss(image_tmp, gt_image, phi=0.5/255)
         Ll1 = torch.abs(Ll1_value).mean()
-        L_smooth =  L_Smooth(illumination_image, gt_image, kernel_size=9) * 1e-3
+        L_smooth =  L_Smooth(illumination_image, gt_image, kernel_size=9) * 5e-4
         L_illu = L_Illu(gt_image, illumination_image) 
-        L_reflectance_smooth = L_Reflectance_Smooth(reflectance_image, illumination_image) * 5e-4
+        L_reflectance_smooth = L_Reflectance_Smooth(reflectance_image, illumination_image) * dataset.reflectance_smooth_reg
         L_depth_similarity = (L_Depth_similarity(1 - minmax_normalize(depth_image).squeeze(0), depth_piror_norm.squeeze(0), 128, 0.5) ) * 0.15
         
         if FUSED_SSIM_AVAILABLE:
@@ -373,6 +429,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         L_sg_energy = L_SG_Energy(sg_stats)
         L_sg_sharpness = L_SG_Sharpness(sg_stats)
         L_reflectance_consistency = L_Reflectance_Consistency(reflectance_image)
+        L_b0_spatial_smooth = L_B0_Spatial_Smooth(gaussians._base_log_reflectance, gaussians.get_anchor)
+        L_residual_reg = torch.tensor(0.0, device=gt_image.device)
 
         if torch.isnan(scaling_reg) or torch.isinf(scaling_reg):
             print("Warning: scaling_reg is nan or inf")
@@ -383,27 +441,28 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             if iteration >= opt.update_from:
                 loss += L_smooth * 0.1 +  L_depth_similarity 
             loss += dataset.reflectance_consistency_reg * (L_reflectance_consistency + L_reflectance_smooth)
+            loss += dataset.b0_spatial_smooth_reg * L_b0_spatial_smooth
         else:
             loss = (1.0 - opt.lambda_dssim ) * Ll1 + opt.lambda_dssim *  ssim_loss + L_illu + 0.01 * scaling_reg  
-
             
             if iteration >= opt.update_from:
                 loss +=  L_smooth + L_depth_similarity
                 loss += dataset.sg_energy_reg * L_sg_energy
                 loss += dataset.sg_smooth_reg * L_sg_sharpness
                 loss += dataset.reflectance_consistency_reg * (L_reflectance_consistency + L_reflectance_smooth)
+                loss += dataset.b0_spatial_smooth_reg * L_b0_spatial_smooth
 
             L_diff = 0
             if iteration >= opt.update_from:
-                L_degree = torch.abs((illumination_enhanced_image.mean(0) - torch.clamp(illumination_image.mean(0).detach() * enhance_ratio, 0, 1))).mean() * 0.2 + torch.abs(illumination_enhanced_image.mean() - illumination_image.mean().detach() * enhance_ratio) * 0.05
-                L_smooth_enhancement = L_Smooth(illumination_enhanced_image/enhance_ratio, gt_image, kernel_size=9) * 5e-4
+                L_degree = torch.abs((illumination_enhanced_image.mean(0) - torch.clamp(illumination_image.mean(0).detach() * enhance_ratio, 0, 1))).mean() * 0.1 + torch.abs(illumination_enhanced_image.mean() - illumination_image.mean().detach() * enhance_ratio) * 0.02
+                L_smooth_enhancement = L_Smooth(illumination_enhanced_image/enhance_ratio, gt_image, kernel_size=9) * 2e-4
                 loss += L_degree + L_smooth_enhancement
             if iteration >= opt.update_from * 2:
-                L_diff =  torch.abs(illumination_enhanced_image * reflectance_image.detach() - refined_image_dict[viewpoint_cam.uid].cuda()).mean() + torch.abs(illumination_enhanced_image.detach() * reflectance_image - refined_image_dict[viewpoint_cam.uid].cuda()).mean() * 0.2
+                L_diff =  torch.abs(illumination_enhanced_image * reflectance_image.detach() - refined_image_dict[viewpoint_cam.uid].cuda()).mean() + torch.abs(illumination_enhanced_image.detach() * reflectance_image - refined_image_dict[viewpoint_cam.uid].cuda()).mean() * 0.05
                 loss += L_diff
-            if dataset.use_residual:
+            if dataset.use_residual and residual_active:
                 scaling_residual_reg = scaling_residual.prod(dim=1).mean()
-                L_residual_reg = torch.mean(torch.abs(residual_image)) * weight_scheduler(iteration)
+                L_residual_reg = torch.mean(torch.abs(residual_image_for_loss)) * weight_scheduler(iteration)
                 loss += L_residual_reg + 0.05 * scaling_residual_reg 
  
         timing_stats['loss_time'] = timing_stats.get('loss_time', 0) + (time.time() - t2)
@@ -429,7 +488,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                            'illumination_mean': illumination_image.mean(),
                            'sg_energy': L_sg_energy,
                            'sg_lambda_mean': L_sg_sharpness,
-                           'reflectance_consistency': L_reflectance_consistency})
+                           'reflectance_consistency': L_reflectance_consistency,
+                           'residual_enabled': float(residual_active)})
             if (iteration - 1) % 600 == 0:
                 gt_image = torch.clamp(gt_image * enhance_ratio, 0.0, 1.0)
                 image = torch.clamp(image_tmp * enhance_ratio, 0.0, 1.0)
@@ -438,8 +498,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 if not dataset.use_residual or mode=="warmup":
                     residual_image = torch.zeros_like(image)
                 residual_scaled = residual_image * enhance_ratio
+                residual_scaled_used = residual_image_for_loss * enhance_ratio
                 residual_image_raw = torch.clamp(residual_scaled, 0.0, 1.0)
                 residual_abs = residual_scaled.abs()
+                residual_abs_used = residual_scaled_used.abs()
                 residual_abs_max = residual_abs.max()
                 if residual_abs_max.item() > 0:
                     residual_image_vis = residual_abs / (residual_abs_max + 1e-6)
@@ -454,6 +516,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         'depth':wandb.Image(1-minmax_normalize(depth_image)),
                         'residual_image':wandb.Image(torchvision.transforms.ToPILImage()(residual_image_vis)),
                         'residual_image_raw':wandb.Image(torchvision.transforms.ToPILImage()(residual_image_raw)),
+                        'residual_abs_mean_raw': residual_abs.mean(),
+                        'residual_abs_mean_used': residual_abs_used.mean(),
                         'residual_abs_mean': residual_abs.mean(),
                         'illumination':wandb.Image(torchvision.transforms.ToPILImage()(illumination_image)),
                         'reflectance':wandb.Image(torchvision.transforms.ToPILImage()(reflectance_image)),
@@ -471,7 +535,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 print("sg_energy", L_sg_energy)
                 print("sg_lambda_mean", L_sg_sharpness)
                 print("residual_image_raw_mean", residual_image_raw.mean())
-                print("residual_abs_mean", residual_abs.mean())
+                print("residual_abs_mean_raw", residual_abs.mean())
+                print("residual_abs_mean_used", residual_abs_used.mean())
                 print("image", image.mean())
                 print("gt_image", gt_image.mean())
 
@@ -859,6 +924,8 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         if not os.path.exists(dataset.model_path):
             os.makedirs(dataset.model_path)
 
+        visible_count = None
+
         if not skip_train:
             t_train_list, visible_count  = render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, dataset.kernel_size)
             train_fps = 1.0 / torch.tensor(t_train_list[5:]).mean()
@@ -869,7 +936,6 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
     if not skip_test:
         gaussians.init_RT_seq(scene.test_cameras)
         render_set_optimize(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, dataset.kernel_size)
-        visible_count = 0
     
     return visible_count
 
@@ -941,7 +1007,7 @@ def evaluate(model_paths, visible_count=None, wandb=None, tb_writer=None, datase
             tb_writer.add_scalar(f'{dataset_name}/PSNR', torch.tensor(psnrs).mean().item(), 0)
             tb_writer.add_scalar(f'{dataset_name}/LPIPS', torch.tensor(lpipss).mean().item(), 0)
             
-            tb_writer.add_scalar(f'{dataset_name}/VISIBLE_NUMS', torch.tensor(visible_count).mean().item(), 0)
+            tb_writer.add_scalar(f'{dataset_name}/VISIBLE_NUMS', _visible_count_value(visible_count), 0)
         
         full_dict[scene_dir][method].update({"SSIM": torch.tensor(ssims).mean().item(),
                                                 "PSNR": torch.tensor(psnrs).mean().item(),
@@ -949,7 +1015,7 @@ def evaluate(model_paths, visible_count=None, wandb=None, tb_writer=None, datase
         per_view_dict[scene_dir][method].update({"SSIM": {name: ssim for ssim, name in zip(torch.tensor(ssims).tolist(), image_names)},
                                                     "PSNR": {name: psnr for psnr, name in zip(torch.tensor(psnrs).tolist(), image_names)},
                                                     "LPIPS": {name: lp for lp, name in zip(torch.tensor(lpipss).tolist(), image_names)},
-                                                    "VISIBLE_COUNT": {name: vc for vc, name in zip(torch.tensor(visible_count).tolist(), image_names)}})
+                                                    "VISIBLE_COUNT": _visible_count_per_view(visible_count, image_names)})
 
     with open(scene_dir + "/results.json", 'w') as fp:
         json.dump(full_dict[scene_dir], fp, indent=True)

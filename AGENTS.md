@@ -218,3 +218,55 @@ python render.py -m /home/liuyuhao/ll_further/LL-Gaussian-sg/outputs/chair_sg_ex
 - `render.py`ï¼šæ–°å¢å‘½ä»¤è¡Œå‚æ•° `--eval_train_metrics`ï¼Œç”¨äºåœ¨æ¸²æŸ“ train é›†æ—¶åŒæ—¶è®¡ç®—å¹¶ä¿å­˜æŒ‡æ ‡ JSONã€‚
 - `render.py`ï¼šå¼€å¯å train ç›®å½•åŒæ ·è¾“å‡º `metrics_lowlight.json` å’Œ `metrics_enhanced_gt.json`ï¼Œå¹¶åœ¨ç»ˆç«¯æ‰“å° summaryï¼ˆå¹³å‡ `PSNR / SSIM / LPIPS`ï¼‰ã€‚
 - è¯´æ˜ï¼šé»˜è®¤ä¸åŠ è¯¥å‚æ•°æ—¶ï¼Œtrain ä»åªå¯¼å›¾ä¸ç®—æŒ‡æ ‡ï¼Œä»¥èŠ‚çœæ¸²æŸ“æ—¶é—´ã€‚
+
+### 2026-05-03 Reflectance è§£è€¦çº åï¼ˆæœ€å°ä¿®å¤ç‰ˆï¼‰
+
+- `train.py`ï¼šæ¢å¤ä¸»é‡å»ºä¸­ `reflectance_image * illumination_image (+ residual)` å¯¹ reflectance çš„æ¢¯åº¦ï¼Œä¸å†åœ¨ `image_tmp` ä¸­å¯¹ `reflectance_image` åš `detach()`ã€‚
+- `train.py`ï¼šæ¢å¤ `L_diff` ç¬¬äºŒé¡¹å¯¹ reflectance çš„ç›‘ç£ï¼Œåªä¿ç•™ç¬¬ä¸€é¡¹ä¸­å¯¹ reflectance çš„ `detach()`ï¼Œé¿å…å¢å¼ºæ”¯è·¯å®Œå…¨åˆ‡æ–­ R çš„æœ‰æ•ˆå­¦ä¹ ä¿¡å·ã€‚
+- `train.py`ï¼šç§»é™¤ `L_reflectance_lowfreq` ä½é¢‘é‡å»ºè¡¥é¡¹ï¼Œé¿å…é€šè¿‡ä½é¢‘ reflectance é‡å»º GT çš„æ–¹å¼æŠŠ illumination è¿›ä¸€æ­¥æ¨ç³Šã€‚
+- `train.py`ï¼šå°† residual æ­£åˆ™è°ƒåº¦ä¸‹é™ä» `0.5` æé«˜åˆ° `1.0`ï¼Œå‡è½»ä¸­åæœŸ residual è¿‡åº¦å¸æ”¶ reflectance å™ªç‚¹çš„é—®é¢˜ã€‚
+- `arguments/__init__.py`ï¼šå°†é»˜è®¤ `reflectance_consistency_reg`ã€`reflectance_smooth_reg` ä» `5e-3` å›è°ƒåˆ°æ›´ç¨³çš„ `1e-3`ã€‚
+- `arguments/__init__.py`ï¼šå°†é»˜è®¤ `b0_spatial_smooth_reg` è®¾ä¸º `0.0`ï¼Œæš‚æ—¶å…³é—­å½“å‰éšæœº pair è¿‘ä¼¼ç‰ˆ B0 ç©ºé—´å¹³æ»‘ï¼Œé¿å…ä¸ç¨³å®šå‰¯ä½œç”¨ã€‚
+
+### 2026-05-03 åå°„ç‡è§£è€¦è´¨é‡æ”¹è¿›ï¼ˆä¸‰é˜¶æ®µï¼‰
+
+#### æ”¹è¿› 1ï¼šå¼ºåŒ– R æ­£åˆ™åŒ–
+
+- `arguments/__init__.py`ï¼šæ–°å¢ `reflectance_smooth_reg=5e-3`ï¼ˆå‚æ•°åŒ–ï¼ŒåŸç¡¬ç¼–ç  `5e-4`ï¼‰ã€`b0_lr=0.001`ï¼ˆåŸç»§æ‰¿ `feature_lr=0.0075`ï¼‰ã€`b0_spatial_smooth_reg=1e-3`ï¼›`reflectance_consistency_reg` ä» `1e-4` æå‡è‡³ `5e-3`ï¼›`_backfill_model_compatibility` åŒæ­¥è¡¥æ–°å‚æ•°é»˜è®¤å€¼ã€‚
+- `scene/gaussian_model.py`ï¼šæ‰€æœ‰ `training_setup` åˆ†æ”¯çš„ `_base_log_reflectance` å­¦ä¹ ç‡æ”¹ä¸º `training_args.b0_lr`ï¼›æ–°å¢ `b0_scheduler_args` è°ƒåº¦å™¨ï¼›`update_learning_rate` ä¸­åŠ å…¥ B0 LR æ›´æ–°ã€‚
+- `utils/loss_utils.py`ï¼šæ–°å¢ `L_B0_Spatial_Smooth` å‡½æ•°ï¼ŒåŸºäº anchor KNN çš„ B0 ç©ºé—´å¹³æ»‘æŸå¤±ã€‚
+- `train.py`ï¼š`L_reflectance_smooth` æƒé‡ä»ç¡¬ç¼–ç  `5e-4` æ”¹ä¸º `dataset.reflectance_smooth_reg`ï¼›æ–°å¢ `L_b0_spatial_smooth` æŸå¤±é¡¹ã€‚
+
+#### æ”¹è¿› 2ï¼šæ¢¯åº¦æµéš”ç¦»
+
+- `train.py`ï¼šé warmup åˆ†æ”¯ä¸»é‡å»º `image_tmp` ä¸­ `reflectance_image` æ”¹ä¸º `reflectance_image.detach()`ï¼Œé˜»æ­¢ L1/SSIM æ¢¯åº¦å›ä¼ åˆ° Rã€‚
+- `train.py`ï¼š`L_diff` ç¬¬äºŒé¡¹ `reflectance_image` æ”¹ä¸º `reflectance_image.detach()`ï¼Œé˜»æ­¢ StableSR ä¼ª GT å™ªå£°æ¢¯åº¦æ±¡æŸ“ B0ã€‚
+- `train.py`ï¼šæ–°å¢ `L_reflectance_lowfreq` ä½é¢‘åå°„ç‡ç›‘ç£ï¼ˆå¯¹ reflectance åšå‡å€¼æ± åŒ–å L1 çº¦æŸï¼‰ï¼Œå¼•å¯¼ R åªå­¦ä½é¢‘ç»“æ„ã€‚
+
+#### æ”¹è¿› 3ï¼šB0 åˆå§‹åŒ–æ”¹è¿›
+
+- `scene/gaussian_model.py`ï¼šæ–°å¢ `_estimate_initial_b0` æ–¹æ³•ï¼ŒåŸºäºç¬¬ä¸€å¸§è®­ç»ƒå›¾åƒåš Retinex åˆå§‹åŒ–ï¼šå°† anchor æŠ•å½±åˆ°ç›¸æœºåƒç´ ï¼Œå– `R = pixel / max_channel(pixel)`ï¼Œ`B0 = log(R)`ï¼Œæ›¿ä»£å…¨é›¶åˆå§‹åŒ–ã€‚
+- `scene/gaussian_model.py`ï¼š`create_from_pcd` ä¸­ `base_log_reflectance` åˆå§‹åŒ–ä» `torch.zeros(...)` æ”¹ä¸ºè°ƒç”¨ `_estimate_initial_b0(fused_point_cloud, cameras)`ã€‚
+- `scene/gaussian_model.py`ï¼š`anchor_growing` ä¸­æ–° anchor çš„ B0 ä» `scatter_max` æ”¹ä¸º `scatter_mean`ï¼Œå–é‚»åŸŸå‡å€¼è€Œéæœ€å¤§å€¼ï¼Œé¿å…æ–° anchor çš„ B0 åé«˜å¯¼è‡´ R è¿‡äº®ã€‚
+- `scene/gaussian_model.py`ï¼šå¯¼å…¥æ–°å¢ `scatter_mean`ã€‚
+
+### 2026-05-03 È¥ºıÓÅÏÈÓë Residual ºóÆôÓÃĞŞÕı
+
+- `arguments/__init__.py`£º½«Ä¬ÈÏ `reflectance_consistency_reg` ´Ó `1e-3` ÏÂµ÷µ½ `5e-4`£¬`reflectance_smooth_reg` ´Ó `1e-3` ÏÂµ÷µ½ `3e-4`£¬½µµÍ¶Ô `R` µÄ¹ıÇ¿Æ½»¬ÓëÒ»ÖÂĞÔÑ¹ÖÆ¡£
+- `arguments/__init__.py`£º½«Ä¬ÈÏ `sg_smooth_reg` ´Ó `1e-4` ÏÂµ÷µ½ `5e-5`£¬¼õÇá SG illumination ¹ı¶ÈµÍÆµ»¯¡£
+- `arguments/__init__.py`£ºĞÂÔö `residual_start_iter`£¬Ä¬ÈÏ±ê×¼ 30k ÑµÁ·ÔÚ `12000` Ö®ºó²ÅÔÊĞí residual ÕæÕı½øÈëÖ÷ÖØ½¨£»¶Ì³Ì 8k ÑµÁ·½¨ÒéÃüÁîĞĞÏÔÊ½¸Ä³É `3500`¡£
+- `train.py`£º½« `L_smooth` È¨ÖØ´Ó `1e-3` ÏÂµ÷µ½ `5e-4`£¬»º½â illumination ¹ıºı¡£
+- `train.py`£º½« enhancement Ïà¹ØµÄ `L_degree` Óë `L_smooth_enhancement` È¨ÖØÏÂµ÷£¬±ÜÃâÔöÇ¿¼à¶½¼ÌĞø°Ñ `L` Ñ¹³É¹ıÆ½»¬½á¹¹¡£
+- `train.py`£ºĞÂÔö `residual_active` ½×¶Î¿ØÖÆ£»ÔÚ `iteration < residual_start_iter` Ê±£¬¼´±ã residual ·ÖÖ§ÒÑÇ°ÏòÉú³É£¬Ò²²»»á¼ÓÈë `image_tmp = R * L + residual` µÄÖ÷ÖØ½¨¡£
+- `train.py`£º½öµ± `residual_active` ÎªÕæÊ±²ÅÆôÓÃ `L_residual_reg` Óë residual scaling ÕıÔò£¬±ÜÃâ residual ¹ıÔç½Ó¹Ü¸ßÆµÎó²î¡£
+- `train.py`£ºwandb ĞÂÔö `residual_enabled` ±êÁ¿£¬±ãÓÚ¼ì²é residual ÊÇ·ñÒÑ¾­ÕæÕı½éÈëÑµÁ·¡£
+- `train.py`£ºĞÂÔö `_visible_count_value` ºÍ `_visible_count_per_view`£¬ĞŞÕıÑµÁ·½áÊøºóÆÀ¹À½×¶Î `visible_count` ¿ÉÄÜÊÇµ¥¸ö±êÁ¿Ê±µ¼ÖÂµÄ `TypeError: 'int' object is not iterable`¡£
+- `train.py`£º`render_sets(...)` ²»ÔÙÔÚ test pose optimize Â·¾¶ÖĞÓÃ `0` ¸²¸Ç train äÖÈ¾µÃµ½µÄ `visible_count`£¬±£Ö¤ÑµÁ·ºóÆÀ¹À½á¹û¸üÎÈ¶¨¡£
+
+### 2026-05-03 Reflectance È¥ºıÓÅÏÈĞŞÕı£¨µÚ¶şÂÖ£©
+
+- `arguments/__init__.py`£º½«Ä¬ÈÏ `reflectance_consistency_reg` ½øÒ»²½ÏÂµ÷µ½ `2e-4`£¬`reflectance_smooth_reg` ½øÒ»²½ÏÂµ÷µ½ `1e-4`£¬Ã÷È·°Ñ±¾ÂÖÓÅÏÈ¼¶·ÅÔÚ¡°R ¸üÇåÎú¡±¶ø²»ÊÇ¼ÌĞø¼«ÏŞÑ¹Ôë¡£
+- `scene/gaussian_model.py`£ºµ÷Õû `_estimate_initial_b0()`£¬²»ÔÙÖ±½ÓÊ¹ÓÃµÚÒ»Ö¡ `image / max_channel(image)` µÄÔ­Ê¼Í¶Ó°Öµ£»ÏÈ×öÒ»´Î¾Ö²¿¾ùÖµÆ½»¬£¬ÔÙÓÃ `reflectance_map + 0.25 * (reflectance_map - blur)` µÄÇáÁ¿±£±ßÔöÇ¿£¬¼õÇá B0 ³õÊ¼»¯ÌìÈ»µÍÆµ»¯µÄÎÊÌâ¡£
+- `train.py`£º½« `L_diff` ÖĞµÚ¶şÏî£¨`illumination_enhanced.detach() * reflectance`£©µÄÈ¨ÖØ´Ó `0.2` ÏÂµ÷µ½ `0.05`£¬¼õÈõ StableSR Î± GT ¶Ô reflectance µÄÆ½»¬Ç£Òı¡£
+- `train.py`£ºĞÂÔö `residual_abs_mean_raw` ºÍ `residual_abs_mean_used` Á½×éÕï¶ÏÁ¿£¬Çø·Ö residual Ç°ÏòÔ­Ê¼Á¿¼¶ÓëÕæÕı½øÈëÖ÷ÖØ½¨ËğÊ§µÄ residual Á¿¼¶£¬±ÜÃâÎóÅĞ residual ÊÇ·ñÒÑ¾­½éÈëÑµÁ·¡£
+- `train.py`£ºdebug Êä³öÍ¬²½¸ÄÎª´òÓ¡ `residual_abs_mean_raw` Óë `residual_abs_mean_used`£¬±£Áô¾É `residual_image_raw_mean` ±ãÓÚºáÏò¶Ô±È¡£

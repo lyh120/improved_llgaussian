@@ -12,7 +12,7 @@
 import torch
 from functools import reduce
 import numpy as np
-from torch_scatter import scatter_max
+from torch_scatter import scatter_max, scatter_mean
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func
 from torch import nn
 import os
@@ -586,6 +586,42 @@ class GaussianModel:
         
         return data
 
+    def _estimate_initial_b0(self, anchors: torch.Tensor, cameras) -> torch.Tensor:
+        N = anchors.shape[0]
+        b0 = torch.zeros((N, 3), dtype=torch.float, device="cuda")
+        if cameras is None or len(cameras) == 0:
+            return b0
+
+        cam = cameras[0]
+        image = cam.original_image  # (3, H, W)
+        H, W = image.shape[1], image.shape[2]
+
+        max_c_img = image.max(dim=0, keepdim=True)[0].clamp(min=1e-1)
+        reflectance_map = (image / max_c_img).clamp(1e-3, 1.0)
+        reflectance_map_bchw = reflectance_map.unsqueeze(0)
+        reflectance_map_blur = F.avg_pool2d(reflectance_map_bchw, kernel_size=5, stride=1, padding=2).squeeze(0)
+        detail = reflectance_map - reflectance_map_blur
+        reflectance_map = (reflectance_map + 0.25 * detail).clamp(1e-3, 1.0)
+        log_reflectance_map = torch.log(reflectance_map)
+        global_mean_b0 = log_reflectance_map.mean(dim=(1, 2))
+
+        ones = torch.ones((N, 1), dtype=torch.float, device="cuda")
+        pts_h = torch.cat([anchors, ones], dim=1)  # (N, 4)
+        proj = cam.full_proj_transform  # (4, 4)
+        pts_clip = pts_h @ proj.T  # (N, 4)
+        w = pts_clip[:, 3:].clamp(min=1e-6)
+        pts_ndc = pts_clip[:, :3] / w  # (N, 3)
+
+        px = ((pts_ndc[:, 0] + 1.0) * 0.5 * (W - 1)).long().clamp(0, W - 1)
+        py = ((1.0 - pts_ndc[:, 1]) * 0.5 * (H - 1)).long().clamp(0, H - 1)
+
+        valid = (pts_ndc[:, 2] > -1.0) & (pts_ndc[:, 2] < 1.0)
+        if valid.any():
+            b0[valid] = log_reflectance_map[:, py[valid], px[valid]].T
+        if (~valid).any():
+            b0[~valid] = global_mean_b0
+        return b0
+
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float, num_sky_gaussians=0, cameras=None, prune_ratio : float = 0.05,model_path=None, beta=1):
         self.spatial_lr_scale = spatial_lr_scale
         points = pcd.points # 
@@ -710,7 +746,7 @@ class GaussianModel:
             anchors_feat_residual = torch.zeros((fused_point_cloud.shape[0], self.feat_dim)).float().cuda()
             offsets_residual = torch.zeros((fused_point_cloud.shape[0], self.n_offsets_residual, 3)).float().cuda()
             scales_residual = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 6) 
-        base_log_reflectance = torch.zeros((fused_point_cloud.shape[0], 3), dtype=torch.float, device="cuda")
+        base_log_reflectance = self._estimate_initial_b0(fused_point_cloud, cameras)
 
 
         self._anchor = nn.Parameter(fused_point_cloud.requires_grad_(True))
@@ -746,7 +782,7 @@ class GaussianModel:
                 {'params': [self._anchor], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "anchor"},
                 {'params': [self._offset], 'lr': training_args.offset_lr_init * self.spatial_lr_scale, "name": "offset"},
                 {'params': [self._anchor_feat], 'lr': training_args.feature_lr, "name": "anchor_feat"},
-                {'params': [self._base_log_reflectance], 'lr': training_args.feature_lr, "name": "base_log_reflectance"},
+                {'params': [self._base_log_reflectance], 'lr': training_args.b0_lr, "name": "base_log_reflectance"},
                 {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
                 {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
                 {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
@@ -763,7 +799,7 @@ class GaussianModel:
                 {'params': [self._anchor], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "anchor"},
                 {'params': [self._offset], 'lr': training_args.offset_lr_init * self.spatial_lr_scale, "name": "offset"},
                 {'params': [self._anchor_feat], 'lr': training_args.feature_lr, "name": "anchor_feat"},
-                {'params': [self._base_log_reflectance], 'lr': training_args.feature_lr, "name": "base_log_reflectance"},
+                {'params': [self._base_log_reflectance], 'lr': training_args.b0_lr, "name": "base_log_reflectance"},
                 {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
                 {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
                 {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
@@ -779,7 +815,7 @@ class GaussianModel:
                 {'params': [self._anchor], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "anchor"},
                 {'params': [self._offset], 'lr': training_args.offset_lr_init * self.spatial_lr_scale, "name": "offset"},
                 {'params': [self._anchor_feat], 'lr': training_args.feature_lr, "name": "anchor_feat"},
-                {'params': [self._base_log_reflectance], 'lr': training_args.feature_lr, "name": "base_log_reflectance"},
+                {'params': [self._base_log_reflectance], 'lr': training_args.b0_lr, "name": "base_log_reflectance"},
                 {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
                 {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
                 {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
@@ -834,6 +870,10 @@ class GaussianModel:
                                                     lr_final=training_args.mlp_enhance_lr_final,
                                                     lr_delay_mult=training_args.mlp_color_lr_delay_mult,
                                                     max_steps=training_args.mlp_color_lr_max_steps)
+        self.b0_scheduler_args = get_expon_lr_func(lr_init=training_args.b0_lr,
+                                                    lr_final=training_args.b0_lr * 0.01,
+                                                    lr_delay_mult=0.01,
+                                                    max_steps=training_args.position_lr_max_steps)
         if self.use_residual:
             self.residual_net_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_color_lr_init,
                                                     lr_final=training_args.mlp_color_lr_final,
@@ -888,6 +928,9 @@ class GaussianModel:
                 param_group['lr'] = lr
             if param_group["name"] == "enhancement_net":
                 lr = self.enhancement_net_scheduler_args(iteration)
+                param_group['lr'] = lr
+            if param_group["name"] == "base_log_reflectance":
+                lr = self.b0_scheduler_args(iteration)
                 param_group['lr'] = lr
             if self.use_feat_bank and param_group["name"] == "mlp_featurebank":
                 lr = self.mlp_featurebank_scheduler_args(iteration)
@@ -1257,11 +1300,11 @@ class GaussianModel:
                 new_base_log_reflectance = torch.zeros((candidate_anchor.shape[0], 3), dtype=torch.float, device="cuda")
                 if candidate_mask.any():
                     repeated_b0 = self._base_log_reflectance.unsqueeze(dim=1).repeat([1, self.n_offsets, 1]).view([-1, 3])[candidate_mask]
-                    new_base_log_reflectance = scatter_max(
+                    new_base_log_reflectance = scatter_mean(
                         repeated_b0,
                         inverse_indices.unsqueeze(1).expand(-1, repeated_b0.size(1)),
                         dim=0,
-                    )[0][remove_duplicates]
+                    )[remove_duplicates]
 
                 new_offsets = torch.zeros_like(candidate_anchor).unsqueeze(dim=1).repeat([1,self.n_offsets,1]).float().cuda()
 
