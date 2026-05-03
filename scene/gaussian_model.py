@@ -10,6 +10,7 @@
 #
 
 import torch
+import torch.nn.functional as F
 from functools import reduce
 import numpy as np
 from torch_scatter import scatter_max, scatter_mean

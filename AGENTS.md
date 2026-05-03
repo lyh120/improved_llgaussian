@@ -270,3 +270,4 @@ python render.py -m /home/liuyuhao/ll_further/LL-Gaussian-sg/outputs/chair_sg_ex
 - `train.py`：将 `L_diff` 中第二项（`illumination_enhanced.detach() * reflectance`）的权重从 `0.2` 下调到 `0.05`，减弱 StableSR 伪 GT 对 reflectance 的平滑牵引。
 - `train.py`：新增 `residual_abs_mean_raw` 和 `residual_abs_mean_used` 两组诊断量，区分 residual 前向原始量级与真正进入主重建损失的 residual 量级，避免误判 residual 是否已经介入训练。
 - `train.py`：debug 输出同步改为打印 `residual_abs_mean_raw` 与 `residual_abs_mean_used`，保留旧 `residual_image_raw_mean` 便于横向对比。
+- `scene/gaussian_model.py`：补充 `import torch.nn.functional as F`，修复 `_estimate_initial_b0()` 中使用 `F.avg_pool2d(...)` 时的 `NameError: name 'F' is not defined`，这是第二轮去糊初始化改动后的必要导入。
