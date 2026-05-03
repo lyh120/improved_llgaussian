@@ -91,9 +91,10 @@ class ModelParams(ParamGroup):
         self.reflectance_consistency_reg = 2e-5
         self.reflectance_smooth_reg = 0.0
         self.reflectance_edge_reg = 2e-4
+        self.reflectance_edge_uplift_reg = 1e-3
         self.highlight_reflectance_reg = 1e-3
         self.residual_chroma_reg = 5e-4
-        self.reflectance_detail_reg = 1e-5
+        self.reflectance_detail_reg = 2e-6
         self.b0_spatial_smooth_reg = 0.0
         self.prune_ratio = 0.05
         self.beta = 1.0
@@ -177,7 +178,7 @@ class OptimizationParams(ParamGroup):
         self.percent_dense = 0.01
         self.lambda_dssim = 0.3
         self.b0_lr = 0.001
-        self.reflectance_offset_lr = 0.002
+        self.reflectance_offset_lr = 0.006
         
         # for anchor densification
         self.start_stat = 500
@@ -214,11 +215,12 @@ def _backfill_model_compatibility(merged_dict):
         "reflectance_consistency_reg": 2e-5,
         "reflectance_smooth_reg": 0.0,
         "reflectance_edge_reg": 2e-4,
+        "reflectance_edge_uplift_reg": 1e-3,
         "highlight_reflectance_reg": 1e-3,
         "residual_chroma_reg": 5e-4,
-        "reflectance_detail_reg": 1e-5,
+        "reflectance_detail_reg": 2e-6,
         "b0_lr": 0.001,
-        "reflectance_offset_lr": 0.002,
+        "reflectance_offset_lr": 0.006,
         "b0_spatial_smooth_reg": 0.0,
         "residual_start_iter": 12_000,
     }

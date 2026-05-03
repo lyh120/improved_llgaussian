@@ -314,3 +314,14 @@ python render.py -m /home/liuyuhao/ll_further/LL-Gaussian-sg/outputs/chair_sg_ex
 
 - `scene/gaussian_model.py`：修正 `load_ply_sparse_gaussian()` 读取 `b0_*` 字段时的匹配条件，`b0_detail_*` 不再被误并入 `base_log_reflectance`，避免加载新 PLY 后 `B0` 通道数错误膨胀。
 - `scene/gaussian_model.py`：`get_reflectance_with_detail` 增加防御式兼容处理；若历史中间产物导致 `base_log_reflectance` 通道数异常大于 3，则仅取前 3 通道参与 `exp(B0 + detail)`，避免训练后自动渲染阶段直接 shape mismatch 崩溃。
+
+### 2026-05-03 fix8 Reflectance 高清化改进
+
+- `arguments/__init__.py`：将默认 `reflectance_offset_lr` 从 `0.002` 提高到 `0.006`，将 `reflectance_detail_reg` 从 `1e-5` 降到 `2e-6`，让 offset 级 reflectance detail 更容易学到局部纹理。
+- `arguments/__init__.py`：新增 `reflectance_edge_uplift_reg = 1e-3`，并在 `_backfill_model_compatibility` 中补默认值，旧配置恢复时也能安全读取。
+- `scene/gaussian_model.py`：将 `reflectance_detail_scale` 从 `0.35` 提高到 `0.8`，保持 `exp(B0 + scale * tanh(detail))` 的有界 detail 结构不变。
+- `utils/loss_utils.py`：新增 `L_Reflectance_Edge_Uplift(...)`，只惩罚 reflectance 边缘弱于低光输入结构的位置，用 one-sided hinge 鼓励 R 补边，不压制已经更清晰的区域。
+- `train.py`：接入 `L_Reflectance_Edge_Uplift`，以 `dataset.reflectance_edge_uplift_reg` 加入 warmup 和 normal train 的总损失。
+- `train.py`：将 `L_diff` 第二项系数从 `0.02` 改为 `0.0`，默认不再让 StableSR 伪 GT 直接回传梯度到 reflectance，只保留增强光照分支监督。
+- `train.py`：新增 `reflectance_edge_uplift_mean` 到 wandb 与 debug 输出，便于观察 R 的边缘补强是否真正生效。
+- 训练建议：8k 诊断训练中将 `residual_start_iter` 推迟到 `6000`，让 `R * L` 先承担主要结构重建，再允许 residual 做少量补偿。
