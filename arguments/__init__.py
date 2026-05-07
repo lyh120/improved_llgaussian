@@ -98,6 +98,8 @@ class ModelParams(ParamGroup):
         self.residual_chroma_reg = 5e-4
         self.reflectance_detail_reg = 1e-6
         self.reflectance_decoder_reg = 2e-5
+        self.enhancement_reflectance_reg = 0.08
+        self.enhancement_guidance_floor = 0.2
         self.residual_hardmask_percentile = 0.8
         self.residual_higherror_percentile = 0.8
         self.residual_highlight_percentile = 0.9
@@ -230,6 +232,8 @@ def _backfill_model_compatibility(merged_dict):
         "residual_chroma_reg": 5e-4,
         "reflectance_detail_reg": 1e-6,
         "reflectance_decoder_reg": 2e-5,
+        "enhancement_reflectance_reg": 0.08,
+        "enhancement_guidance_floor": 0.2,
         "b0_lr": 0.001,
         "reflectance_offset_lr": 0.008,
         "reflectance_decoder_lr": 0.002,
