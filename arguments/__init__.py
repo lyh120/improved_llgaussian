@@ -101,10 +101,11 @@ class ModelParams(ParamGroup):
         self.enhancement_reflectance_reg = 0.06
         self.enhancement_degree_reg = 0.2
         self.enhancement_degree_global_reg = 0.05
-        self.enhancement_smooth_reg = 5e-4
+        self.enhancement_smooth_reg = 4e-4
         self.enhancement_diff_start_iter = 2500
-        self.enhancement_color_reg = 0.08
-        self.enhancement_color_std_reg = 0.03
+        self.enhancement_color_reg = 0.06
+        self.enhancement_color_std_reg = 0.02
+        self.enhancement_green_bias_reg = 0.05
         self.residual_hardmask_percentile = 0.8
         self.residual_higherror_percentile = 0.8
         self.residual_highlight_percentile = 0.9
@@ -240,10 +241,11 @@ def _backfill_model_compatibility(merged_dict):
         "enhancement_reflectance_reg": 0.06,
         "enhancement_degree_reg": 0.2,
         "enhancement_degree_global_reg": 0.05,
-        "enhancement_smooth_reg": 5e-4,
+        "enhancement_smooth_reg": 4e-4,
         "enhancement_diff_start_iter": 2500,
-        "enhancement_color_reg": 0.08,
-        "enhancement_color_std_reg": 0.03,
+        "enhancement_color_reg": 0.06,
+        "enhancement_color_std_reg": 0.02,
+        "enhancement_green_bias_reg": 0.05,
         "b0_lr": 0.001,
         "reflectance_offset_lr": 0.008,
         "reflectance_decoder_lr": 0.002,

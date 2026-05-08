@@ -46,7 +46,7 @@ sys.path.append("./submodules/Depth-Anything-V2")
 # from lpipsPyTorch import lpips
 import lpips
 from random import randint
-from utils.loss_utils import l1_loss, ssim, l1_plus_loss, L_Smooth, L_Illu, L_Gray, L_Depth_similarity, L_Reflectance_Smooth, L_Depth_Smooth, pearson_depth_loss, L_Reflectance_Consistency, L_Reflectance_Edge, L_Reflectance_Edge_Uplift, L_Reflectance_Highlight, L_Reflectance_LocalContrast, L_Reflectance_HighFreq, L_Residual_Chroma_Boost, L_SG_Energy, L_SG_Sharpness, L_B0_Spatial_Smooth, build_residual_hard_mask
+from utils.loss_utils import l1_loss, ssim, l1_plus_loss, L_Smooth, L_Illu, L_Gray, L_Green_Bias, L_Depth_similarity, L_Reflectance_Smooth, L_Depth_Smooth, pearson_depth_loss, L_Reflectance_Consistency, L_Reflectance_Edge, L_Reflectance_Edge_Uplift, L_Reflectance_Highlight, L_Reflectance_LocalContrast, L_Reflectance_HighFreq, L_Residual_Chroma_Boost, L_SG_Energy, L_SG_Sharpness, L_B0_Spatial_Smooth, build_residual_hard_mask
 from gaussian_renderer import prefilter_voxel, render, network_gui
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -464,6 +464,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         L_diff_illumination = torch.tensor(0.0, device=gt_image.device)
         L_enhanced_color = torch.tensor(0.0, device=gt_image.device)
         L_enhanced_color_std = torch.tensor(0.0, device=gt_image.device)
+        L_enhanced_green_bias = torch.tensor(0.0, device=gt_image.device)
 
         if torch.isnan(scaling_reg) or torch.isinf(scaling_reg):
             print("Warning: scaling_reg is nan or inf")
@@ -523,11 +524,13 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 target_std = refined_target.view(3, -1).std(dim=1, unbiased=False)
                 L_enhanced_color = torch.abs(pred_mean - target_mean).mean()
                 L_enhanced_color_std = torch.abs(pred_std - target_std).mean()
+                L_enhanced_green_bias = L_Green_Bias(image_enhanced_pred)
                 loss += (
                     L_degree
                     + L_smooth_enhancement
                     + dataset.enhancement_color_reg * L_enhanced_color
                     + dataset.enhancement_color_std_reg * L_enhanced_color_std
+                    + dataset.enhancement_green_bias_reg * L_enhanced_green_bias
                 )
 
                 if iteration >= dataset.enhancement_diff_start_iter:
@@ -606,6 +609,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                            'enhancement_guidance_weight': enhancement_guidance_weight,
                            'enhancement_color_mean': L_enhanced_color,
                            'enhancement_color_std': L_enhanced_color_std,
+                           'enhancement_green_bias': L_enhanced_green_bias,
                            'enhancement_illumination_guidance': L_diff_illumination,
                            'enhancement_reflectance_guidance': L_diff_reflectance})
             if (iteration - 1) % 600 == 0:
@@ -653,6 +657,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         'residual_chroma_boost': L_residual_chroma_boost,
                         'enhancement_color_mean': L_enhanced_color,
                         'enhancement_color_std': L_enhanced_color_std,
+                        'enhancement_green_bias': L_enhanced_green_bias,
                         'enhancement_illumination_guidance': L_diff_illumination,
                         'enhancement_reflectance_guidance': L_diff_reflectance,
                         'illumination':wandb.Image(torchvision.transforms.ToPILImage()(illumination_image)),
@@ -688,6 +693,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 print("residual_chroma_boost", L_residual_chroma_boost)
                 print("enhancement_color_mean", L_enhanced_color)
                 print("enhancement_color_std", L_enhanced_color_std)
+                print("enhancement_green_bias", L_enhanced_green_bias)
                 print("enhancement_illumination_guidance", L_diff_illumination)
                 print("enhancement_reflectance_guidance", L_diff_reflectance)
                 print("image", image.mean())

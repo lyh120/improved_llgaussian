@@ -499,6 +499,18 @@ def L_Gray(image):
     return k.mean()
 
 
+def L_Green_Bias(image, threshold=0.02):
+    """Penalize only residual green cast where G is noticeably above the red/blue average.
+
+    This is intentionally asymmetric so we can suppress green tint without globally
+    desaturating the enhanced image.
+    """
+    green = image[1:2]
+    rb_mean = 0.5 * (image[0:1] + image[2:3])
+    green_excess = F.relu(green - rb_mean - threshold)
+    return green_excess.mean()
+
+
 def L_B0_Spatial_Smooth(base_log_reflectance, anchor_positions, knn=8):
     """3D spatial smoothness for B0 (base_log_reflectance).
     Encourages nearby anchors in 3D space to have similar B0 values.
