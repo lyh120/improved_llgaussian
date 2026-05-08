@@ -461,6 +461,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         L_residual_chroma_boost = torch.tensor(0.0, device=gt_image.device)
         enhancement_guidance_weight = 0.0
         L_diff_reflectance = torch.tensor(0.0, device=gt_image.device)
+        L_diff_illumination = torch.tensor(0.0, device=gt_image.device)
 
         if torch.isnan(scaling_reg) or torch.isinf(scaling_reg):
             print("Warning: scaling_reg is nan or inf")
@@ -498,10 +499,22 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
             L_diff = 0
             if iteration >= opt.update_from:
-                L_degree = torch.abs((illumination_enhanced_image.mean(0) - torch.clamp(illumination_image.mean(0).detach() * enhance_ratio, 0, 1))).mean() * 0.1 + torch.abs(illumination_enhanced_image.mean() - illumination_image.mean().detach() * enhance_ratio) * 0.02
-                L_smooth_enhancement = L_Smooth(illumination_enhanced_image/enhance_ratio, gt_image, kernel_size=9) * 2e-4
+                L_degree = (
+                    torch.abs(
+                        illumination_enhanced_image.mean(0)
+                        - torch.clamp(illumination_image.mean(0).detach() * enhance_ratio, 0, 1)
+                    ).mean() * dataset.enhancement_degree_reg
+                    + torch.abs(
+                        illumination_enhanced_image.mean()
+                        - illumination_image.mean().detach() * enhance_ratio
+                    ).mean() * dataset.enhancement_degree_global_reg
+                )
+                L_smooth_enhancement = (
+                    L_Smooth(illumination_enhanced_image / enhance_ratio, gt_image, kernel_size=9)
+                    * dataset.enhancement_smooth_reg
+                )
                 loss += L_degree + L_smooth_enhancement
-            if iteration >= opt.update_from * 2:
+            if iteration >= opt.update_from:
                 refined_target = refined_image_dict[viewpoint_cam.uid].cuda()
                 L_diff_illumination = torch.abs(
                     illumination_enhanced_image * reflectance_image.detach() - refined_target
@@ -511,12 +524,25 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 L_diff_reflectance = torch.abs(
                     illumination_enhanced_image.detach() * reflectance_image - refined_target
                 ).mean()
-                guidance_progress = min(1.0, max(0.0, float(iteration - opt.update_from * 2) / float(max(1, opt.iterations - opt.update_from * 2))))
+                guidance_progress = min(
+                    1.0,
+                    max(0.0, float(iteration - opt.update_from) / float(max(1, opt.iterations - opt.update_from))),
+                )
                 enhancement_guidance_weight = max(
                     dataset.enhancement_guidance_floor,
                     1.0 - 0.9 * guidance_progress,
                 )
-                L_diff = L_diff_illumination + dataset.enhancement_reflectance_reg * L_diff_reflectance
+                reflectance_gate = min(
+                    1.0,
+                    max(
+                        0.0,
+                        float(iteration - opt.update_from)
+                        / float(max(1, int(opt.update_from * dataset.enhancement_reflectance_start_ratio))),
+                    ),
+                )
+                L_diff = L_diff_illumination + (
+                    dataset.enhancement_reflectance_reg * reflectance_gate * L_diff_reflectance
+                )
                 loss += enhancement_guidance_weight * L_diff
             if dataset.use_residual and residual_active:
                 scaling_residual_reg = scaling_residual.prod(dim=1).mean()
@@ -573,6 +599,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                            'residual_chroma_boost': L_residual_chroma_boost,
                            'residual_enabled': float(residual_active),
                            'enhancement_guidance_weight': enhancement_guidance_weight,
+                           'enhancement_illumination_guidance': L_diff_illumination,
                            'enhancement_reflectance_guidance': L_diff_reflectance})
             if (iteration - 1) % 600 == 0:
                 gt_image = torch.clamp(gt_image * enhance_ratio, 0.0, 1.0)
@@ -617,6 +644,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         'residual_chroma_mean': residual_chroma_mean,
                         'residual_mix_weight': residual_mix_weight,
                         'residual_chroma_boost': L_residual_chroma_boost,
+                        'enhancement_illumination_guidance': L_diff_illumination,
                         'enhancement_reflectance_guidance': L_diff_reflectance,
                         'illumination':wandb.Image(torchvision.transforms.ToPILImage()(illumination_image)),
                         'reflectance':wandb.Image(torchvision.transforms.ToPILImage()(reflectance_image)),
@@ -649,6 +677,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 print("residual_error_mask_coverage", residual_error_mask_coverage)
                 print("residual_highlight_mask_coverage", residual_highlight_mask_coverage)
                 print("residual_chroma_boost", L_residual_chroma_boost)
+                print("enhancement_illumination_guidance", L_diff_illumination)
                 print("enhancement_reflectance_guidance", L_diff_reflectance)
                 print("image", image.mean())
                 print("gt_image", gt_image.mean())
