@@ -462,6 +462,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         enhancement_guidance_weight = 0.0
         L_diff_reflectance = torch.tensor(0.0, device=gt_image.device)
         L_diff_illumination = torch.tensor(0.0, device=gt_image.device)
+        L_enhanced_color = torch.tensor(0.0, device=gt_image.device)
+        L_enhanced_color_std = torch.tensor(0.0, device=gt_image.device)
 
         if torch.isnan(scaling_reg) or torch.isinf(scaling_reg):
             print("Warning: scaling_reg is nan or inf")
@@ -513,37 +515,40 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     L_Smooth(illumination_enhanced_image / enhance_ratio, gt_image, kernel_size=9)
                     * dataset.enhancement_smooth_reg
                 )
-                loss += L_degree + L_smooth_enhancement
-            if iteration >= opt.update_from:
                 refined_target = refined_image_dict[viewpoint_cam.uid].cuda()
-                L_diff_illumination = torch.abs(
-                    illumination_enhanced_image * reflectance_image.detach() - refined_target
-                ).mean()
-                # Allow a small amount of enhancement supervision to correct reflectance-side color cast
-                # without turning reflectance back into the main enhancement carrier.
-                L_diff_reflectance = torch.abs(
-                    illumination_enhanced_image.detach() * reflectance_image - refined_target
-                ).mean()
-                guidance_progress = min(
-                    1.0,
-                    max(0.0, float(iteration - opt.update_from) / float(max(1, opt.iterations - opt.update_from))),
+                image_enhanced_pred = torch.clamp(illumination_enhanced_image * reflectance_image, 0.0, 1.0)
+                pred_mean = image_enhanced_pred.mean(dim=(1, 2))
+                target_mean = refined_target.mean(dim=(1, 2))
+                pred_std = image_enhanced_pred.view(3, -1).std(dim=1, unbiased=False)
+                target_std = refined_target.view(3, -1).std(dim=1, unbiased=False)
+                L_enhanced_color = torch.abs(pred_mean - target_mean).mean()
+                L_enhanced_color_std = torch.abs(pred_std - target_std).mean()
+                loss += (
+                    L_degree
+                    + L_smooth_enhancement
+                    + dataset.enhancement_color_reg * L_enhanced_color
+                    + dataset.enhancement_color_std_reg * L_enhanced_color_std
                 )
-                enhancement_guidance_weight = max(
-                    dataset.enhancement_guidance_floor,
-                    1.0 - 0.9 * guidance_progress,
-                )
-                reflectance_gate = min(
-                    1.0,
-                    max(
-                        0.0,
-                        float(iteration - opt.update_from)
-                        / float(max(1, int(opt.update_from * dataset.enhancement_reflectance_start_ratio))),
-                    ),
-                )
-                L_diff = L_diff_illumination + (
-                    dataset.enhancement_reflectance_reg * reflectance_gate * L_diff_reflectance
-                )
-                loss += enhancement_guidance_weight * L_diff
+
+                if iteration >= dataset.enhancement_diff_start_iter:
+                    L_diff_illumination = torch.abs(
+                        illumination_enhanced_image * reflectance_image.detach() - refined_target
+                    ).mean()
+                    # Keep a smaller reflectance-side correction than the illumination-side guidance.
+                    L_diff_reflectance = torch.abs(
+                        illumination_enhanced_image.detach() * reflectance_image - refined_target
+                    ).mean()
+                    guidance_progress = min(
+                        1.0,
+                        max(
+                            0.0,
+                            float(iteration - dataset.enhancement_diff_start_iter)
+                            / float(max(1, opt.iterations - dataset.enhancement_diff_start_iter)),
+                        ),
+                    )
+                    enhancement_guidance_weight = 1.0 - 0.7 * guidance_progress
+                    L_diff = L_diff_illumination + dataset.enhancement_reflectance_reg * L_diff_reflectance
+                    loss += enhancement_guidance_weight * L_diff
             if dataset.use_residual and residual_active:
                 scaling_residual_reg = scaling_residual.prod(dim=1).mean()
                 L_residual_reg = torch.mean(torch.abs(residual_image_for_loss)) * weight_scheduler(iteration)
@@ -599,6 +604,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                            'residual_chroma_boost': L_residual_chroma_boost,
                            'residual_enabled': float(residual_active),
                            'enhancement_guidance_weight': enhancement_guidance_weight,
+                           'enhancement_color_mean': L_enhanced_color,
+                           'enhancement_color_std': L_enhanced_color_std,
                            'enhancement_illumination_guidance': L_diff_illumination,
                            'enhancement_reflectance_guidance': L_diff_reflectance})
             if (iteration - 1) % 600 == 0:
@@ -644,6 +651,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         'residual_chroma_mean': residual_chroma_mean,
                         'residual_mix_weight': residual_mix_weight,
                         'residual_chroma_boost': L_residual_chroma_boost,
+                        'enhancement_color_mean': L_enhanced_color,
+                        'enhancement_color_std': L_enhanced_color_std,
                         'enhancement_illumination_guidance': L_diff_illumination,
                         'enhancement_reflectance_guidance': L_diff_reflectance,
                         'illumination':wandb.Image(torchvision.transforms.ToPILImage()(illumination_image)),
@@ -677,6 +686,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 print("residual_error_mask_coverage", residual_error_mask_coverage)
                 print("residual_highlight_mask_coverage", residual_highlight_mask_coverage)
                 print("residual_chroma_boost", L_residual_chroma_boost)
+                print("enhancement_color_mean", L_enhanced_color)
+                print("enhancement_color_std", L_enhanced_color_std)
                 print("enhancement_illumination_guidance", L_diff_illumination)
                 print("enhancement_reflectance_guidance", L_diff_reflectance)
                 print("image", image.mean())
