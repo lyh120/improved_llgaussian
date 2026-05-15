@@ -75,3 +75,5 @@ submodules/**/third_party/glm/test/
 
 # Embedded Git metadata from vendored repositories
 submodules/**/.git/
+submodules/Retinexformer/
+submodules/Retinexformer/
