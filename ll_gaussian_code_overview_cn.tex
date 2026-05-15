@@ -1,0 +1,195 @@
+\documentclass[11pt,a4paper]{ctexart}
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{xcolor}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  citecolor=blue
+}
+
+\title{\textbf{LL-Gaussian 当前代码版本方法概述}\\
+\large 基于仓库实现的中文精简论文式说明}
+\author{面向当前 \texttt{LL-Gaussian-ref-sgs} 代码主线整理}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+本文基于当前仓库 \texttt{LL-Gaussian-ref-sgs} 的实际实现，对 LL-Gaussian 的核心思想、训练目标与工程化改动进行论文式整理。原始 MM25 版本关注在极端低照度、强噪声的普通 sRGB 输入下，实现稳定的三维场景重建与实时新视角增强渲染。当前代码在保留“低光初始化 + 内蕴/瞬态分解 + 光照增强”总体框架的基础上，进一步将反射率主路径改写为 \texttt{B0 + offset detail + decoder refinement}，将光照分支升级为球面高斯（Spherical Gaussian, SG）建模，并将残差分支改造为带有局部硬掩码和线性爬坡机制的受控补偿模块。本文重点说明该版本的模型结构、损失设计、训练流程以及与原论文概念之间的对应关系，可作为当前代码版本的中文方法介绍初稿。
+\end{abstract}
+
+\section{研究背景与问题定义}
+低光场景的新视角合成同时面临几何退化、噪声污染与光照失真三类困难。对于 NeRF 类方法，隐式 MLP 表达虽然具有较强拟合能力，但训练与推理成本较高，且不少方法依赖 RAW 传感器数据或多曝光序列。对于 3D Gaussian Splatting（3DGS）类方法，显式高斯表示具有实时渲染优势，但在极暗 sRGB 输入下容易出现两类失效：其一是初始化不稳定，弱纹理区域难以提供可靠的几何种子；其二是显式点云结构容易直接吸收高频噪声，导致漂浮伪影和几何污染。
+
+LL-Gaussian 的基本目标是在普通消费级设备拍摄的低照度 sRGB 图像上，直接完成三维场景建模，并生成接近正常光照条件下的实时新视角结果。与“先 2D 增强、再 3D 重建”的串行方案不同，该路线强调在统一的可微 3DGS 框架内联合优化反射率、光照与瞬态残差，从而尽量避免二维预处理误差在三维重建阶段被放大。
+
+\section{原始方法主线与当前实现承接}
+从论文思想上看，LL-Gaussian 的核心由三部分组成：低光初始化模块、内蕴/瞬态双分支分解模块以及光照增强模块。当前仓库仍然沿着这条主线组织代码，但具体实现已经相较原版有明显演化。
+
+\subsection{低光初始化与几何预热}
+原始论文使用学习式 MVS 先验替代传统 COLMAP 在低光下不稳定的特征匹配，并配合深度先验完成 warm-up 几何校正。当前代码中，场景入口由 \texttt{scene/\_\_init\_\_.py} 负责：系统接收 \texttt{scene\_info.point\_cloud} 或外部 \texttt{ply\_path} 作为初始点云，再调用 \texttt{GaussianModel.create\_from\_pcd(...)} 将点云体素化、锚点化，并进行冗余剪枝与初始化。与此同时，训练阶段通过 \texttt{Depth Anything V2} 产生单目深度先验，并使用 Pearson 相关形式的深度一致性损失辅助 warm-up 阶段的结构约束。
+
+需要强调的是，当前仓库保留了“低光先验初始化 + 深度预热”的总体思想，但学习式 MVS 点云的生成并不完全封装在本仓库内部。换言之，代码层面更像是接收外部先验点云后，在 Scaffold-GS 风格的锚点空间中完成后续重建与优化。
+
+\subsection{从原始反射率分支到 B0 主路径}
+当前版本对原论文最关键的扩展之一，是将反射率主路径改写为
+\begin{equation}
+R = \exp(B_0 + \Delta_{\text{detail}})\odot \left(1 + 0.15 \tanh(D)\right),
+\end{equation}
+其中 $B_0$ 表示 anchor 级的底层对数反射率，$\Delta_{\text{detail}}$ 表示 offset 级的局部细节增量，$D$ 为轻量解码器输出的局部 refinement。对应到代码中：
+\begin{itemize}[leftmargin=1.5em]
+  \item \texttt{scene/gaussian\_model.py} 中的 \texttt{\_base\_log\_reflectance} 是 anchor 级主反射率参数；
+  \item \texttt{\_reflectance\_offset\_delta} 为每个 offset 的反射率细节项；
+  \item \texttt{mlp\_reflectance\_decoder} 则在锚点特征与局部 offset 几何的基础上进行微调补偿。
+\end{itemize}
+
+这意味着当前实现已经不再把早期的 \texttt{mlp\_reflectance} 作为默认主路径，而是把它退化为 legacy 兼容分支。相比原始“单路反射率预测”设定，这种设计更适合显式锚点结构：$B_0$ 负责稳定承载低频材质底色，offset-detail 负责补充局部纹理，而 decoder 只做小幅结构细化，避免反射率重新吸收彩色高亮和噪声。
+
+\subsection{SG 光照建模与增强分支}
+当前代码将光照主路径升级为球面高斯建模。对于每个 anchor 的每个 offset，网络预测若干个 SG lobes，其方向、锐度与幅值经正规化后得到最终光照值。其基本形式可写为
+\begin{equation}
+S(\mathbf{v})=\frac{1}{M}\sum_{m=1}^{M} a_m \exp\left(\lambda_m(\langle \boldsymbol{\mu}_m,\mathbf{v}\rangle-1)\right),
+\end{equation}
+其中 $\mathbf{v}$ 为视线方向，$\boldsymbol{\mu}_m$、$\lambda_m$、$a_m$ 分别对应 SG lobe 的方向、锐度和幅值。该过程由 \texttt{utils/sg\_utils.py} 中的 \texttt{evaluate\_spherical\_gaussians(...)} 和 \texttt{gaussian\_renderer/\_\_init\_\_.py} 中的 \texttt{\_compute\_illumination(...)} 共同实现。
+
+在此基础上，代码保留了一个可学习增强网络 \texttt{enhancement\_net}，用于把低光光照映射到更接近正常曝光的增强光照 $\tilde{S}$。最终可得到两种渲染形式：
+\begin{align}
+\hat{C}_{\text{low}} &= R \odot S + R_s, \\
+\hat{C}_{\text{enh}} &= R \odot \tilde{S},
+\end{align}
+其中 $R_s$ 为瞬态残差分支。与原论文一致，低光重建分支负责拟合输入观测，而增强分支负责输出“去噪且提亮”的新视角结果。
+
+\subsection{残差分支的受控局部补偿}
+原始论文将瞬态分支视为噪声与伪影的吸收器，并通过早期强正则、后期放松的方式抑制其过拟合。当前代码进一步把这一思路细化为三项机制：
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{延迟启用}：残差在 \texttt{residual\_start\_iter} 之前不参与主重建；
+  \item \textbf{线性爬坡}：通过 \texttt{residual\_mix\_weight} 在若干步内从 0 平滑过渡到 1；
+  \item \textbf{局部硬掩码}：利用 \texttt{build\_residual\_hard\_mask(...)} 从高重建误差区域与高亮彩色区域构造 sparse mask，仅允许残差在“真正难解释”的局部区域介入。
+\end{enumerate}
+
+因此，当前版本的残差分支不再是全图范围内自由拟合，而更像一个受约束的局部误差补偿器。它的目标不是承担整体成像，而是在内蕴分支已经尽可能解释结构与颜色之后，吸收剩余噪声、伪影以及少量高亮色偏。
+
+\section{训练目标}
+当前训练目标由低光重建、结构平滑、反射率解耦、SG 正则、增强监督与残差抑制等多类项组成。其总损失可概括为
+\begin{equation}
+\mathcal{L}=
+\mathcal{L}_{\text{recon}}
+\;+\;
+\mathcal{L}_{\text{geom}}
+\;+\;
+\mathcal{L}_{R}
+\;+\;
+\mathcal{L}_{SG}
+\;+\;
+\mathcal{L}_{\text{enh}}
+\;+\;
+\mathcal{L}_{\text{res}}.
+\end{equation}
+
+\subsection{低光重建与几何约束}
+训练使用加权 L1 与 SSIM 共同约束重建质量，其中加权 L1 对暗部区域更敏感，SSIM 负责补充结构一致性。与此同时，warm-up 与后续阶段都可引入深度先验与光照平滑项：
+\begin{itemize}[leftmargin=1.5em]
+  \item \texttt{l1\_plus\_loss(...)}：强调极暗区域的重建误差；
+  \item \texttt{ssim(...)}：提升结构保持能力；
+  \item \texttt{L\_Smooth(...)}：鼓励光照在局部区域内平滑变化；
+  \item \texttt{pearson\_depth\_loss(...)} / 深度相关项：约束渲染深度与先验深度的一致性。
+\end{itemize}
+
+\subsection{反射率分支正则}
+为了保证 $R$ 主要承载稳定材质和可迁移结构，而不是高光噪声或伪彩色，当前代码在 \texttt{utils/loss\_utils.py} 中引入了多种反射率约束，包括：
+\begin{itemize}[leftmargin=1.5em]
+  \item \texttt{L\_Reflectance\_Consistency}：抑制局部无意义抖动；
+  \item \texttt{L\_Reflectance\_Edge} 与 \texttt{L\_Reflectance\_Edge\_Uplift}：要求反射率边缘不弱于输入中的结构边缘；
+  \item \texttt{L\_Reflectance\_LocalContrast} 与 \texttt{L\_Reflectance\_HighFreq}：提升局部对比度与高频纹理保真；
+  \item \texttt{L\_Reflectance\_Highlight}：抑制反射率中不合理的高亮彩色区域；
+  \item \texttt{L\_B0\_Spatial\_Smooth}：在三维 anchor 邻域上对 $B_0$ 做空间平滑。
+\end{itemize}
+
+此外，代码还对 offset-detail 与 decoder 输出施加幅值正则，使这两个补偿支路更偏向“细化结构”，而不是重构整幅图像的主色调。
+
+\subsection{SG 光照正则}
+为了防止 SG 光照分支退化为过强能量或过尖锐的方向峰，当前实现记录并约束
+\begin{equation}
+\mathcal{L}_{SG}=
+\lambda_{\text{energy}} \mathcal{L}_{\text{SG-energy}}
+\;+\;
+\lambda_{\text{sharp}} \mathcal{L}_{\text{SG-sharpness}},
+\end{equation}
+其中对应的统计量来自 \texttt{sg\_stats}，包括平均能量、平均锐度和最大锐度。该设计能够使 SG 光照在保持方向表达能力的同时，避免数值过度集中。
+
+\subsection{增强监督}
+增强分支既需要输出更亮的结果，也要避免失真。当前版本保留了“物理增强约束 + 扩散先验监督”的双重结构：
+\begin{itemize}[leftmargin=1.5em]
+  \item 通过增强前后亮度均值、全局亮度比例和光照平滑项控制提亮幅度；
+  \item 通过与 StableSR 伪监督结果的差异约束增强图像的颜色统计与自然性；
+  \item 额外加入颜色均值、颜色标准差与绿色偏置惩罚，以降低增强结果中的偏色和发绿现象。
+\end{itemize}
+
+值得注意的是，当前代码把扩散引导拆分为 illumination-side 与 reflectance-side 两路，其中 reflectance-side 的权重明显更小，以避免伪监督对反射率结构产生持续拖软作用。
+
+\subsection{残差正则}
+残差项的目标是“只在必要时使用”。因此训练中不仅对残差本身施加绝对值稀疏正则，还通过 chroma boost 项鼓励其在高亮色偏区域承担少量颜色异常，从而进一步把彩色伪影从反射率主路径中迁出。
+
+\section{训练流程}
+当前代码遵循明显的阶段式训练逻辑。
+
+\subsection{Warm-up 阶段}
+warm-up 阶段不启用增强主监督，也不让残差分支参与主重建，而是优先完成以下任务：
+\begin{enumerate}[leftmargin=1.5em]
+  \item 在初始点云基础上稳定锚点几何；
+  \item 借助深度先验抑制漂浮伪影；
+  \item 让 $R$ 与 $S$ 先学到基础的低光成像分解。
+\end{enumerate}
+
+\subsection{联合优化阶段}
+当几何与基础分解相对稳定后，训练进入联合优化阶段：SG 光照、B0 反射率、offset-detail、decoder refinement、增强网络与残差分支一起参与优化。其中残差并非立刻全量启用，而是通过起始迭代和线性爬坡机制逐步接管局部困难区域。
+
+\section{与当前代码文件的对应关系}
+为便于后续写论文或做答辩整理，表~\ref{tab:code-map} 给出当前方法与主要代码文件的对应关系。
+
+\begin{table}[ht]
+\centering
+\caption{当前实现中的模块与代码映射}
+\label{tab:code-map}
+\begin{tabular}{p{0.26\linewidth} p{0.64\linewidth}}
+\toprule
+代码文件 & 主要职责 \\
+\midrule
+\texttt{arguments/\_\_init\_\_.py} & 统一维护训练/渲染超参数，包括 SG、B0、reflectance detail、decoder、residual ramp 与增强监督相关开关。 \\
+\texttt{scene/gaussian\_model.py} & 定义锚点高斯主体、B0 反射率主路径、offset-detail、reflectance decoder、SG illumination MLP、residual 分支及其优化器与 checkpoint 逻辑。 \\
+\texttt{gaussian\_renderer/\_\_init\_\_.py} & 将 anchor 特征展开为可渲染 offset，高效计算反射率、SG 光照、增强光照和残差，并完成主渲染。 \\
+\texttt{utils/sg\_utils.py} & 实现 SG 方向归一化、球面高斯求值与统计量提取。 \\
+\texttt{utils/loss\_utils.py} & 定义反射率、光照、增强、残差与深度相关的损失函数。 \\
+\texttt{train.py} & 组织 warm-up / train 阶段训练流程，接入 Depth Anything V2 与 StableSR 先验，并记录 wandb 诊断项。 \\
+\texttt{render.py} & 导出低光渲染、增强渲染、反射率、光照、残差与深度结果，并输出 SG 统计与测试指标 JSON。 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{相对原始 MM25 方案的当前版本特征}
+如果从“论文原型”与“当前仓库实际版本”对照来看，当前实现有四个非常鲜明的工程化特征：
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{反射率主路径更强}：从单纯的反射率预测，升级到 anchor 级 $B_0$、offset 级 detail 与 decoder refinement 协同表达；
+  \item \textbf{光照建模更明确}：SG illumination 替代更简单的标量式光照估计，使光照分支具备方向表达能力；
+  \item \textbf{残差介入更克制}：通过延迟、爬坡和 hard mask 三重机制，减少 residual 重新吞噬主体结构的风险；
+  \item \textbf{诊断信号更丰富}：代码中显式记录了 reflectance edge、high-frequency、decoder mean、residual coverage、SG energy 等统计项，便于针对分解失败进行调参与误差归因。
+\end{enumerate}
+
+因此，当前代码版本虽然延续了 LL-Gaussian 的论文叙事框架，但其真实实现已经更接近一个“面向低光显式三维分解的增强型 Scaffold-GS 变体”，而不是简单复刻原始稿件。
+
+\section{局限性与讨论}
+尽管当前实现相比基础 3DGS 更适合低光场景，但它仍有若干限制。首先，增强监督仍依赖外部扩散模型产生伪监督，因此颜色先验会受到二维模型偏好的影响。其次，反射率、光照与残差的解耦在极低信噪比区域仍然不完全可辨识，即便引入了 edge/high-frequency 等多种结构约束，也可能在深阴影区域出现纹理恢复不足。最后，尽管整体推理仍保持显式高斯渲染的高效率，但引入 decoder、SG illumination 与 residual 分支后，训练稳定性与超参数耦合程度明显高于 vanilla 3DGS。
+
+\section{结论}
+本文从当前代码实现出发，对 LL-Gaussian 的方法主线进行了面向论文写作的精简整理。整体而言，当前仓库已经形成一条较为清晰的技术路径：以先验点云和深度 warm-up 稳定几何，以 \texttt{B0 + detail + decoder} 建模反射率，以 SG 建模视角相关光照，以受控 residual 吸收局部瞬态误差，再通过增强网络和扩散伪监督实现正常光照的新视角输出。这一实现既继承了原始 MM25 工作中“低光端到端三维分解”的核心思想，也体现了面向实际训练稳定性和结果可控性的多轮工程修正。
+
+\end{document}
