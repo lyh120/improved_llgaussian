@@ -84,6 +84,7 @@ class GaussianModel:
                  add_illumination_dist : bool = False,
                  add_residual_dist : bool = False,
                  use_residual : bool = False,
+                 use_dual_transient: bool = True,
                  use_3D_filter : bool = False,
                  use_undependent_illumination : bool = False,
                  use_sg_illumination: bool = True,
@@ -110,6 +111,7 @@ class GaussianModel:
         self.add_residual_dist = add_residual_dist
 
         self.use_3D_filter = use_3D_filter
+        self.use_dual_transient = use_dual_transient
 
         self.use_undependent_illumination = use_undependent_illumination
         self.use_sg_illumination = use_sg_illumination
@@ -221,12 +223,19 @@ class GaussianModel:
         ).cuda()
         if self.use_residual:
             self.residual_dist_dim = 1 if self.add_residual_dist else 0 # take distant as input or not
-            self.residual_net= nn.Sequential(
+            self.noise_net = nn.Sequential(
                 nn.Linear(feat_dim+3+self.residual_dist_dim+self.appearance_residual_dim, feat_dim),
                 nn.ReLU(True),
                 nn.Linear(feat_dim, 3*self.n_offsets_residual),
-                nn.Sigmoid()
+                nn.Tanh()
             ).cuda()
+            self.artifact_net = nn.Sequential(
+                nn.Linear(feat_dim+3+self.residual_dist_dim+self.appearance_residual_dim, feat_dim),
+                nn.ReLU(True),
+                nn.Linear(feat_dim, 3*self.n_offsets_residual),
+                nn.Tanh()
+            ).cuda()
+            self.residual_net = self.artifact_net
 
         self.enhancement_net = nn.Sequential(
                 nn.Linear(feat_dim + 1*self.n_offsets, feat_dim // 2),
@@ -234,6 +243,14 @@ class GaussianModel:
                 nn.Linear(feat_dim // 2, 3*self.n_offsets),
                 nn.Sigmoid()
             ).cuda()
+
+    def _reset_noise_net(self):
+        if not self.use_residual:
+            return
+        for module in self.noise_net.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.zeros_(module.weight)
+                nn.init.zeros_(module.bias)
 
     def eval(self):
         self.mlp_opacity.eval()
@@ -246,7 +263,8 @@ class GaussianModel:
         self.mlp_reflectance_decoder.eval()
         self.enhancement_net.eval()
         if self.use_residual:
-            self.residual_net.eval()
+            self.noise_net.eval()
+            self.artifact_net.eval()
             self.mlp_cov_residual.eval()
             self.mlp_opacity_residual.eval()
         if self.appearance_residual_dim > 0: # use appearance embedding or not
@@ -265,7 +283,8 @@ class GaussianModel:
         self.mlp_reflectance_decoder.train()
         self.enhancement_net.train()
         if self.use_residual:
-            self.residual_net.train()
+            self.noise_net.train()
+            self.artifact_net.train()
             self.mlp_cov_residual.train()
             self.mlp_opacity_residual.train()
         if self.appearance_residual_dim > 0:
@@ -542,8 +561,16 @@ class GaussianModel:
         return self.mlp_sg_illumination
     
     @property
+    def get_noise_net(self):
+        return self.noise_net
+
+    @property
+    def get_artifact_net(self):
+        return self.artifact_net
+
+    @property
     def get_residual_net(self):
-        return self.residual_net
+        return self.artifact_net
     
     @property
     def get_rotation(self):
@@ -911,7 +938,8 @@ class GaussianModel:
             l.append({'params': [self._anchor_feat_residual], 'lr': training_args.feature_lr , "name": "anchor_feat_residual"})
             l.append({'params': [self._offset_residual], 'lr': training_args.offset_lr_init * self.spatial_lr_scale  , "name": "offset_residual"})
             l.append({'params': [self._scaling_residual], 'lr': training_args.scaling_lr, "name": "scaling_residual"})
-            l.append({'params': self.residual_net.parameters(), 'lr': training_args.mlp_color_lr_init , "name": "residual_net"})
+            l.append({'params': self.noise_net.parameters(), 'lr': training_args.mlp_color_lr_init , "name": "noise_net"})
+            l.append({'params': self.artifact_net.parameters(), 'lr': training_args.mlp_color_lr_init , "name": "artifact_net"})
             l.append({'params': self.mlp_opacity_residual.parameters(), 'lr': training_args.mlp_opacity_lr_init, "name": "mlp_opacity_residual"})
             l.append({'params': self.mlp_cov_residual.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov_residual"})
             
@@ -965,7 +993,11 @@ class GaussianModel:
                                                     lr_delay_mult=0.01,
                                                     max_steps=training_args.position_lr_max_steps)
         if self.use_residual:
-            self.residual_net_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_color_lr_init,
+            self.noise_net_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_color_lr_init,
+                                                    lr_final=training_args.mlp_color_lr_final,
+                                                    lr_delay_mult=training_args.mlp_color_lr_delay_mult,
+                                                    max_steps=training_args.mlp_color_lr_max_steps)
+            self.artifact_net_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_color_lr_init,
                                                     lr_final=training_args.mlp_color_lr_final,
                                                     lr_delay_mult=training_args.mlp_color_lr_delay_mult,
                                                     max_steps=training_args.mlp_color_lr_max_steps)
@@ -1037,8 +1069,11 @@ class GaussianModel:
             if self.use_residual and param_group["name"] == "offset_residual":
                 lr = self.offset_residual_scheduler_args(iteration)
                 param_group['lr'] = lr
-            if self.use_residual and param_group["name"] == "residual_net":
-                lr = self.residual_net_scheduler_args(iteration)
+            if self.use_residual and param_group["name"] == "noise_net":
+                lr = self.noise_net_scheduler_args(iteration)
+                param_group['lr'] = lr
+            if self.use_residual and param_group["name"] == "artifact_net":
+                lr = self.artifact_net_scheduler_args(iteration)
                 param_group['lr'] = lr
             if self.use_residual and param_group['name'] == "mlp_opacity_residual":
                 lr = self.mlp_opacity_residual_scheduler_args(iteration)
@@ -1231,7 +1266,8 @@ class GaussianModel:
             if  'mlp' in group['name'] or \
                 'conv' in group['name'] or \
                 'feat_base' in group['name'] or \
-                'residual_net' in group['name'] or \
+                'noise_net' in group['name'] or \
+                'artifact_net' in group['name'] or \
                 'embedding' in group['name'] or \
                 'enhancement_net' in group['name'] or \
                 'pose' in group['name']:
@@ -1289,7 +1325,8 @@ class GaussianModel:
             if  'mlp' in group['name'] or \
                 'conv' in group['name'] or \
                 'feat_base' in group['name'] or \
-                'residual_net' in group['name'] or \
+                'noise_net' in group['name'] or \
+                'artifact_net' in group['name'] or \
                 'enhancement_net' in group['name'] or \
                 'embedding' in group['name'] or \
                 'pose' in group['name']:
@@ -1584,10 +1621,16 @@ class GaussianModel:
             self.enhancement_net.train()
 
             if self.use_residual:
-                self.residual_net.eval()
-                residual_net = torch.jit.trace(self.residual_net, (torch.rand(1, self.feat_dim+3+self.residual_dist_dim + self.appearance_residual_dim).cuda()))
-                residual_net.save(os.path.join(path, 'residual_net.pt'))
-                self.residual_net.train()
+                residual_input = torch.rand(1, self.feat_dim+3+self.residual_dist_dim + self.appearance_residual_dim).cuda()
+                self.noise_net.eval()
+                noise_net = torch.jit.trace(self.noise_net, (residual_input,))
+                noise_net.save(os.path.join(path, 'noise_net.pt'))
+                self.noise_net.train()
+
+                self.artifact_net.eval()
+                artifact_net = torch.jit.trace(self.artifact_net, (residual_input,))
+                artifact_net.save(os.path.join(path, 'artifact_net.pt'))
+                self.artifact_net.train()
 
                 self.mlp_cov_residual.eval()
                 cov_residual_mlp = torch.jit.trace(self.mlp_cov_residual, (torch.rand(1, self.feat_dim+3+self.cov_dist_dim).cuda()))
@@ -1619,13 +1662,15 @@ class GaussianModel:
                     'sg_illumination_mlp': self.mlp_sg_illumination.state_dict(),
                     'reflectance_decoder': self.mlp_reflectance_decoder.state_dict(),
                     'enhancement_net': self.enhancement_net.state_dict(),
-                    'residual_net': self.residual_net.state_dict(),
-                    'cov_residual_mlp': self.mlp_cov_residual.state_dict(),
-                    'opacity_residual_mlp': self.mlp_opacity_residual.state_dict(),
                     'feature_bank_mlp': self.mlp_feature_bank.state_dict(),
                     'appearance': self.embedding_appearance.state_dict(),
                     'illumination_mode': self.illumination_mode,
                     }
+                if self.use_residual:
+                    checkpoint['noise_net'] = self.noise_net.state_dict()
+                    checkpoint['artifact_net'] = self.artifact_net.state_dict()
+                    checkpoint['cov_residual_mlp'] = self.mlp_cov_residual.state_dict()
+                    checkpoint['opacity_residual_mlp'] = self.mlp_opacity_residual.state_dict()
                 if self.illumination_mode == "legacy":
                     checkpoint['reflectance_mlp'] = self.mlp_reflectance.state_dict()
                     checkpoint['illumination_mlp'] = self.mlp_illumination.state_dict()
@@ -1637,12 +1682,14 @@ class GaussianModel:
                     'sg_illumination_mlp': self.mlp_sg_illumination.state_dict(),
                     'reflectance_decoder': self.mlp_reflectance_decoder.state_dict(),
                     'enhancement_net': self.enhancement_net.state_dict(),
-                    'residual_net': self.residual_net.state_dict(),
-                    'cov_residual_mlp': self.mlp_cov_residual.state_dict(),
-                    'opacity_residual_mlp': self.mlp_opacity_residual.state_dict(),
                     'appearance': self.embedding_appearance.state_dict(),
                     'illumination_mode': self.illumination_mode,
                     }
+                if self.use_residual:
+                    checkpoint['noise_net'] = self.noise_net.state_dict()
+                    checkpoint['artifact_net'] = self.artifact_net.state_dict()
+                    checkpoint['cov_residual_mlp'] = self.mlp_cov_residual.state_dict()
+                    checkpoint['opacity_residual_mlp'] = self.mlp_opacity_residual.state_dict()
                 if self.illumination_mode == "legacy":
                     checkpoint['reflectance_mlp'] = self.mlp_reflectance.state_dict()
                     checkpoint['illumination_mlp'] = self.mlp_illumination.state_dict()
@@ -1654,11 +1701,13 @@ class GaussianModel:
                     'sg_illumination_mlp': self.mlp_sg_illumination.state_dict(),
                     'reflectance_decoder': self.mlp_reflectance_decoder.state_dict(),
                     'enhancement_net': self.enhancement_net.state_dict(),
-                    'residual_net': self.residual_net.state_dict(),
-                    'cov_residual_mlp': self.mlp_cov_residual.state_dict(),
-                    'opacity_residual_mlp': self.mlp_opacity_residual.state_dict(),
                     'illumination_mode': self.illumination_mode,
                     }
+                if self.use_residual:
+                    checkpoint['noise_net'] = self.noise_net.state_dict()
+                    checkpoint['artifact_net'] = self.artifact_net.state_dict()
+                    checkpoint['cov_residual_mlp'] = self.mlp_cov_residual.state_dict()
+                    checkpoint['opacity_residual_mlp'] = self.mlp_opacity_residual.state_dict()
                 if self.illumination_mode == "legacy":
                     checkpoint['reflectance_mlp'] = self.mlp_reflectance.state_dict()
                     checkpoint['illumination_mlp'] = self.mlp_illumination.state_dict()
@@ -1693,9 +1742,20 @@ class GaussianModel:
                 self.mlp_illumination = torch.jit.load(legacy_illumination_path).cuda()
             self.enhancement_net = torch.jit.load(os.path.join(path, 'enhancement_net.pt')).cuda()
             if self.use_residual:
-                self.residual_net = torch.jit.load(os.path.join(path, 'residual_net.pt')).cuda()
+                noise_path = os.path.join(path, 'noise_net.pt')
+                artifact_path = os.path.join(path, 'artifact_net.pt')
+                legacy_residual_path = os.path.join(path, 'residual_net.pt')
+                if os.path.exists(noise_path):
+                    self.noise_net = torch.jit.load(noise_path).cuda()
+                else:
+                    self._reset_noise_net()
+                if os.path.exists(artifact_path):
+                    self.artifact_net = torch.jit.load(artifact_path).cuda()
+                elif os.path.exists(legacy_residual_path):
+                    self.artifact_net = torch.jit.load(legacy_residual_path).cuda()
                 self.mlp_cov_residual = torch.jit.load(os.path.join(path, 'cov_residual_mlp.pt')).cuda()
                 self.mlp_opacity_residual = torch.jit.load(os.path.join(path, 'opacity_residual_mlp.pt')).cuda()
+                self.residual_net = self.artifact_net
             if self.use_feat_bank:
                 self.mlp_feature_bank = torch.jit.load(os.path.join(path, 'feature_bank_mlp.pt')).cuda()
             if self.appearance_residual_dim > 0:
@@ -1722,9 +1782,17 @@ class GaussianModel:
                 self.mlp_illumination.load_state_dict(checkpoint['illumination_mlp'])
             self.enhancement_net.load_state_dict(checkpoint['enhancement_net'])
             if self.use_residual:
-                self.residual_net.load_state_dict(checkpoint['residual_net'])
+                if 'noise_net' in checkpoint:
+                    self.noise_net.load_state_dict(checkpoint['noise_net'])
+                else:
+                    self._reset_noise_net()
+                if 'artifact_net' in checkpoint:
+                    self.artifact_net.load_state_dict(checkpoint['artifact_net'])
+                elif 'residual_net' in checkpoint:
+                    self.artifact_net.load_state_dict(checkpoint['residual_net'])
                 self.mlp_cov_residual.load_state_dict(checkpoint['cov_residual_mlp'])
                 self.mlp_opacity_residual.load_state_dict(checkpoint['opacity_residual_mlp'])
+                self.residual_net = self.artifact_net
             if self.use_feat_bank:
                 self.mlp_feature_bank.load_state_dict(checkpoint['feature_bank_mlp'])
             if self.appearance_residual_dim > 0:

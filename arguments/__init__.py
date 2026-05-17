@@ -81,6 +81,7 @@ class ModelParams(ParamGroup):
         self.add_illumination_dist = False
         self.add_residual_dist = False
         self.use_residual = False
+        self.use_dual_transient = True
         self.use_3D_filter = False
         self.use_sg_illumination = True
         self.illumination_mode = "sg"
@@ -96,6 +97,12 @@ class ModelParams(ParamGroup):
         self.reflectance_highfreq_reg = 3e-3
         self.highlight_reflectance_reg = 1e-3
         self.residual_chroma_reg = 5e-4
+        self.noise_residual_reg = 1.0
+        self.artifact_residual_reg = 0.35
+        self.noise_zero_mean_reg = 0.05
+        self.noise_highfreq_reg = 0.05
+        self.noise_dark_weight_reg = 0.05
+        self.artifact_highlight_reg = 0.25
         self.reflectance_detail_reg = 1e-6
         self.reflectance_decoder_reg = 2e-5
         self.enhancement_reflectance_reg = 0.06
@@ -224,6 +231,7 @@ def _backfill_model_compatibility(merged_dict):
     defaults = {
         "use_sg_illumination": True,
         "illumination_mode": "sg",
+        "use_dual_transient": True,
         "sg_lobes": 4,
         "sg_lambda_min": 1.0,
         "sg_energy_reg": 1e-4,
@@ -236,6 +244,12 @@ def _backfill_model_compatibility(merged_dict):
         "reflectance_highfreq_reg": 3e-3,
         "highlight_reflectance_reg": 1e-3,
         "residual_chroma_reg": 5e-4,
+        "noise_residual_reg": 1.0,
+        "artifact_residual_reg": 0.35,
+        "noise_zero_mean_reg": 0.05,
+        "noise_highfreq_reg": 0.05,
+        "noise_dark_weight_reg": 0.05,
+        "artifact_highlight_reg": 0.25,
         "reflectance_detail_reg": 1e-6,
         "reflectance_decoder_reg": 2e-5,
         "enhancement_reflectance_reg": 0.06,

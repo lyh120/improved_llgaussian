@@ -293,6 +293,38 @@ def L_Residual_Chroma_Boost(residual_image, reflectance_image, threshold=0.6):
     return -(residual_chroma * bright_mask).mean()
 
 
+def L_Noise_Zero_Mean(noise_image, mask=None):
+    """Encourage the noise branch to stay zero-centered and avoid low-frequency bias."""
+    if mask is None:
+        return torch.abs(noise_image.mean())
+    weight = mask.expand_as(noise_image)
+    denom = weight.sum().clamp_min(1.0)
+    return torch.abs((noise_image * weight).sum() / denom)
+
+
+def L_Noise_Dark_Weighted(noise_image, gt_image):
+    """Allow larger noise in dark regions while suppressing bright-region residual noise."""
+    intensity = gt_image.detach().mean(dim=0, keepdim=True)
+    bright_weight = intensity.expand_as(noise_image)
+    return torch.abs(noise_image * bright_weight).mean()
+
+
+def L_Noise_HighFreq(noise_image, threshold=0.1, target_ratio=0.8):
+    """Push the noise branch toward high-frequency content instead of low-frequency color blobs."""
+    noise_gray = noise_image.mean(dim=0, keepdim=True).unsqueeze(0)
+    kernel = torch.tensor(
+        [[0.0, -1.0, 0.0], [-1.0, 4.0, -1.0], [0.0, -1.0, 0.0]],
+        device=noise_image.device,
+        dtype=noise_image.dtype,
+    ).view(1, 1, 3, 3)
+    hf = torch.abs(F.conv2d(noise_gray, kernel, padding=1)).squeeze(0)
+    noise_mag = torch.abs(noise_gray).squeeze(0).detach()
+    structure_mask = torch.clamp(noise_mag / (noise_mag.mean().clamp_min(1e-6)) - threshold, 0.0, 1.0)
+    hf_norm = hf / (hf.mean().detach() + 1e-6)
+    target = target_ratio * structure_mask
+    return (F.relu(target - hf_norm) * structure_mask).mean()
+
+
 def _topk_mask(score, keep_ratio, candidate_mask=None):
     flat_score = score.flatten()
     if candidate_mask is not None:
@@ -313,6 +345,41 @@ def _topk_mask(score, keep_ratio, candidate_mask=None):
     return mask.view_as(score)
 
 
+def build_dual_transient_masks(
+    base_image,
+    gt_image,
+    higherror_percentile=0.8,
+    highlight_percentile=0.9,
+    bright_threshold=0.6,
+):
+    """Build dedicated masks for noise-like errors and structured transient artifacts.
+
+    Low-light sRGB frames can be globally dark, so the artifact branch cannot rely on
+    bright pixels alone. It gets a sparse top-k mask from structured reconstruction
+    error and chroma cues, while the noise branch remains biased toward dark errors.
+    """
+    gt_image = gt_image.detach()
+    base_image = base_image.detach()
+    recon_error = torch.abs(gt_image - base_image).mean(dim=0, keepdim=True)
+    gt_value = gt_image.mean(dim=0, keepdim=True)
+    gt_chroma = torch.abs(gt_image - gt_value).mean(dim=0, keepdim=True)
+    base_value = base_image.mean(dim=0, keepdim=True)
+    base_chroma = torch.abs(base_image - base_value).mean(dim=0, keepdim=True)
+
+    dark_weight = (1.0 - gt_value).clamp(0.0, 1.0)
+    dark_error_score = recon_error * dark_weight
+    noise_keep_ratio = max(1e-3, 1.0 - higherror_percentile)
+    noise_mask = _topk_mask(dark_error_score, noise_keep_ratio)
+
+    bright_mask = ((gt_value - bright_threshold) / max(1e-6, 1.0 - bright_threshold)).clamp(0.0, 1.0)
+    chroma_score = torch.maximum(gt_chroma, base_chroma)
+    artifact_score = recon_error * (0.5 + 0.5 * bright_mask) + 0.5 * chroma_score
+    artifact_keep_ratio = max(1e-3, 1.0 - highlight_percentile)
+    artifact_mask = _topk_mask(artifact_score, artifact_keep_ratio)
+
+    return noise_mask, artifact_mask, noise_mask.mean(), artifact_mask.mean()
+
+
 def build_residual_hard_mask(
     base_image,
     gt_image,
@@ -320,23 +387,16 @@ def build_residual_hard_mask(
     highlight_percentile=0.9,
     bright_threshold=0.6,
 ):
-    """Build a sparse residual mask from high-error regions and bright chromatic highlights."""
-    gt_image = gt_image.detach()
-    base_image = base_image.detach()
-    recon_error = torch.abs(gt_image - base_image).mean(dim=0, keepdim=True)
-    error_keep_ratio = max(1e-3, 1.0 - higherror_percentile)
-    error_mask = _topk_mask(recon_error, error_keep_ratio)
-
-    gt_value = gt_image.mean(dim=0, keepdim=True)
-    gt_chroma = torch.abs(gt_image - gt_value).mean(dim=0, keepdim=True)
-    bright_mask = ((gt_value - bright_threshold) / max(1e-6, 1.0 - bright_threshold)).clamp(0.0, 1.0)
-    highlight_score = gt_chroma * bright_mask
-    highlight_keep_ratio = max(1e-3, 1.0 - highlight_percentile)
-    highlight_candidates = bright_mask > 0.05
-    highlight_mask = _topk_mask(highlight_score, highlight_keep_ratio, candidate_mask=highlight_candidates.float())
-
-    hard_mask = torch.clamp(error_mask + highlight_mask, 0.0, 1.0)
-    return hard_mask, error_mask.mean(), highlight_mask.mean()
+    """Backward-compatible single-mask helper built from dual transient masks."""
+    noise_mask, artifact_mask, noise_cov, artifact_cov = build_dual_transient_masks(
+        base_image,
+        gt_image,
+        higherror_percentile=higherror_percentile,
+        highlight_percentile=highlight_percentile,
+        bright_threshold=bright_threshold,
+    )
+    hard_mask = torch.clamp(noise_mask + artifact_mask, 0.0, 1.0)
+    return hard_mask, noise_cov, artifact_cov
 
 
 def L_SG_Energy(sg_stats):

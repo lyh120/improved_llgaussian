@@ -228,6 +228,8 @@ def render_set_optimize(model_path, name, iteration, views, gaussians, pipeline,
     render_enhanced_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_enhanceds")
     render_depth_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_depths")
     render_residual_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_residuals")
+    render_noise_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_noises")
+    render_artifact_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_artifacts")
     error_path = os.path.join(model_path, name, "ours_{}".format(iteration), "errors")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
     makedirs(render_path, exist_ok=True)
@@ -236,6 +238,8 @@ def render_set_optimize(model_path, name, iteration, views, gaussians, pipeline,
     makedirs(render_enhanced_path, exist_ok=True)
     makedirs(render_depth_path, exist_ok=True)
     makedirs(render_residual_path, exist_ok=True)
+    makedirs(render_noise_path, exist_ok=True)
+    makedirs(render_artifact_path, exist_ok=True)
     makedirs(error_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
 
@@ -320,6 +324,12 @@ def render_set_optimize(model_path, name, iteration, views, gaussians, pipeline,
             if 'render_residual' in render_pkg:
                 rendering_residual = torch.clamp(render_pkg["render_residual"], 0.0, 1.0)
                 torchvision.utils.save_image(rendering_residual, os.path.join(render_residual_path, view.image_name + ".png"))
+            if 'render_noise' in render_pkg:
+                rendering_noise = torch.clamp(render_pkg["render_noise"], 0.0, 1.0)
+                torchvision.utils.save_image(rendering_noise, os.path.join(render_noise_path, view.image_name + ".png"))
+            if 'render_artifact' in render_pkg:
+                rendering_artifact = torch.clamp(render_pkg["render_artifact"], 0.0, 1.0)
+                torchvision.utils.save_image(rendering_artifact, os.path.join(render_artifact_path, view.image_name + ".png"))
 
 
 
@@ -360,6 +370,8 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     render_depth_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_depths")
     render_residual_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_residuals")
     render_residual_path_fast = os.path.join(model_path, name, "ours_{}".format(iteration), "render_residuals(enhanced)")
+    render_noise_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_noises")
+    render_artifact_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_artifacts")
     error_path = os.path.join(model_path, name, "ours_{}".format(iteration), "errors")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
     makedirs(render_path, exist_ok=True)
@@ -372,6 +384,8 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     makedirs(render_depth_path, exist_ok=True)
     makedirs(render_residual_path, exist_ok=True)
     makedirs(render_residual_path_fast, exist_ok=True)
+    makedirs(render_noise_path, exist_ok=True)
+    makedirs(render_artifact_path, exist_ok=True)
     makedirs(error_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
 
@@ -421,6 +435,12 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
              torchvision.utils.save_image(rendering_residul_image, os.path.join(render_residual_path, view.image_name + ".png"))
              rendering_residul_image_enhance = torch.clamp(render_pkg["render_residual"] * 30, 0.0, 1.0)
              torchvision.utils.save_image(rendering_residul_image_enhance, os.path.join(render_residual_path_fast, view.image_name + ".png"))
+        if "render_noise" in render_pkg:
+             rendering_noise_image = torch.clamp(render_pkg["render_noise"] * 30, 0.0, 1.0)
+             torchvision.utils.save_image(rendering_noise_image, os.path.join(render_noise_path, view.image_name + ".png"))
+        if "render_artifact" in render_pkg:
+             rendering_artifact_image = torch.clamp(render_pkg["render_artifact"] * 30, 0.0, 1.0)
+             torchvision.utils.save_image(rendering_artifact_image, os.path.join(render_artifact_path, view.image_name + ".png"))
 
         gt = None
         if name != "interp":
@@ -479,7 +499,7 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         sg_lambda_min = getattr(dataset, "sg_lambda_min", 1.0)
 
         gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
-                              dataset.appearance_residual_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_reflectance_dist, dataset.add_illumination_dist, dataset.add_residual_dist, dataset.use_residual, dataset.use_3D_filter,
+                              dataset.appearance_residual_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_reflectance_dist, dataset.add_illumination_dist, dataset.add_residual_dist, dataset.use_residual, dataset.use_dual_transient, dataset.use_3D_filter,
                               use_sg_illumination=use_sg_illumination, illumination_mode=illumination_mode, sg_lobes=sg_lobes, sg_lambda_min=sg_lambda_min)
         scene = Scene(dataset, gaussians, depth_piror_model=None, load_iteration=iteration, shuffle=False)
         

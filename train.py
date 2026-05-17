@@ -46,7 +46,7 @@ sys.path.append("./submodules/Depth-Anything-V2")
 # from lpipsPyTorch import lpips
 import lpips
 from random import randint
-from utils.loss_utils import l1_loss, ssim, l1_plus_loss, L_Smooth, L_Illu, L_Gray, L_Green_Bias, L_Depth_similarity, L_Reflectance_Smooth, L_Depth_Smooth, pearson_depth_loss, L_Reflectance_Consistency, L_Reflectance_Edge, L_Reflectance_Edge_Uplift, L_Reflectance_Highlight, L_Reflectance_LocalContrast, L_Reflectance_HighFreq, L_Residual_Chroma_Boost, L_SG_Energy, L_SG_Sharpness, L_B0_Spatial_Smooth, build_residual_hard_mask
+from utils.loss_utils import l1_loss, ssim, l1_plus_loss, L_Smooth, L_Illu, L_Gray, L_Green_Bias, L_Depth_similarity, L_Reflectance_Smooth, L_Depth_Smooth, pearson_depth_loss, L_Reflectance_Consistency, L_Reflectance_Edge, L_Reflectance_Edge_Uplift, L_Reflectance_Highlight, L_Reflectance_LocalContrast, L_Reflectance_HighFreq, L_Residual_Chroma_Boost, L_Noise_Zero_Mean, L_Noise_Dark_Weighted, L_Noise_HighFreq, L_SG_Energy, L_SG_Sharpness, L_B0_Spatial_Smooth, build_dual_transient_masks
 from gaussian_renderer import prefilter_voxel, render, network_gui
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -220,7 +220,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     tb_writer = prepare_output_and_logger(dataset)
 
     gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
-                              dataset.appearance_residual_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_reflectance_dist, dataset.add_illumination_dist, dataset.add_residual_dist, dataset.use_residual, dataset.use_3D_filter,
+                              dataset.appearance_residual_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_reflectance_dist, dataset.add_illumination_dist, dataset.add_residual_dist, dataset.use_residual, dataset.use_dual_transient, dataset.use_3D_filter,
                               use_sg_illumination=dataset.use_sg_illumination, illumination_mode=dataset.illumination_mode, sg_lobes=dataset.sg_lobes, sg_lambda_min=dataset.sg_lambda_min)
     depth_piror_model = depth_piror_Model()
     if mode == "warmuped":
@@ -399,33 +399,46 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         if residual_active:
             ramp_iters = max(1, opt.residual_ramp_iters)
             residual_mix_weight = min(1.0, float(iteration - opt.residual_start_iter + 1) / float(ramp_iters))
-        residual_hard_mask = torch.zeros_like(gt_image[:1])
-        residual_hardmask_coverage = torch.tensor(0.0, device=gt_image.device)
-        residual_error_mask_coverage = torch.tensor(0.0, device=gt_image.device)
-        residual_highlight_mask_coverage = torch.tensor(0.0, device=gt_image.device)
+        noise_mask = torch.zeros_like(gt_image[:1])
+        artifact_mask = torch.zeros_like(gt_image[:1])
+        noise_mask_coverage = torch.tensor(0.0, device=gt_image.device)
+        artifact_mask_coverage = torch.tensor(0.0, device=gt_image.device)
 
         if mode == "warmup":
+            noise_image = torch.zeros_like(gt_image)
+            artifact_image = torch.zeros_like(gt_image)
             residual_image = torch.zeros_like(gt_image)
+            noise_image_for_loss = noise_image
+            artifact_image_for_loss = artifact_image
             residual_image_for_loss = residual_image
             image_tmp = base_image
         else:
             if "render_residual" in render_pkg:
                 scaling_residual = render_pkg["scaling_residual"]
+                noise_image = render_pkg.get("render_noise", torch.zeros_like(gt_image))
+                artifact_image = render_pkg.get("render_artifact", torch.zeros_like(gt_image))
                 residual_image = render_pkg["render_residual"]
                 if residual_active:
-                    residual_hard_mask, residual_error_mask_coverage, residual_highlight_mask_coverage = build_residual_hard_mask(
+                    noise_mask, artifact_mask, noise_mask_coverage, artifact_mask_coverage = build_dual_transient_masks(
                         base_image,
                         gt_image,
                         higherror_percentile=dataset.residual_higherror_percentile,
                         highlight_percentile=dataset.residual_highlight_percentile,
                     )
-                    residual_hardmask_coverage = residual_hard_mask.mean()
-                    residual_image_for_loss = residual_image * residual_mix_weight * residual_hard_mask
+                    noise_image_for_loss = noise_image * residual_mix_weight * noise_mask
+                    artifact_image_for_loss = artifact_image * residual_mix_weight * artifact_mask
+                    residual_image_for_loss = noise_image_for_loss + artifact_image_for_loss
                 else:
+                    noise_image_for_loss = torch.zeros_like(noise_image)
+                    artifact_image_for_loss = torch.zeros_like(artifact_image)
                     residual_image_for_loss = torch.zeros_like(residual_image)
                 image_tmp = torch.clamp(base_image + residual_image_for_loss, 0.0, 1.0)
             else:
+                noise_image = torch.zeros_like(gt_image)
+                artifact_image = torch.zeros_like(gt_image)
                 residual_image = torch.zeros_like(gt_image)
+                noise_image_for_loss = noise_image
+                artifact_image_for_loss = artifact_image
                 residual_image_for_loss = residual_image
                 image_tmp = base_image
         timing_stats["data_time"] = timing_stats.get("data_time", 0) + (time.time() - t1)
@@ -459,6 +472,14 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         L_residual_reg = torch.tensor(0.0, device=gt_image.device)
         residual_chroma_mean = torch.tensor(0.0, device=gt_image.device)
         L_residual_chroma_boost = torch.tensor(0.0, device=gt_image.device)
+        L_noise_sparse = torch.tensor(0.0, device=gt_image.device)
+        L_artifact_sparse = torch.tensor(0.0, device=gt_image.device)
+        L_noise_zero_mean = torch.tensor(0.0, device=gt_image.device)
+        L_noise_dark_weighted = torch.tensor(0.0, device=gt_image.device)
+        L_noise_highfreq = torch.tensor(0.0, device=gt_image.device)
+        noise_abs_mean = torch.tensor(0.0, device=gt_image.device)
+        artifact_abs_mean = torch.tensor(0.0, device=gt_image.device)
+        artifact_chroma_mean = torch.tensor(0.0, device=gt_image.device)
         enhancement_guidance_weight = 0.0
         L_diff_reflectance = torch.tensor(0.0, device=gt_image.device)
         L_diff_illumination = torch.tensor(0.0, device=gt_image.device)
@@ -554,9 +575,26 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     loss += enhancement_guidance_weight * L_diff
             if dataset.use_residual and residual_active:
                 scaling_residual_reg = scaling_residual.prod(dim=1).mean()
-                L_residual_reg = torch.mean(torch.abs(residual_image_for_loss)) * weight_scheduler(iteration)
-                L_residual_chroma_boost = L_Residual_Chroma_Boost(residual_image_for_loss, reflectance_image)
-                loss += L_residual_reg + 0.05 * scaling_residual_reg + dataset.residual_chroma_reg * L_residual_chroma_boost
+                L_noise_sparse = torch.mean(torch.abs(noise_image_for_loss)) * weight_scheduler(iteration)
+                L_artifact_sparse = torch.mean(torch.abs(artifact_image_for_loss)) * weight_scheduler(iteration)
+                L_noise_zero_mean = L_Noise_Zero_Mean(noise_image_for_loss, noise_mask)
+                L_noise_dark_weighted = L_Noise_Dark_Weighted(noise_image_for_loss, gt_image)
+                L_noise_highfreq = L_Noise_HighFreq(noise_image_for_loss)
+                L_residual_chroma_boost = L_Residual_Chroma_Boost(artifact_image_for_loss, reflectance_image)
+                L_residual_reg = L_noise_sparse + L_artifact_sparse
+                noise_abs_mean = torch.abs(noise_image_for_loss).mean()
+                artifact_abs_mean = torch.abs(artifact_image_for_loss).mean()
+                artifact_chroma_mean = torch.abs(artifact_image_for_loss - artifact_image_for_loss.mean(dim=0, keepdim=True)).mean()
+                loss += (
+                    dataset.noise_residual_reg * L_noise_sparse
+                    + dataset.artifact_residual_reg * L_artifact_sparse
+                    + dataset.noise_zero_mean_reg * L_noise_zero_mean
+                    + dataset.noise_dark_weight_reg * L_noise_dark_weighted
+                    + dataset.noise_highfreq_reg * L_noise_highfreq
+                    + dataset.artifact_highlight_reg * L_residual_chroma_boost
+                    + dataset.residual_chroma_reg * L_residual_chroma_boost
+                    + 0.05 * scaling_residual_reg
+                )
  
         timing_stats['loss_time'] = timing_stats.get('loss_time', 0) + (time.time() - t2)
 
@@ -600,9 +638,13 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                            'reflectance_detail_mean': L_reflectance_detail,
                            'reflectance_decoder_mean': L_reflectance_decoder,
                            'residual_mix_weight': residual_mix_weight,
-                           'residual_hardmask_coverage': residual_hardmask_coverage,
-                           'residual_error_mask_coverage': residual_error_mask_coverage,
-                           'residual_highlight_mask_coverage': residual_highlight_mask_coverage,
+                           'noise_mask_coverage': noise_mask_coverage,
+                           'artifact_mask_coverage': artifact_mask_coverage,
+                           'noise_abs_mean': noise_abs_mean,
+                           'artifact_abs_mean': artifact_abs_mean,
+                           'noise_zero_mean': L_noise_zero_mean,
+                           'noise_highfreq_mean': L_noise_highfreq,
+                           'artifact_chroma_mean': artifact_chroma_mean,
                            'residual_chroma_mean': residual_chroma_mean,
                            'residual_chroma_boost': L_residual_chroma_boost,
                            'residual_enabled': float(residual_active),
@@ -618,18 +660,36 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 enhanced_image = torch.clamp(reflectance_image * illumination_image * enhance_ratio, 0.0, 1.0)
                 illumination_image = torch.clamp(illumination_image * enhance_ratio, 0.0, 1.0)
                 if not dataset.use_residual or mode=="warmup":
+                    noise_image = torch.zeros_like(image)
+                    artifact_image = torch.zeros_like(image)
                     residual_image = torch.zeros_like(image)
+                noise_scaled = noise_image * enhance_ratio
+                artifact_scaled = artifact_image * enhance_ratio
                 residual_scaled = residual_image * enhance_ratio
                 residual_scaled_used = residual_image_for_loss * enhance_ratio
+                noise_image_raw = torch.clamp(noise_scaled, 0.0, 1.0)
+                artifact_image_raw = torch.clamp(artifact_scaled, 0.0, 1.0)
                 residual_image_raw = torch.clamp(residual_scaled, 0.0, 1.0)
                 residual_abs = residual_scaled.abs()
                 residual_abs_used = residual_scaled_used.abs()
+                noise_abs = noise_scaled.abs()
+                artifact_abs = artifact_scaled.abs()
                 residual_chroma_mean = torch.abs(residual_image_for_loss - residual_image_for_loss.mean(dim=0, keepdim=True)).mean()
                 residual_abs_max = residual_abs.max()
+                noise_abs_max = noise_abs.max()
+                artifact_abs_max = artifact_abs.max()
                 if residual_abs_max.item() > 0:
                     residual_image_vis = residual_abs / (residual_abs_max + 1e-6)
                 else:
                     residual_image_vis = torch.zeros_like(residual_abs)
+                if noise_abs_max.item() > 0:
+                    noise_image_vis = noise_abs / (noise_abs_max + 1e-6)
+                else:
+                    noise_image_vis = torch.zeros_like(noise_abs)
+                if artifact_abs_max.item() > 0:
+                    artifact_image_vis = artifact_abs / (artifact_abs_max + 1e-6)
+                else:
+                    artifact_image_vis = torch.zeros_like(artifact_abs)
                 enhanced_image_pil = torchvision.transforms.ToPILImage()(enhanced_image)
                 
 
@@ -638,6 +698,11 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         'image':wandb.Image(torchvision.transforms.ToPILImage()(image)),
                         'depth':wandb.Image(1-minmax_normalize(depth_image)),
                         'residual_image':wandb.Image(torchvision.transforms.ToPILImage()(residual_image_vis)),
+                        'noise_image':wandb.Image(torchvision.transforms.ToPILImage()(noise_image_vis)),
+                        'artifact_image':wandb.Image(torchvision.transforms.ToPILImage()(artifact_image_vis)),
+                        'residual_image_total':wandb.Image(torchvision.transforms.ToPILImage()(residual_image_vis)),
+                        'noise_image_raw':wandb.Image(torchvision.transforms.ToPILImage()(noise_image_raw)),
+                        'artifact_image_raw':wandb.Image(torchvision.transforms.ToPILImage()(artifact_image_raw)),
                         'residual_image_raw':wandb.Image(torchvision.transforms.ToPILImage()(residual_image_raw)),
                         'residual_abs_mean_raw': residual_abs.mean(),
                         'residual_abs_mean_used': residual_abs_used.mean(),
@@ -649,9 +714,13 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         'reflectance_detail_mean': L_reflectance_detail,
                         'reflectance_decoder_mean': L_reflectance_decoder,
                         'reflectance_highlight_mean': L_reflectance_highlight,
-                        'residual_hardmask_coverage': residual_hardmask_coverage,
-                        'residual_error_mask_coverage': residual_error_mask_coverage,
-                        'residual_highlight_mask_coverage': residual_highlight_mask_coverage,
+                        'noise_mask_coverage': noise_mask_coverage,
+                        'artifact_mask_coverage': artifact_mask_coverage,
+                        'noise_abs_mean': noise_abs_mean,
+                        'artifact_abs_mean': artifact_abs_mean,
+                        'noise_zero_mean': L_noise_zero_mean,
+                        'noise_highfreq_mean': L_noise_highfreq,
+                        'artifact_chroma_mean': artifact_chroma_mean,
                         'residual_chroma_mean': residual_chroma_mean,
                         'residual_mix_weight': residual_mix_weight,
                         'residual_chroma_boost': L_residual_chroma_boost,
@@ -678,6 +747,11 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 print("residual_image_raw_mean", residual_image_raw.mean())
                 print("residual_abs_mean_raw", residual_abs.mean())
                 print("residual_abs_mean_used", residual_abs_used.mean())
+                print("noise_abs_mean", noise_abs_mean)
+                print("artifact_abs_mean", artifact_abs_mean)
+                print("noise_zero_mean", L_noise_zero_mean)
+                print("noise_highfreq_mean", L_noise_highfreq)
+                print("artifact_chroma_mean", artifact_chroma_mean)
                 print("reflectance_edge_mean", L_reflectance_edge)
                 print("reflectance_edge_uplift_mean", L_reflectance_edge_uplift)
                 print("reflectance_contrast_mean", L_reflectance_contrast)
@@ -687,9 +761,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 print("reflectance_highlight_mean", L_reflectance_highlight)
                 print("residual_chroma_mean", residual_chroma_mean)
                 print("residual_mix_weight", residual_mix_weight)
-                print("residual_hardmask_coverage", residual_hardmask_coverage)
-                print("residual_error_mask_coverage", residual_error_mask_coverage)
-                print("residual_highlight_mask_coverage", residual_highlight_mask_coverage)
+                print("noise_mask_coverage", noise_mask_coverage)
+                print("artifact_mask_coverage", artifact_mask_coverage)
                 print("residual_chroma_boost", L_residual_chroma_boost)
                 print("enhancement_color_mean", L_enhanced_color)
                 print("enhancement_color_std", L_enhanced_color_std)
@@ -1069,22 +1142,20 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     return t_list, visible_count_list
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train=False, skip_test=False, wandb=None, tb_writer=None, dataset_name=None, logger=None):
+    gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
+                              dataset.appearance_residual_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_reflectance_dist, dataset.add_illumination_dist, dataset.add_residual_dist, dataset.use_residual, dataset.use_dual_transient, dataset.use_3D_filter,
+                              use_sg_illumination=dataset.use_sg_illumination, illumination_mode=dataset.illumination_mode, sg_lobes=dataset.sg_lobes, sg_lambda_min=dataset.sg_lambda_min)
+    scene = Scene(dataset, gaussians, depth_piror_model=None, load_iteration=iteration, shuffle=False)
+    gaussians.eval()
+
+    bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
+    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
+    if not os.path.exists(dataset.model_path):
+        os.makedirs(dataset.model_path)
+
+    visible_count = None
+
     with torch.no_grad():
-
-        gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
-                                dataset.appearance_residual_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_reflectance_dist, dataset.add_illumination_dist, dataset.add_residual_dist, dataset.use_residual, dataset.use_3D_filter,
-                                use_sg_illumination=dataset.use_sg_illumination, illumination_mode=dataset.illumination_mode, sg_lobes=dataset.sg_lobes, sg_lambda_min=dataset.sg_lambda_min)
-        scene = Scene(dataset, gaussians, depth_piror_model=None, load_iteration=iteration, shuffle=False)
-        # gaussians.train()
-        gaussians.eval()
-
-        bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
-        background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-        if not os.path.exists(dataset.model_path):
-            os.makedirs(dataset.model_path)
-
-        visible_count = None
-
         if not skip_train:
             t_train_list, visible_count  = render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, dataset.kernel_size)
             train_fps = 1.0 / torch.tensor(t_train_list[5:]).mean()
@@ -1094,8 +1165,9 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
 
     if not skip_test:
         gaussians.init_RT_seq(scene.test_cameras)
-        render_set_optimize(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, dataset.kernel_size)
-    
+        with torch.enable_grad():
+            render_set_optimize(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, dataset.kernel_size)
+
     return visible_count
 
 

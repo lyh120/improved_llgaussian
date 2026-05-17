@@ -147,16 +147,15 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     illumination_enhanced = pc.get_enhancement_net(torch.cat([feat.detach(), illumination_feat.detach()], dim=1))
     if pc.use_residual and pc.appearance_residual_dim>0:
         if pc.add_residual_dist:
-            color_residual = pc.get_residual_net(torch.cat([cat_local_view_residual, appearance_residual], dim=1))
+            residual_input = torch.cat([cat_local_view_residual, appearance_residual], dim=1)
         else:
-            color_residual = pc.get_residual_net(torch.cat([cat_local_view_wodist_residual, appearance_residual], dim=1))
-        color_residual = color_residual.reshape([anchor.shape[0]*pc.n_offsets_residual, 3]) # [mask]
+            residual_input = torch.cat([cat_local_view_wodist_residual, appearance_residual], dim=1)
+        color_noise = pc.get_noise_net(residual_input).reshape([anchor.shape[0]*pc.n_offsets_residual, 3])
+        color_artifact = pc.get_artifact_net(residual_input).reshape([anchor.shape[0]*pc.n_offsets_residual, 3])
     elif pc.use_residual:
-        if pc.add_residual_dist:
-            color_residual = pc.get_residual_net(cat_local_view_residual)
-        else:
-            color_residual = pc.get_residual_net(cat_local_view_wodist_residual)
-        color_residual = color_residual.reshape([anchor.shape[0]*pc.n_offsets_residual, 3]) # [mask]
+        residual_input = cat_local_view_residual if pc.add_residual_dist else cat_local_view_wodist_residual
+        color_noise = pc.get_noise_net(residual_input).reshape([anchor.shape[0]*pc.n_offsets_residual, 3])
+        color_artifact = pc.get_artifact_net(residual_input).reshape([anchor.shape[0]*pc.n_offsets_residual, 3])
     if pc.legacy_compatibility_mode:
         cat_local_view_woview = torch.cat([feat, ob_dist], dim=1) # [N, c+1]
         cat_local_view_woview_wodist = torch.cat([feat], dim=1) # [N, c]
@@ -213,9 +212,9 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
         concatenated_residual = torch.cat([grid_scaling_residual, anchor_residual], dim=-1)
         concatenated_repeated_residual = repeat(concatenated_residual, 'n (c) -> (n k) (c)', k=pc.n_offsets_residual)
         feat_repeated_residual = repeat(anchor_feat_residual, 'n (c) -> (n k) (c)', k=pc.n_offsets_residual)
-        concatenated_all_residual = torch.cat([concatenated_repeated_residual, color_residual, scale_rot_residual, offsets_residual, feat_repeated_residual], dim=-1)# [[6,3],3,7,3,32]
+        concatenated_all_residual = torch.cat([concatenated_repeated_residual, color_noise, color_artifact, scale_rot_residual, offsets_residual, feat_repeated_residual], dim=-1)# [[6,3],3,3,7,3,32]
         masked_residual = concatenated_all_residual[mask_residual]
-        scaling_repeat_residual, repeat_anchor_residual, color_residual, scale_rot_residual, offsets_residual, feat_repeated_residual = masked_residual.split([6, 3, 3, 7, 3, anchor_feat_residual.shape[1]], dim=-1)
+        scaling_repeat_residual, repeat_anchor_residual, color_noise, color_artifact, scale_rot_residual, offsets_residual, feat_repeated_residual = masked_residual.split([6, 3, 3, 3, 7, 3, anchor_feat_residual.shape[1]], dim=-1)
         scaling_residual = scaling_repeat_residual[:, 3:] * torch.sigmoid(scale_rot_residual[:, :3])
         rot_residual = pc.rotation_activation(scale_rot_residual[:, 3:7])
         offsets_residual = offsets_residual * scaling_residual[:,:3]
@@ -230,7 +229,8 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
         rot_residual = None
         opacity_residual = None
         mask_residual = None
-        color_residual = None
+        color_noise = None
+        color_artifact = None
     # post-process cov
     scaling = scaling_repeat[:,3:] * torch.sigmoid(scale_rot[:,:3]) # * (1+torch.sigmoid(repeat_dist))
     rot = pc.rotation_activation(scale_rot[:,3:7])
@@ -253,9 +253,9 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     # feat_downsampled = feat_repeated.detach()
 
     if is_training:
-        return xyz, reflectance, illumination, illumination_enhanced, opacity, scaling, rot, neural_opacity, mask, xyz_residual, color_residual, scaling_residual, rot_residual, opacity_residual, sg_stats
+        return xyz, reflectance, illumination, illumination_enhanced, opacity, scaling, rot, neural_opacity, mask, xyz_residual, color_noise, color_artifact, scaling_residual, rot_residual, opacity_residual, sg_stats
     else:
-        return xyz, reflectance, illumination, illumination_enhanced, opacity, scaling, rot, xyz_residual, color_residual, scaling_residual, rot_residual, opacity_residual, sg_stats
+        return xyz, reflectance, illumination, illumination_enhanced, opacity, scaling, rot, xyz_residual, color_noise, color_artifact, scaling_residual, rot_residual, opacity_residual, sg_stats
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, kernel_size: float, scaling_modifier = 1.0, visible_mask=None, retain_grad=False, camera_pose=None):
     """
@@ -267,9 +267,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # is_enhancing = pc.render_enhancement
         
     if is_training:
-        xyz, reflectance, illumination, illumination_enhanced, opacity, scaling, rot, neural_opacity, mask, xyz_residual, color_residual, scaling_residual, rot_residual, opacity_residual, sg_stats = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
+        xyz, reflectance, illumination, illumination_enhanced, opacity, scaling, rot, neural_opacity, mask, xyz_residual, color_noise, color_artifact, scaling_residual, rot_residual, opacity_residual, sg_stats = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
     else:
-        xyz, reflectance, illumination, illumination_enhanced, opacity, scaling, rot, xyz_residual, color_residual, scaling_residual, rot_residual, opacity_residual, sg_stats = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
+        xyz, reflectance, illumination, illumination_enhanced, opacity, scaling, rot, xyz_residual, color_noise, color_artifact, scaling_residual, rot_residual, opacity_residual, sg_stats = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
     
     # print("ill_shape:", illumination.shape)
     # print("ref_shape:", reflectance.shape)
@@ -472,18 +472,29 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         # input_concated_residual = torch.cat([color_residual, torch.zeros(color_residual.shape[0], input_concated.shape[1]-color_residual.shape[1]-feat_downsampled_residual.shape[1]).cuda().detach(), feat_downsampled_residual.detach()], dim=1)
         # print("reflectance:", reflectance.mean(), "color_residual:", color_residual.mean())
        
-        rendered_residual,_ = rasterizer_residual(
+        rendered_noise,_ = rasterizer_residual(
             # means3D = xyz_residual,
             # means2D = screenspace_points_residual,
             means3D = means3D_residual,
             means2D = means2D_residual,
             shs = None,
-            colors_precomp = color_residual,
+            colors_precomp = color_noise,
             opacities = opacity_residual,
             scales = scaling_residual,
             rotations = gaussians_rot_residual_trans,
             # rotations = rot_residual,
             cov3D_precomp = None)
+        rendered_artifact,_ = rasterizer_residual(
+            means3D = means3D_residual,
+            means2D = means2D_residual,
+            shs = None,
+            colors_precomp = color_artifact,
+            opacities = opacity_residual,
+            scales = scaling_residual,
+            rotations = gaussians_rot_residual_trans,
+            # rotations = rot_residual,
+            cov3D_precomp = None)
+        rendered_residual = rendered_noise + rendered_artifact
         
         # rendered_feat_downsampled_residual,_ = rasterizer_residual(
         #     means3D = means3D_residual,
@@ -507,6 +518,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                     "render_illumination_enhanced":rendered_illumination_enhanced,
                     "render_depth":depth_map,
                     # "render_depth_variance":depth_variance_map,
+                    "render_noise": rendered_noise * 0.1,
+                    "render_artifact": rendered_artifact * 0.1,
                     "render_residual":rendered_residual * 0.1 ,
                     # "render_feat":rendered_feat,
                     # "render_feat_downsampled":rendered_feat_downsampled,
@@ -525,6 +538,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                     "render_reflectance":rendered_reflectance,
                     "render_illumination":rendered_illumination,
                     "render_illumination_enhanced":rendered_illumination_enhanced,
+                    "render_noise": rendered_noise * 0.1,
+                    "render_artifact": rendered_artifact * 0.1,
                     "render_residual":rendered_residual * 0.1 ,
                     "render_depth":depth_map,
                     # "render_depth_variance":depth_variance_map,
