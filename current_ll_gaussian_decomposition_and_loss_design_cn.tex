@@ -1,0 +1,486 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{ctex}
+
+\title{Current LL-Gaussian Decomposition and Loss Design}
+\author{LL-Gaussian Current Code Notes}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+本文档用于整理当前仓库实现中的 LL-Gaussian 分解策略与损失设计。它不是对论文最终方法的定稿表述，而是对当前代码状态的一份实现快照，重点描述当前训练目标、各分支职责以及若干关键调度与约束项。文中的内容以当前代码实现为准，尤其关注当前主路径中的 \textbf{B0 + reflectance detail + decoder refinement}、\textbf{SG illumination}、\textbf{dual transient residual} 与 \textbf{enhancement supervision} 四个部分。
+\end{abstract}
+
+\section{Overview}
+
+当前实现仍然遵循低光观测的分解思想，但相比最初版本，分解结构已经更细化。对于一张低光图像 $I$，当前代码可概括为
+\begin{equation}
+    I \approx R \odot L + E_{\text{used}},
+\end{equation}
+其中：
+\begin{itemize}[leftmargin=1.5em]
+    \item $R$ 表示反射率分支；
+    \item $L$ 表示当前视角下的低光照明分支；
+    \item $E_{\text{used}}$ 表示经调度与局部 mask 后真正参与重建的瞬态残差；
+    \item 增强图像由增强光照分支给出：
+    \begin{equation}
+        I^{\text{enh}} \approx R \odot L^{\text{enh}}.
+    \end{equation}
+\end{itemize}
+
+与早期版本相比，当前代码的核心变化包括：
+\begin{itemize}[leftmargin=1.5em]
+    \item 反射率不再是单层直接回归，而是由 anchor 级底色、offset 级 detail 与 view-independent decoder 共同构成；
+    \item 光照主路径默认为 SG（spherical Gaussian）方向照明，而不是直接标量回归；
+    \item residual 分支在当前最佳实验中采用 dual-transient 设计，即噪声型 residual 与结构型 artifact residual 分头建模；
+    \item enhancement 分支不仅约束亮度提升，还引入颜色统计、绿色偏色抑制，以及基于 refined pseudo target 的阶段性监督。
+\end{itemize}
+
+\section{Current Decomposition Strategy}
+
+\subsection{Anchor-Offset Representation}
+
+当前场景仍由 Gaussian anchors 及其 offset 表达。对于每个可见 anchor，网络在其局部 offsets 上预测反射率、光照、增强光照与 residual 相关量，再经 splatting 投影到图像空间。因此当前分解是 \emph{offset-wise decomposition}，而不是显式像素级分解。
+
+\subsection{Reflectance Design}
+
+当前反射率 $R$ 由三层结构共同构成。
+
+\paragraph{(1) Anchor-level base reflectance.}
+每个 anchor 持有一个三通道对数反射率参数
+\begin{equation}
+    B_i^0 \in \mathbb{R}^3,
+\end{equation}
+基础反射率为
+\begin{equation}
+    R_i^{\text{base}} = \exp(B_i^0).
+\end{equation}
+
+\paragraph{(2) Offset-level detail in log space.}
+为恢复局部纹理与边缘，当前代码为每个 offset 引入 detail：
+\begin{equation}
+    \Delta^R_{i,k} \in \mathbb{R}^3.
+\end{equation}
+detail 被限制在双曲正切有界区间，并以固定比例叠加到 log-reflectance：
+\begin{equation}
+    R_{i,k}^{\text{detail}}
+    =
+    \exp\left(B_i^0 + s_R \tanh(\Delta^R_{i,k})\right),
+\end{equation}
+其中当前代码中 $s_R = 1.1$。
+
+\paragraph{(3) View-independent decoder refinement.}
+在上述 detail 之后，当前实现再用一个仅依赖 anchor feature 与 offset geometry 的 decoder 做微调：
+\begin{equation}
+    D^R_{i,k} = f_{\theta_R}(\mathbf{f}_i, \mathbf{o}_{i,k}),
+\end{equation}
+最终反射率为
+\begin{equation}
+    R_{i,k}
+    =
+    \mathrm{clip}
+    \left(
+        R_{i,k}^{\text{detail}}
+        \odot
+        \left(1 + 0.15 \tanh(D^R_{i,k})\right),
+        10^{-3},
+        1
+    \right).
+\end{equation}
+
+当前设计意图是：
+\begin{itemize}[leftmargin=1.5em]
+    \item $B^0$ 负责稳定的低频材质底色；
+    \item offset detail 负责局部纹理与边缘；
+    \item decoder 只作为轻量补偿器，不希望它重新退化成自由的颜色生成器。
+\end{itemize}
+
+\subsection{Illumination Design}
+
+当前低光照明主路径默认使用 SG illumination。对每个 offset，网络预测若干个球面高斯 lobes：
+\begin{equation}
+    \left\{
+        (\bm{\mu}_{i,k,m}, \lambda_{i,k,m}, a_{i,k,m})
+    \right\}_{m=1}^{M},
+\end{equation}
+其中：
+\begin{itemize}[leftmargin=1.5em]
+    \item $\bm{\mu}_{i,k,m}$ 为单位方向；
+    \item $\lambda_{i,k,m}$ 为 sharpness；
+    \item $a_{i,k,m}$ 为 amplitude；
+    \item 当前每个 lobe 在实现中总共由 5 个值参数化，因此对应代码中 SG MLP 输出维度为 $5M$。
+\end{itemize}
+
+给定观察方向 $\bm{v}_i$ 后，当前照明值由 SG 求和得到：
+\begin{equation}
+    L_{i,k}
+    =
+    \frac{1}{M}
+    \sum_{m=1}^{M}
+    a_{i,k,m}
+    \exp\left(
+        \lambda_{i,k,m}
+        \left(\bm{\mu}_{i,k,m}^{\top}\bm{v}_i - 1\right)
+    \right).
+\end{equation}
+
+代码中仍保留 legacy 直接 illumination MLP 兼容路径，但当前主实现默认使用 SG，并在非 legacy 模式下要求 SG illumination 可用。
+
+\subsection{Enhanced Illumination Design}
+
+增强分支并不直接重定义反射率，而是学习一个增强光照：
+\begin{equation}
+    L^{\text{enh}}_{i,k}
+    =
+    g_{\theta_E}(\mathbf{f}_i, \phi_{i,k}),
+\end{equation}
+其中 $\phi_{i,k}$ 表示来自当前 illumination branch 的 offset 级 illumination feature。当前实现中 enhancement net 的输入为
+\begin{equation}
+    [\mathrm{stopgrad}(\mathbf{f}_i), \mathrm{stopgrad}(\phi_{i,k})],
+\end{equation}
+输出经 sigmoid 后形成三通道增强光照，并构成
+\begin{equation}
+    I^{\text{enh}} = R \odot L^{\text{enh}}.
+\end{equation}
+
+这意味着当前增强设计本质上仍是 ``同一反射率，不同光照'' 的重光照框架。
+
+\subsection{Dual-Transient Residual Design}
+
+当前最佳实验命令使用 \verb|--use_dual_transient|，因此 residual 分支被拆成两头：
+\begin{equation}
+    E_{\text{used}} = w_{\text{res}} \left(M_n \odot E_n + M_a \odot E_a\right),
+\end{equation}
+其中：
+\begin{itemize}[leftmargin=1.5em]
+    \item $E_n$ 是 noise transient，偏向随机噪声；
+    \item $E_a$ 是 artifact transient，偏向结构化伪影与局部色偏补偿；
+    \item $M_n$ 与 $M_a$ 为各自的局部 mask；
+    \item $w_{\text{res}}$ 为 residual ramp weight。
+\end{itemize}
+
+\paragraph{Noise head.}
+noise head 当前使用 \verb|Tanh| 输出，设计上希望其保持零中心并允许正负扰动。
+
+\paragraph{Artifact head.}
+在 dual-transient 模式下，artifact head 也使用 \verb|Tanh| 输出，避免其退化成强正向全图补偿器；在非 dual 模式下，代码中仍保留基于 \verb|Sigmoid| 的单 residual 兼容路径。
+
+\paragraph{Residual masks.}
+当前 dual-transient mask 由重建误差、暗区偏好与色度偏好联合构造。
+
+对 noise 分支，定义
+\begin{equation}
+    S_n = \|I - I^{\text{base}}\|_1 \cdot (1 - V(I)),
+\end{equation}
+其中 $V(I)$ 为输入亮度。随后对 $S_n$ 做 top-k 选择，得到更偏暗区的 noise mask $M_n$。
+
+对 artifact 分支，当前分数写为
+\begin{equation}
+    S_a
+    =
+    \|I - I^{\text{base}}\|_1 \cdot (0.5 + 0.5 B(I))
+    + 0.5 C(I, I^{\text{base}}),
+\end{equation}
+其中 $B(I)$ 为亮区权重，$C(\cdot)$ 表示基于输入与 base reconstruction 的 chroma cue。再对 $S_a$ 做 top-k，得到更稀疏的 artifact mask $M_a$。
+
+\section{Rendering Equations}
+
+综合当前实现，可将渲染主路径写为：
+\begin{align}
+    I^{\text{base}} &= R \odot L, \\
+    I^{\text{rec}}  &= R \odot L + w_{\text{res}} (M_n \odot E_n + M_a \odot E_a), \\
+    I^{\text{enh}}  &= R \odot L^{\text{enh}}.
+\end{align}
+
+其中 $w_{\text{res}}$ 在 residual 启用后按训练迭代线性 ramp 到 1，而在 residual 启用前，代码中直接令 residual contribution 为 0。
+
+\section{Loss Design}
+
+\subsection{Main Reconstruction Loss}
+
+当前主重建使用带亮度加权的 $L_1$ 与 SSIM 组合：
+\begin{equation}
+    \mathcal{L}_{\text{rec}}
+    =
+    (1-\lambda_{\text{ssim}})\mathcal{L}_{1+}(I^{\text{rec}}, I)
+    +
+    \lambda_{\text{ssim}}\mathcal{L}_{\text{ssim}}(I^{\text{rec}}, I),
+\end{equation}
+其中 $\mathcal{L}_{1+}$ 在代码中具体为
+\begin{equation}
+    \mathcal{L}_{1+}
+    =
+    \left|
+        \frac{I^{\text{rec}} - I}{\alpha I^{\text{rec}} + \phi}
+    \right|,
+\end{equation}
+且分母权重在反向传播中停止梯度，用于更强调暗部误差。
+
+同时当前基础重建目标还包含
+\begin{equation}
+    \mathcal{L}_{\text{base}}
+    =
+    \mathcal{L}_{\text{rec}}
+    +
+    \mathcal{L}_{\text{illu}}
+    +
+    \lambda_{\text{scale}}\mathcal{L}_{\text{scale}},
+\end{equation}
+其中 $\mathcal{L}_{\text{illu}}$ 对 illumination image 施加像素级约束，$\mathcal{L}_{\text{scale}}$ 约束 Gaussian scaling 的体积项。
+
+\subsection{Smoothness and Depth Prior}
+
+在 densification/update 阶段开始后，当前实现加入 illumination smoothness 与 depth prior：
+\begin{equation}
+    \mathcal{L}_{\text{geom}}
+    =
+    \lambda_{\text{smooth}}\mathcal{L}_{\text{smooth}}(L)
+    +
+    \lambda_{\text{depth}}\mathcal{L}_{\text{depth}}.
+\end{equation}
+
+\paragraph{Illumination smoothness.}
+当前 smoothness 先对输入灰度图做高斯低通，再用图像边缘对 illumination 梯度做边缘感知归一化，因此本质上是边缘感知 illumination smoothness。
+
+\paragraph{Depth prior.}
+当前 depth similarity 由渲染深度与外部 depth prior 间的一致性项构成，用于维持几何结构。
+
+\subsection{SG Regularization}
+
+当前 SG 分支通过 energy 与 sharpness 统计做正则：
+\begin{equation}
+    \mathcal{L}_{\text{sg}}
+    =
+    \lambda_{\text{sg-energy}}\mathcal{L}_{\text{sg-energy}}
+    +
+    \lambda_{\text{sg-smooth}}\mathcal{L}_{\text{sg-sharp}}.
+\end{equation}
+
+代码中的第二项实际上使用的是 SG $\lambda$ 统计量，对过尖锐或不稳定的方向照明进行约束。
+
+\subsection{Reflectance Regularization}
+
+当前反射率总正则可概括为
+\begin{align}
+    \mathcal{L}_{R}
+    ={}&
+    \lambda_{\text{cons}}
+    \left(
+        \mathcal{L}_{\text{cons}}
+        +
+        \mathcal{L}_{\text{smooth-R}}
+    \right)
+    +
+    \lambda_{\text{edge}}\mathcal{L}_{\text{edge}}
+    +
+    \lambda_{\text{edge-up}}\mathcal{L}_{\text{edge-up}}
+    \nonumber \\
+    &+
+    \lambda_{\text{contrast}}\mathcal{L}_{\text{contrast}}
+    +
+    \lambda_{\text{hf}}\mathcal{L}_{\text{hf}}
+    +
+    \lambda_{\text{highlight}}\mathcal{L}_{\text{highlight}}
+    +
+    \lambda_{\text{detail}}\mathcal{L}_{\text{detail}}
+    +
+    \lambda_{\text{decoder}}\mathcal{L}_{\text{decoder}}
+    +
+    \lambda_{\text{B0}}\mathcal{L}_{\text{B0-3D}}.
+\end{align}
+
+各项对应含义为：
+\begin{itemize}[leftmargin=1.5em]
+    \item $\mathcal{L}_{\text{cons}}$：抑制反射率吸收随机噪声；
+    \item $\mathcal{L}_{\text{smooth-R}}$：在 illumination 权重下做反射率平滑；
+    \item $\mathcal{L}_{\text{edge}}$：让 reflectance 结构边缘与图像结构边缘对齐；
+    \item $\mathcal{L}_{\text{edge-up}}$：只惩罚弱于目标结构边缘的区域；
+    \item $\mathcal{L}_{\text{contrast}}$：提升局部灰度对比；
+    \item $\mathcal{L}_{\text{hf}}$：基于 Laplacian 提升高频结构；
+    \item $\mathcal{L}_{\text{highlight}}$：惩罚 reflectance 中亮且高彩度的区域，把彩色高光推出 $R$；
+    \item $\mathcal{L}_{\text{detail}}$：约束 offset detail 幅度；
+    \item $\mathcal{L}_{\text{decoder}}$：约束 decoder refinement 幅度；
+    \item $\mathcal{L}_{\text{B0-3D}}$：对 3D 邻近 anchors 的 $B^0$ 做空间平滑。
+\end{itemize}
+
+\subsection{Dual-Transient Residual Regularization}
+
+在 dual-transient 模式下，当前 residual 项不是单一稀疏项，而是分成 noise 与 artifact 两头：
+\begin{align}
+    \mathcal{L}_{\text{res}}
+    ={}&
+    \lambda_n \mathcal{L}_{\text{noise-sparse}}
+    +
+    \lambda_a \mathcal{L}_{\text{artifact-sparse}}
+    +
+    \lambda_{\text{zero}} \mathcal{L}_{\text{noise-zero}}
+    \nonumber \\
+    &+
+    \lambda_{\text{dark}} \mathcal{L}_{\text{noise-dark}}
+    +
+    \lambda_{\text{hf-noise}} \mathcal{L}_{\text{noise-hf}}
+    +
+    \lambda_{\text{art-chroma}} \mathcal{L}_{\text{artifact-chroma}}
+    +
+    \lambda_{\text{scale-res}} \mathcal{L}_{\text{scale-res}}.
+\end{align}
+
+\paragraph{Noise terms.}
+\begin{itemize}[leftmargin=1.5em]
+    \item $\mathcal{L}_{\text{noise-sparse}}$：约束噪声分支幅度；
+    \item $\mathcal{L}_{\text{noise-zero}}$：推动噪声分支保持零均值；
+    \item $\mathcal{L}_{\text{noise-dark}}$：在亮区更强抑制噪声 residual；
+    \item $\mathcal{L}_{\text{noise-hf}}$：推动噪声 residual 更偏高频。
+\end{itemize}
+
+\paragraph{Artifact terms.}
+artifact 分支当前主要通过稀疏项和 chroma boost 项控制。后者形式上写成
+\begin{equation}
+    \mathcal{L}_{\text{artifact-chroma}} < 0,
+\end{equation}
+它在 bright reflectance 区域鼓励 artifact 分支承担少量彩色残差，从而把彩色亮斑和局部色偏从 reflectance 中迁移出去。
+
+\subsection{Enhanced Illumination Losses}
+
+增强分支的监督分为三层。
+
+\paragraph{(1) Enhancement degree and smoothness.}
+当前代码先要求增强 illumination 达到更高的亮度水平，同时保持空间平滑：
+\begin{equation}
+    \mathcal{L}_{\text{enh-base}}
+    =
+    \lambda_{\text{deg-local}}\mathcal{L}_{\text{deg-local}}
+    +
+    \lambda_{\text{deg-global}}\mathcal{L}_{\text{deg-global}}
+    +
+    \lambda_{\text{enh-smooth}}\mathcal{L}_{\text{enh-smooth}}.
+\end{equation}
+
+\paragraph{(2) Weak color-statistic alignment.}
+当前代码对增强结果
+\begin{equation}
+    I^{\text{enh}} = R \odot L^{\text{enh}}
+\end{equation}
+与 refined pseudo target $\hat{I}$ 之间施加颜色统计约束：
+\begin{align}
+    \mathcal{L}_{\text{color-mean}}
+    &= \|\mu(I^{\text{enh}}) - \mu(\hat{I})\|_1, \\
+    \mathcal{L}_{\text{color-std}}
+    &= \|\sigma(I^{\text{enh}}) - \sigma(\hat{I})\|_1.
+\end{align}
+此外保留一个不对称 green bias penalty：
+\begin{equation}
+    \mathcal{L}_{\text{green}}
+    =
+    \mathbb{E}\left[
+        \max\left(
+            0,\,
+            I^{\text{enh}}_G
+            -
+            \frac{I^{\text{enh}}_R + I^{\text{enh}}_B}{2}
+            -
+            \tau
+        \right)
+    \right].
+\end{equation}
+
+\paragraph{(3) Refined-target guidance after a scheduled iteration.}
+在 \verb|enhancement_diff_start_iter| 之后，当前代码加入 pseudo-target guidance：
+\begin{align}
+    \mathcal{L}_{\text{diff-illu}}
+    &=
+    \left\|
+        L^{\text{enh}} \odot \mathrm{stopgrad}(R) - \hat{I}
+    \right\|_1, \\
+    \mathcal{L}_{\text{diff-refl}}
+    &=
+    \left\|
+        \mathrm{stopgrad}(L^{\text{enh}}) \odot R - \hat{I}
+    \right\|_1.
+\end{align}
+总的增强 guidance 写为
+\begin{equation}
+    \mathcal{L}_{\text{diff}}
+    =
+    w_{\text{guidance}}(t)
+    \left(
+        \mathcal{L}_{\text{diff-illu}}
+        +
+        \lambda_{\text{diff-R}}\mathcal{L}_{\text{diff-refl}}
+    \right),
+\end{equation}
+其中当前调度为
+\begin{equation}
+    w_{\text{guidance}}(t) = 1 - 0.7 \cdot \mathrm{progress}(t),
+\end{equation}
+也就是说它在后期不会完全消失，而是从 1 逐渐衰减到约 0.3。
+
+\subsection{Warmup vs Normal Stage}
+
+当前实现显式区分 warmup 与 normal train：
+\begin{itemize}[leftmargin=1.5em]
+    \item warmup 仍使用主重建、illumination、depth、reflectance 相关正则，但不启用 enhancement guidance 与 residual 分支；
+    \item normal train 在 update 阶段后加入 SG regularization、enhancement supervision，以及 residual scheduling。
+\end{itemize}
+
+\subsection{Total Objective}
+
+因此，当前代码的总目标可以概括为
+\begin{equation}
+    \mathcal{L}_{\text{total}}
+    =
+    \mathcal{L}_{\text{base}}
+    +
+    \mathcal{L}_{\text{geom}}
+    +
+    \mathcal{L}_{\text{sg}}
+    +
+    \mathcal{L}_{R}
+    +
+    \mathcal{L}_{\text{res}}
+    +
+    \mathcal{L}_{\text{enh-base}}
+    +
+    \mathcal{L}_{\text{diff}}
+    +
+    \lambda_{\text{color-mean}}\mathcal{L}_{\text{color-mean}}
+    +
+    \lambda_{\text{color-std}}\mathcal{L}_{\text{color-std}}
+    +
+    \lambda_{\text{green}}\mathcal{L}_{\text{green}}.
+\end{equation}
+
+\section{Current Practical Interpretation}
+
+从当前代码实现出发，可以把各分支的职责理解为：
+\begin{itemize}[leftmargin=1.5em]
+    \item $R$ 负责稳定材质颜色、结构边缘与局部细节；
+    \item $L$ 负责当前低光条件下的视角相关照明变化；
+    \item $L^{\text{enh}}$ 负责把场景重光照到更自然、可见的增强状态；
+    \item $E_n$ 负责高频、零中心、偏暗区的噪声吸收；
+    \item $E_a$ 负责局部结构化伪影、色偏与高亮异常的补偿；
+    \item residual 仍然被设计成局部误差吸收器，而不是主图像生成分支。
+\end{itemize}
+
+从这一点看，当前 dual-transient 实现并不是对 Retinex 分解原则的替代，而是在原有 $R \odot L$ 框架之上，把 residual 分支进一步结构化，从而提升解释性与局部拟合稳定性。
+
+\section{Open Directions}
+
+基于当前代码状态，后续仍有若干自然改进方向：
+\begin{itemize}[leftmargin=1.5em]
+    \item 进一步稳定 dual-transient 的 artifact 分支，使其在 PSNR 与 LPIPS 之间取得更稳的平衡；
+    \item 降低 enhancement pseudo target 对训练的依赖，让增强分支具有更强的自监督或物理可解释性；
+    \item 为增强结果加入更直接的结构监督，而不只依赖颜色统计与 diffusion-refined target；
+    \item 继续厘清 reflectance detail、decoder refinement 与 artifact residual 三者之间的边界，避免功能重叠。
+\end{itemize}
+
+\end{document}

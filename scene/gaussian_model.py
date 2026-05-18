@@ -229,11 +229,12 @@ class GaussianModel:
                 nn.Linear(feat_dim, 3*self.n_offsets_residual),
                 nn.Tanh()
             ).cuda()
+            artifact_activation = nn.Tanh() if self.use_dual_transient else nn.Sigmoid()
             self.artifact_net = nn.Sequential(
                 nn.Linear(feat_dim+3+self.residual_dist_dim+self.appearance_residual_dim, feat_dim),
                 nn.ReLU(True),
                 nn.Linear(feat_dim, 3*self.n_offsets_residual),
-                nn.Tanh()
+                artifact_activation
             ).cuda()
             self.residual_net = self.artifact_net
 

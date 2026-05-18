@@ -81,7 +81,7 @@ class ModelParams(ParamGroup):
         self.add_illumination_dist = False
         self.add_residual_dist = False
         self.use_residual = False
-        self.use_dual_transient = True
+        self.use_dual_transient = False
         self.use_3D_filter = False
         self.use_sg_illumination = True
         self.illumination_mode = "sg"
@@ -231,7 +231,7 @@ def _backfill_model_compatibility(merged_dict):
     defaults = {
         "use_sg_illumination": True,
         "illumination_mode": "sg",
-        "use_dual_transient": True,
+        "use_dual_transient": False,
         "sg_lobes": 4,
         "sg_lambda_min": 1.0,
         "sg_energy_reg": 1e-4,

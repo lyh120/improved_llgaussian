@@ -150,12 +150,18 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
             residual_input = torch.cat([cat_local_view_residual, appearance_residual], dim=1)
         else:
             residual_input = torch.cat([cat_local_view_wodist_residual, appearance_residual], dim=1)
-        color_noise = pc.get_noise_net(residual_input).reshape([anchor.shape[0]*pc.n_offsets_residual, 3])
         color_artifact = pc.get_artifact_net(residual_input).reshape([anchor.shape[0]*pc.n_offsets_residual, 3])
+        if pc.use_dual_transient:
+            color_noise = pc.get_noise_net(residual_input).reshape([anchor.shape[0]*pc.n_offsets_residual, 3])
+        else:
+            color_noise = torch.zeros_like(color_artifact)
     elif pc.use_residual:
         residual_input = cat_local_view_residual if pc.add_residual_dist else cat_local_view_wodist_residual
-        color_noise = pc.get_noise_net(residual_input).reshape([anchor.shape[0]*pc.n_offsets_residual, 3])
         color_artifact = pc.get_artifact_net(residual_input).reshape([anchor.shape[0]*pc.n_offsets_residual, 3])
+        if pc.use_dual_transient:
+            color_noise = pc.get_noise_net(residual_input).reshape([anchor.shape[0]*pc.n_offsets_residual, 3])
+        else:
+            color_noise = torch.zeros_like(color_artifact)
     if pc.legacy_compatibility_mode:
         cat_local_view_woview = torch.cat([feat, ob_dist], dim=1) # [N, c+1]
         cat_local_view_woview_wodist = torch.cat([feat], dim=1) # [N, c]

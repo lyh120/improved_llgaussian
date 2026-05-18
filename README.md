@@ -135,6 +135,76 @@ Step 3: Start training
 bash scripts/single_train.sh
 ```
 
+### Reproducible Best Setting (LLRS-sRGB/chair, 8k)
+
+The following command is the current best-performing setting in this repo for
+`LLRS-sRGB/chair` under the dual-transient pipeline:
+
+```bash
+python train.py --eval \
+  -s /home/liuyuhao/ll_further/LL-Gaussian/dataset/LLRS-sRGB/chair \
+  -m outputs/chair_sg_dualtransient_v8 \
+  --gpu 1 \
+  --use_sg_illumination --illumination_mode sg \
+  --use_3D_filter --use_residual --use_wandb --warmup \
+  --use_dual_transient \
+  --iterations 8000 \
+  --save_iterations 8000 \
+  --test_iterations 5000 8000 \
+  --position_lr_max_steps 8000 \
+  --offset_lr_max_steps 8000 \
+  --update_from 1500 \
+  --update_until 4500 \
+  --start_stat 500 \
+  --mlp_opacity_lr_max_steps 8000 \
+  --mlp_cov_lr_max_steps 8000 \
+  --mlp_color_lr_max_steps 8000 \
+  --mlp_color_lr_init 0.008 \
+  --mlp_color_lr_final 0.00025 \
+  --offset_lr_init 0.001 \
+  --offset_lr_final 0.00001 \
+  --feat_dim 32 \
+  --reflectance_consistency_reg 2e-5 \
+  --reflectance_smooth_reg 0.0 \
+  --reflectance_edge_reg 2e-4 \
+  --reflectance_edge_uplift_reg 3e-3 \
+  --reflectance_contrast_reg 2e-3 \
+  --reflectance_highfreq_reg 3e-3 \
+  --highlight_reflectance_reg 1e-3 \
+  --residual_chroma_reg 5e-4 \
+  --reflectance_detail_reg 1e-6 \
+  --reflectance_decoder_reg 2e-5 \
+  --reflectance_offset_lr 0.008 \
+  --reflectance_decoder_lr 0.002 \
+  --sg_smooth_reg 5e-5 \
+  --b0_spatial_smooth_reg 0.0 \
+  --residual_start_iter 3000 \
+  --residual_ramp_iters 2500 \
+  --residual_higherror_percentile 0.9 \
+  --residual_highlight_percentile 0.92 \
+  --enhancement_reflectance_reg 0.06 \
+  --enhancement_degree_reg 0.2 \
+  --enhancement_degree_global_reg 0.05 \
+  --enhancement_smooth_reg 4e-4 \
+  --enhancement_diff_start_iter 2350 \
+  --enhancement_color_reg 0.06 \
+  --enhancement_color_std_reg 0.02 \
+  --enhancement_green_bias_reg 0.06 \
+  --noise_residual_reg 1.0 \
+  --artifact_residual_reg 0.35 \
+  --noise_zero_mean_reg 0.03 \
+  --noise_highfreq_reg 0.03 \
+  --noise_dark_weight_reg 0.03 \
+  --artifact_highlight_reg 0.0
+```
+
+Observed metrics (run date: 2026-05-18):
+
+- Train lowlight: `PSNR=41.3628`, `SSIM=0.9324`, `LPIPS=0.3133`
+- Train enhanced_gt: `PSNR=17.8513`, `SSIM=0.2632`, `LPIPS=0.6687`
+- Test lowlight: `PSNR=40.4566`, `SSIM=0.9256`, `LPIPS=0.3211`
+- Test enhanced_gt: `PSNR=17.8936`, `SSIM=0.2619`, `LPIPS=0.6757`
+
 
 ## ⚙️ Inference Arguments
 | Argument            | Description                             |
