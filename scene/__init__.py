@@ -48,6 +48,7 @@ class Scene:
         self.loaded_iter = None
         self.gaussians = gaussians
         self.depth_piror_model = depth_piror_model
+        self.depth_piror_raw_dict = {}
 
         if load_iteration:
             if load_iteration == -1:
@@ -155,6 +156,7 @@ class Scene:
                 depth_piror = depth_piror.unsqueeze(0)
             depth_piror = depth_piror.to(device)
             idx = camera.uid
+            self.depth_piror_raw_dict[idx] = depth_piror.detach().clone()
             depth_piror_dict[idx] = minmax_normalize(depth_piror)
         return depth_piror_dict
     

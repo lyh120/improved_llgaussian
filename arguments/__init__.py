@@ -91,6 +91,11 @@ class ModelParams(ParamGroup):
         self.sg_smooth_reg = 5e-5
         self.reflectance_consistency_reg = 2e-5
         self.reflectance_smooth_reg = 0.0
+        self.illum_edge_source = "gray"
+        self.illum_edge_fusion_alpha = 0.3
+        self.illum_edge_dark_threshold = 0.25
+        self.illum_edge_eps = 1e-6
+        self.illum_edge_w_max = -1.0
         self.reflectance_edge_reg = 2e-4
         self.reflectance_edge_uplift_reg = 3e-3
         self.reflectance_contrast_reg = 2e-3
@@ -238,6 +243,11 @@ def _backfill_model_compatibility(merged_dict):
         "sg_smooth_reg": 5e-5,
         "reflectance_consistency_reg": 2e-5,
         "reflectance_smooth_reg": 0.0,
+        "illum_edge_source": "gray",
+        "illum_edge_fusion_alpha": 0.3,
+        "illum_edge_dark_threshold": 0.25,
+        "illum_edge_eps": 1e-6,
+        "illum_edge_w_max": -1.0,
         "reflectance_edge_reg": 2e-4,
         "reflectance_edge_uplift_reg": 3e-3,
         "reflectance_contrast_reg": 2e-3,

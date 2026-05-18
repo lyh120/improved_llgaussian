@@ -126,6 +126,178 @@ def L_Smooth(illumination_image, image, kernel_size=9):
 
     return torch.sqrt(grad_image).mean()
 
+
+def _normalize_edge_map(edge_map, method="mean"):
+    if method == "median":
+        scale = edge_map.median().detach().clamp_min(1e-6)
+    else:
+        scale = edge_map.mean().detach().clamp_min(1e-6)
+    return edge_map / scale
+
+
+def _robust_normalize_depth(depth_map, lower_q=0.05, upper_q=0.95):
+    depth_map = depth_map.detach().float()
+    flat = depth_map.flatten()
+    if flat.numel() == 0:
+        return depth_map
+
+    lower = torch.quantile(flat, lower_q)
+    upper = torch.quantile(flat, upper_q)
+    if not torch.isfinite(lower) or not torch.isfinite(upper) or (upper - lower).abs() < 1e-6:
+        median = flat.median()
+        mad = torch.median(torch.abs(flat - median)).clamp_min(1e-6)
+        return torch.sigmoid((depth_map - median) / mad)
+    return ((depth_map - lower) / (upper - lower + 1e-6)).clamp(0.0, 1.0)
+
+
+def _align_single_channel_map(source_map, reference_map):
+    if source_map is None:
+        return None
+    source_map = source_map.detach().float()
+    if source_map.ndim == 2:
+        source_map = source_map.unsqueeze(0)
+    if source_map.ndim != 3:
+        raise ValueError(f"Expected [1,H,W] or [H,W], got {tuple(source_map.shape)}")
+
+    if source_map.shape[-2:] != reference_map.shape[-2:]:
+        source_map = F.interpolate(
+            source_map.unsqueeze(0),
+            size=reference_map.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+    return source_map.to(device=reference_map.device, dtype=reference_map.dtype)
+
+
+def _compute_lowpass_edges(single_channel_map, kernel_size):
+    single_channel_map = single_channel_map.unsqueeze(0)
+    channel = single_channel_map.size(-3)
+    window = create_window(kernel_size, channel)
+
+    if single_channel_map.is_cuda:
+        window = window.cuda(single_channel_map.get_device())
+    window = window.type_as(single_channel_map)
+
+    blurred = F.conv2d(single_channel_map, window, padding=kernel_size // 2, groups=channel)
+    edge_x = torch.abs(blurred[:, :, :-1, :-1] - blurred[:, :, 1:, :-1])
+    edge_y = torch.abs(blurred[:, :, :-1, :-1] - blurred[:, :, :-1, 1:])
+    return edge_x.squeeze(0), edge_y.squeeze(0)
+
+
+def L_Smooth(
+    illumination_image,
+    image,
+    kernel_size=9,
+    depth_prior=None,
+    edge_source="gray",
+    fusion_alpha=0.3,
+    dark_threshold=0.25,
+    eps=1e-6,
+    w_max=None,
+    return_debug=False,
+):
+    image = image.detach()
+    gray_image = 0.299 * image[0, :, :] + 0.587 * image[1, :, :] + 0.114 * image[2, :, :]
+    gray_image = gray_image.unsqueeze(0)
+    gray_edge_x, gray_edge_y = _compute_lowpass_edges(gray_image, kernel_size)
+    gray_edge_x_norm = _normalize_edge_map(gray_edge_x)
+    gray_edge_y_norm = _normalize_edge_map(gray_edge_y)
+
+    depth_available = False
+    depth_map = None
+    depth_edge_x = None
+    depth_edge_y = None
+    depth_edge_x_norm = None
+    depth_edge_y_norm = None
+    if depth_prior is not None:
+        try:
+            depth_map = _align_single_channel_map(depth_prior, image)
+            depth_map = _robust_normalize_depth(depth_map)
+            depth_edge_x, depth_edge_y = _compute_lowpass_edges(depth_map, kernel_size)
+            depth_edge_x_norm = _normalize_edge_map(depth_edge_x)
+            depth_edge_y_norm = _normalize_edge_map(depth_edge_y)
+            depth_available = True
+        except Exception:
+            depth_available = False
+
+    effective_source = edge_source
+    fusion_edge_x = gray_edge_x_norm
+    fusion_edge_y = gray_edge_y_norm
+    if edge_source == "gray":
+        edge_x = gray_edge_x
+        edge_y = gray_edge_y
+    elif edge_source == "depth":
+        if depth_available:
+            edge_x = depth_edge_x
+            edge_y = depth_edge_y
+            fusion_edge_x = depth_edge_x_norm
+            fusion_edge_y = depth_edge_y_norm
+        else:
+            effective_source = "gray"
+            edge_x = gray_edge_x
+            edge_y = gray_edge_y
+    elif edge_source == "fusion":
+        if depth_available:
+            alpha = float(fusion_alpha)
+            fusion_edge_x = alpha * gray_edge_x_norm + (1.0 - alpha) * depth_edge_x_norm
+            fusion_edge_y = alpha * gray_edge_y_norm + (1.0 - alpha) * depth_edge_y_norm
+            edge_x = fusion_edge_x
+            edge_y = fusion_edge_y
+        else:
+            effective_source = "gray"
+            edge_x = gray_edge_x
+            edge_y = gray_edge_y
+    elif edge_source == "fusion_dark":
+        if depth_available:
+            alpha = float(fusion_alpha)
+            fusion_edge_x = alpha * gray_edge_x_norm + (1.0 - alpha) * depth_edge_x_norm
+            fusion_edge_y = alpha * gray_edge_y_norm + (1.0 - alpha) * depth_edge_y_norm
+            gray_base = gray_image[:, :-1, :-1]
+            dark_gate = torch.clamp((float(dark_threshold) - gray_base) / max(float(dark_threshold), 1e-6), 0.0, 1.0)
+            edge_x = (1.0 - dark_gate) * gray_edge_x_norm + dark_gate * fusion_edge_x
+            edge_y = (1.0 - dark_gate) * gray_edge_y_norm + dark_gate * fusion_edge_y
+        else:
+            effective_source = "gray"
+            edge_x = gray_edge_x
+            edge_y = gray_edge_y
+    else:
+        effective_source = "gray"
+        edge_x = gray_edge_x
+        edge_y = gray_edge_y
+
+    w_x = 1.0 / (edge_x + eps)
+    w_y = 1.0 / (edge_y + eps)
+    if w_max is not None and w_max > 0:
+        w_x = torch.clamp(w_x, max=w_max)
+        w_y = torch.clamp(w_y, max=w_max)
+
+    grad_x = torch.abs(illumination_image[:, :-1, :-1] - illumination_image[:, 1:, :-1]) * w_x
+    grad_y = torch.abs(illumination_image[:, :-1, :-1] - illumination_image[:, :-1, 1:]) * w_y
+    grad_image = grad_x ** 2 + grad_y ** 2 + 1e-10
+    loss = torch.sqrt(grad_image).mean()
+
+    if not return_debug:
+        return loss
+
+    debug = {
+        "requested_source": edge_source,
+        "effective_source": effective_source,
+        "depth_available": depth_available,
+        "gray_edge_x": gray_edge_x.detach(),
+        "gray_edge_y": gray_edge_y.detach(),
+        "depth_edge_x": None if depth_edge_x is None else depth_edge_x.detach(),
+        "depth_edge_y": None if depth_edge_y is None else depth_edge_y.detach(),
+        "fusion_edge_x": fusion_edge_x.detach(),
+        "fusion_edge_y": fusion_edge_y.detach(),
+        "edge_x": edge_x.detach(),
+        "edge_y": edge_y.detach(),
+        "w_x": w_x.detach(),
+        "w_y": w_y.detach(),
+        "depth_norm": None if depth_map is None else depth_map.detach(),
+        "dark_gate": None if edge_source != "fusion_dark" or not depth_available else dark_gate.detach(),
+    }
+    return loss, debug
+
 # def L_Smooth(illumination_image, image):
 #     image = image.detach().unsqueeze(0)
 #     illumination_image = illumination_image.unsqueeze(0)

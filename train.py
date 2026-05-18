@@ -229,6 +229,12 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     elif mode == "train" or mode == "warmup":
         scene = Scene(dataset, gaussians, depth_piror_model, ply_path=ply_path, shuffle=False)
     depth_piror_dict = scene.depth_piror_dict
+    depth_piror_raw_dict = getattr(scene, "depth_piror_raw_dict", {})
+    print(
+        f"[INFO] Illumination edge source: {dataset.illum_edge_source} "
+        f"(fusion_alpha={dataset.illum_edge_fusion_alpha}, dark_threshold={dataset.illum_edge_dark_threshold}, "
+        f"eps={dataset.illum_edge_eps}, w_max={dataset.illum_edge_w_max})"
+    )
     gaussians.training_setup(opt)
 
     train_cams_init = scene.getTrainCameras().copy()
@@ -347,6 +353,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
           
     timing_stats = {}
     total_start_time = time.time()
+    warned_missing_illum_depth = False
     for iteration in range(first_iter, opt.iterations + 1):        
         # network gui not available in scaffold-gs yet
         # if network_gui.conn == None:
@@ -392,6 +399,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
         gt_image = viewpoint_cam.original_image.cuda()
         depth_piror_norm = depth_piror_dict[viewpoint_cam.uid]
+        depth_piror_raw = depth_piror_raw_dict.get(viewpoint_cam.uid)
         base_image = torch.clamp(reflectance_image * illumination_image, 0.0, 1.0)
 
         residual_active = dataset.use_residual and mode != "warmup" and iteration >= opt.residual_start_iter
@@ -446,7 +454,30 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
         Ll1_value = l1_plus_loss(image_tmp, gt_image, phi=0.5/255)
         Ll1 = torch.abs(Ll1_value).mean()
-        L_smooth =  L_Smooth(illumination_image, gt_image, kernel_size=9) * 5e-4
+        illum_edge_w_max = dataset.illum_edge_w_max if dataset.illum_edge_w_max > 0 else None
+        L_smooth_raw, illum_smooth_debug = L_Smooth(
+            illumination_image,
+            gt_image,
+            kernel_size=9,
+            depth_prior=depth_piror_raw,
+            edge_source=dataset.illum_edge_source,
+            fusion_alpha=dataset.illum_edge_fusion_alpha,
+            dark_threshold=dataset.illum_edge_dark_threshold,
+            eps=dataset.illum_edge_eps,
+            w_max=illum_edge_w_max,
+            return_debug=True,
+        )
+        if (
+            dataset.illum_edge_source in ("depth", "fusion", "fusion_dark")
+            and not illum_smooth_debug["depth_available"]
+            and not warned_missing_illum_depth
+        ):
+            print(
+                f"[WARN] depth prior missing or invalid for illumination smoothness under "
+                f"source={dataset.illum_edge_source}; falling back to gray edges."
+            )
+            warned_missing_illum_depth = True
+        L_smooth = L_smooth_raw * 5e-4
         L_illu = L_Illu(gt_image, illumination_image) 
         L_reflectance_smooth = L_Reflectance_Smooth(reflectance_image, illumination_image) * dataset.reflectance_smooth_reg
         L_depth_similarity = (L_Depth_similarity(1 - minmax_normalize(depth_image).squeeze(0), depth_piror_norm.squeeze(0), 128, 0.5) ) * 0.15
@@ -486,6 +517,15 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         L_enhanced_color = torch.tensor(0.0, device=gt_image.device)
         L_enhanced_color_std = torch.tensor(0.0, device=gt_image.device)
         L_enhanced_green_bias = torch.tensor(0.0, device=gt_image.device)
+        illum_edge_source_map = {"gray": 0.0, "depth": 1.0, "fusion": 2.0, "fusion_dark": 3.0}
+        illum_edge_source_id = illum_edge_source_map.get(illum_smooth_debug["effective_source"], -1.0)
+        illum_edge_depth_available = float(illum_smooth_debug["depth_available"])
+        illum_edge_fallback_used = float(illum_smooth_debug["effective_source"] != dataset.illum_edge_source)
+        illum_edge_x = illum_smooth_debug["edge_x"]
+        illum_edge_y = illum_smooth_debug["edge_y"]
+        illum_w_x = illum_smooth_debug["w_x"]
+        illum_w_y = illum_smooth_debug["w_y"]
+        illum_dark_gate = illum_smooth_debug.get("dark_gate")
 
         if torch.isnan(scaling_reg) or torch.isinf(scaling_reg):
             print("Warning: scaling_reg is nan or inf")
@@ -534,7 +574,17 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     ).mean() * dataset.enhancement_degree_global_reg
                 )
                 L_smooth_enhancement = (
-                    L_Smooth(illumination_enhanced_image / enhance_ratio, gt_image, kernel_size=9)
+                    L_Smooth(
+                        illumination_enhanced_image / enhance_ratio,
+                        gt_image,
+                        kernel_size=9,
+                        depth_prior=depth_piror_raw,
+                        edge_source=dataset.illum_edge_source,
+                        fusion_alpha=dataset.illum_edge_fusion_alpha,
+                        dark_threshold=dataset.illum_edge_dark_threshold,
+                        eps=dataset.illum_edge_eps,
+                        w_max=illum_edge_w_max,
+                    )
                     * dataset.enhancement_smooth_reg
                 )
                 refined_target = refined_image_dict[viewpoint_cam.uid].cuda()
@@ -611,6 +661,22 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             if mode=="warmup" or not dataset.use_residual:
                 wandb.log({'loss':loss, 'iteration':iteration,
                            'illumination_mean': illumination_image.mean(),
+                           'illum_edge_source_id': illum_edge_source_id,
+                           'illum_edge_depth_available': illum_edge_depth_available,
+                           'illum_edge_fallback_used': illum_edge_fallback_used,
+                           'illum_edge_x_min': illum_edge_x.min(),
+                           'illum_edge_x_mean': illum_edge_x.mean(),
+                           'illum_edge_x_max': illum_edge_x.max(),
+                           'illum_edge_y_min': illum_edge_y.min(),
+                           'illum_edge_y_mean': illum_edge_y.mean(),
+                           'illum_edge_y_max': illum_edge_y.max(),
+                           'illum_w_x_min': illum_w_x.min(),
+                           'illum_w_x_mean': illum_w_x.mean(),
+                           'illum_w_x_max': illum_w_x.max(),
+                           'illum_w_y_min': illum_w_y.min(),
+                           'illum_w_y_mean': illum_w_y.mean(),
+                           'illum_w_y_max': illum_w_y.max(),
+                           'illum_dark_gate_mean': torch.tensor(0.0, device=gt_image.device) if illum_dark_gate is None else illum_dark_gate.mean(),
                            'sg_energy': L_sg_energy,
                            'sg_lambda_mean': L_sg_sharpness,
                            'reflectance_consistency': L_reflectance_consistency,
@@ -627,6 +693,22 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 residual_chroma_mean = torch.abs(residual_image_for_loss - residual_image_for_loss.mean(dim=0, keepdim=True)).mean()
                 wandb.log({'loss':loss, 'iteration':iteration,
                            'illumination_mean': illumination_image.mean(),
+                           'illum_edge_source_id': illum_edge_source_id,
+                           'illum_edge_depth_available': illum_edge_depth_available,
+                           'illum_edge_fallback_used': illum_edge_fallback_used,
+                           'illum_edge_x_min': illum_edge_x.min(),
+                           'illum_edge_x_mean': illum_edge_x.mean(),
+                           'illum_edge_x_max': illum_edge_x.max(),
+                           'illum_edge_y_min': illum_edge_y.min(),
+                           'illum_edge_y_mean': illum_edge_y.mean(),
+                           'illum_edge_y_max': illum_edge_y.max(),
+                           'illum_w_x_min': illum_w_x.min(),
+                           'illum_w_x_mean': illum_w_x.mean(),
+                           'illum_w_x_max': illum_w_x.max(),
+                           'illum_w_y_min': illum_w_y.min(),
+                           'illum_w_y_mean': illum_w_y.mean(),
+                           'illum_w_y_max': illum_w_y.max(),
+                           'illum_dark_gate_mean': torch.tensor(0.0, device=gt_image.device) if illum_dark_gate is None else illum_dark_gate.mean(),
                            'sg_energy': L_sg_energy,
                            'sg_lambda_mean': L_sg_sharpness,
                            'reflectance_consistency': L_reflectance_consistency,
@@ -691,6 +773,22 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 else:
                     artifact_image_vis = torch.zeros_like(artifact_abs)
                 enhanced_image_pil = torchvision.transforms.ToPILImage()(enhanced_image)
+                gray_edge_x_vis = minmax_normalize(illum_smooth_debug["gray_edge_x"])
+                gray_edge_y_vis = minmax_normalize(illum_smooth_debug["gray_edge_y"])
+                fusion_edge_x_vis = minmax_normalize(illum_smooth_debug["fusion_edge_x"])
+                fusion_edge_y_vis = minmax_normalize(illum_smooth_debug["fusion_edge_y"])
+                illum_edge_x_vis = minmax_normalize(illum_smooth_debug["edge_x"])
+                illum_edge_y_vis = minmax_normalize(illum_smooth_debug["edge_y"])
+                illum_w_x_vis = minmax_normalize(illum_smooth_debug["w_x"])
+                illum_w_y_vis = minmax_normalize(illum_smooth_debug["w_y"])
+                illum_dark_gate_vis = None
+                depth_edge_x_vis = None
+                depth_edge_y_vis = None
+                if illum_smooth_debug["depth_edge_x"] is not None:
+                    depth_edge_x_vis = minmax_normalize(illum_smooth_debug["depth_edge_x"])
+                    depth_edge_y_vis = minmax_normalize(illum_smooth_debug["depth_edge_y"])
+                if illum_dark_gate is not None:
+                    illum_dark_gate_vis = minmax_normalize(illum_dark_gate)
                 
 
                 wandb.log({'loss':loss, 'iteration':iteration,
@@ -730,6 +828,14 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         'enhancement_illumination_guidance': L_diff_illumination,
                         'enhancement_reflectance_guidance': L_diff_reflectance,
                         'illumination':wandb.Image(torchvision.transforms.ToPILImage()(illumination_image)),
+                        'illum_edge_gray_x':wandb.Image(torchvision.transforms.ToPILImage()(gray_edge_x_vis)),
+                        'illum_edge_gray_y':wandb.Image(torchvision.transforms.ToPILImage()(gray_edge_y_vis)),
+                        'illum_edge_fusion_x':wandb.Image(torchvision.transforms.ToPILImage()(fusion_edge_x_vis)),
+                        'illum_edge_fusion_y':wandb.Image(torchvision.transforms.ToPILImage()(fusion_edge_y_vis)),
+                        'illum_edge_used_x':wandb.Image(torchvision.transforms.ToPILImage()(illum_edge_x_vis)),
+                        'illum_edge_used_y':wandb.Image(torchvision.transforms.ToPILImage()(illum_edge_y_vis)),
+                        'illum_weight_x':wandb.Image(torchvision.transforms.ToPILImage()(illum_w_x_vis)),
+                        'illum_weight_y':wandb.Image(torchvision.transforms.ToPILImage()(illum_w_y_vis)),
                         'reflectance':wandb.Image(torchvision.transforms.ToPILImage()(reflectance_image)),
                         'depth_piror_image':wandb.Image(torchvision.transforms.ToPILImage()(depth_piror_norm)),
                         'clear_image':wandb.Image(enhanced_image_pil),
@@ -737,6 +843,15 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         'image_enhanced':wandb.Image(torchvision.transforms.ToPILImage()(illumination_enhanced_image * reflectance_image)),
                         'refined_image':wandb.Image(torchvision.transforms.ToPILImage()(refined_image_dict[viewpoint_cam.uid].cuda())),
                 })
+                if depth_edge_x_vis is not None:
+                    wandb.log({
+                        'illum_edge_depth_x': wandb.Image(torchvision.transforms.ToPILImage()(depth_edge_x_vis)),
+                        'illum_edge_depth_y': wandb.Image(torchvision.transforms.ToPILImage()(depth_edge_y_vis)),
+                    })
+                if illum_dark_gate_vis is not None:
+                    wandb.log({
+                        'illum_dark_gate': wandb.Image(torchvision.transforms.ToPILImage()(illum_dark_gate_vis)),
+                    })
 
             # debug
             if iteration % 600 == 0:
@@ -769,6 +884,15 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 print("enhancement_green_bias", L_enhanced_green_bias)
                 print("enhancement_illumination_guidance", L_diff_illumination)
                 print("enhancement_reflectance_guidance", L_diff_reflectance)
+                print("illum_edge_source", dataset.illum_edge_source)
+                print("illum_edge_effective_source", illum_smooth_debug["effective_source"])
+                print("illum_edge_depth_available", illum_smooth_debug["depth_available"])
+                print("illum_edge_x_stats", illum_edge_x.min().item(), illum_edge_x.mean().item(), illum_edge_x.max().item())
+                print("illum_edge_y_stats", illum_edge_y.min().item(), illum_edge_y.mean().item(), illum_edge_y.max().item())
+                print("illum_w_x_stats", illum_w_x.min().item(), illum_w_x.mean().item(), illum_w_x.max().item())
+                print("illum_w_y_stats", illum_w_y.min().item(), illum_w_y.mean().item(), illum_w_y.max().item())
+                if illum_dark_gate is not None:
+                    print("illum_dark_gate_stats", illum_dark_gate.min().item(), illum_dark_gate.mean().item(), illum_dark_gate.max().item())
                 print("image", image.mean())
                 print("gt_image", gt_image.mean())
 
