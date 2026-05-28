@@ -144,7 +144,12 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
         cat_local_view_illumination_wodist,
         pc,
     )
-    illumination_enhanced = pc.get_enhancement_net(torch.cat([feat.detach(), illumination_feat.detach()], dim=1))
+    illumination_enhanced = pc.get_enhanced_illumination(
+        feat,
+        illumination_feat,
+        ob_view,
+        visible_mask,
+    )
     if pc.use_residual and pc.appearance_residual_dim>0:
         if pc.add_residual_dist:
             residual_input = torch.cat([cat_local_view_residual, appearance_residual], dim=1)
@@ -752,7 +757,12 @@ def generate_neural_gaussians_fast(viewpoint_camera, pc : GaussianModel, visible
         cat_local_view_illumination_wodist,
         pc,
     )
-    illumination_enhanced = pc.get_enhancement_net(torch.cat([feat.detach(), illumination_feat.detach()], dim=1))
+    illumination_enhanced = pc.get_enhanced_illumination(
+        feat,
+        illumination_feat,
+        ob_view,
+        visible_mask,
+    )
 
 
     if pc.legacy_compatibility_mode:

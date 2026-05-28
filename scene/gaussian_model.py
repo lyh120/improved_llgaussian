@@ -122,6 +122,8 @@ class GaussianModel:
         self.legacy_compatibility_mode = illumination_mode == "legacy"
         self.reflectance_detail_scale = 1.1
         self._last_reflectance_decoder_mean = torch.tensor(0.0, device="cuda")
+        self.enhancement_sg_init_sharpness = 8.0
+        self.enhancement_sg_amplitude_init = 0.05
         
         ## residual
         self.use_residual = use_residual
@@ -133,6 +135,12 @@ class GaussianModel:
         self._anchor_feat = torch.empty(0)
         self._base_log_reflectance = torch.empty(0)
         self._reflectance_offset_delta = torch.empty(0)
+        self._enhancement_sg_axis = torch.empty(0)
+        self._enhancement_sg_sharpness = torch.empty(0)
+        self._enhancement_sg_amplitude = torch.empty(0)
+        self._enhancement_feat_weight = torch.empty(0)
+        self._enhancement_illum_weight = torch.empty(0)
+        self._enhancement_context_bias = torch.empty(0)
 
         
         self.opacity_accum = torch.empty(0)
@@ -245,13 +253,6 @@ class GaussianModel:
                     nn.Sigmoid()
             ).cuda()
 
-        self.enhancement_net = nn.Sequential(
-                nn.Linear(feat_dim + 1*self.n_offsets, feat_dim // 2),
-                nn.ReLU(True),
-                nn.Linear(feat_dim // 2, 3*self.n_offsets),
-                nn.Sigmoid()
-            ).cuda()
-
     def _reset_noise_net(self):
         if not self.use_residual or not self.use_dual_transient:
             return
@@ -259,6 +260,68 @@ class GaussianModel:
             if isinstance(module, nn.Linear):
                 nn.init.zeros_(module.weight)
                 nn.init.zeros_(module.bias)
+
+    def _init_enhancement_sg_params(self, anchor_count, device="cuda", dtype=torch.float):
+        axis = F.normalize(torch.randn((anchor_count, self.n_offsets, 3), device=device, dtype=dtype), dim=-1)
+        sharpness = torch.log(torch.expm1(torch.full(
+            (anchor_count, self.n_offsets, 1),
+            self.enhancement_sg_init_sharpness,
+            device=device,
+            dtype=dtype,
+        )))
+        amplitude = inverse_sigmoid(torch.full(
+            (anchor_count, self.n_offsets, 3),
+            self.enhancement_sg_amplitude_init,
+            device=device,
+            dtype=dtype,
+        ))
+        return axis, sharpness, amplitude
+
+    def _ensure_enhancement_sg_params(self):
+        if (
+            not torch.is_tensor(self._enhancement_feat_weight)
+            or self._enhancement_feat_weight.numel() == 0
+            or tuple(self._enhancement_feat_weight.shape) != (self.feat_dim, 3)
+            or tuple(self._enhancement_illum_weight.shape) != (self.n_offsets, 3)
+            or tuple(self._enhancement_context_bias.shape) != (1, self.n_offsets, 3)
+        ):
+            self._enhancement_feat_weight = nn.Parameter(
+                torch.zeros((self.feat_dim, 3), device=self._anchor.device, dtype=self._anchor.dtype).requires_grad_(True)
+            )
+            self._enhancement_illum_weight = nn.Parameter(
+                torch.zeros((self.n_offsets, 3), device=self._anchor.device, dtype=self._anchor.dtype).requires_grad_(True)
+            )
+            self._enhancement_context_bias = nn.Parameter(
+                torch.zeros((1, self.n_offsets, 3), device=self._anchor.device, dtype=self._anchor.dtype).requires_grad_(True)
+            )
+        else:
+            if not isinstance(self._enhancement_feat_weight, nn.Parameter):
+                self._enhancement_feat_weight = nn.Parameter(self._enhancement_feat_weight.requires_grad_(True))
+            if not isinstance(self._enhancement_illum_weight, nn.Parameter):
+                self._enhancement_illum_weight = nn.Parameter(self._enhancement_illum_weight.requires_grad_(True))
+            if not isinstance(self._enhancement_context_bias, nn.Parameter):
+                self._enhancement_context_bias = nn.Parameter(self._enhancement_context_bias.requires_grad_(True))
+
+        if (
+            torch.is_tensor(self._enhancement_sg_axis)
+            and self._enhancement_sg_axis.numel() > 0
+            and self._enhancement_sg_axis.shape[0] == self._anchor.shape[0]
+        ):
+            if not isinstance(self._enhancement_sg_axis, nn.Parameter):
+                self._enhancement_sg_axis = nn.Parameter(self._enhancement_sg_axis.requires_grad_(True))
+            if not isinstance(self._enhancement_sg_sharpness, nn.Parameter):
+                self._enhancement_sg_sharpness = nn.Parameter(self._enhancement_sg_sharpness.requires_grad_(True))
+            if not isinstance(self._enhancement_sg_amplitude, nn.Parameter):
+                self._enhancement_sg_amplitude = nn.Parameter(self._enhancement_sg_amplitude.requires_grad_(True))
+            return
+        axis, sharpness, amplitude = self._init_enhancement_sg_params(
+            self._anchor.shape[0],
+            device=self._anchor.device,
+            dtype=self._anchor.dtype,
+        )
+        self._enhancement_sg_axis = nn.Parameter(axis.requires_grad_(True))
+        self._enhancement_sg_sharpness = nn.Parameter(sharpness.requires_grad_(True))
+        self._enhancement_sg_amplitude = nn.Parameter(amplitude.requires_grad_(True))
 
     def eval(self):
         self.mlp_opacity.eval()
@@ -269,7 +332,6 @@ class GaussianModel:
         if self.use_sg_illumination:
             self.mlp_sg_illumination.eval()
         self.mlp_reflectance_decoder.eval()
-        self.enhancement_net.eval()
         if self.use_residual:
             if self.use_dual_transient:
                 self.noise_net.eval()
@@ -292,7 +354,6 @@ class GaussianModel:
         if self.use_sg_illumination:
             self.mlp_sg_illumination.train()
         self.mlp_reflectance_decoder.train()
-        self.enhancement_net.train()
         if self.use_residual:
             if self.use_dual_transient:
                 self.noise_net.train()
@@ -313,6 +374,12 @@ class GaussianModel:
                 self._anchor_feat,
                 self._base_log_reflectance,
                 self._reflectance_offset_delta,
+                self._enhancement_sg_axis,
+                self._enhancement_sg_sharpness,
+                self._enhancement_sg_amplitude,
+                self._enhancement_feat_weight,
+                self._enhancement_illum_weight,
+                self._enhancement_context_bias,
                 self._anchor_feat_residual,
                 self._offset,
                 self._offset_residual,
@@ -331,6 +398,12 @@ class GaussianModel:
                 self._anchor_feat,
                 self._base_log_reflectance,
                 self._reflectance_offset_delta,
+                self._enhancement_sg_axis,
+                self._enhancement_sg_sharpness,
+                self._enhancement_sg_amplitude,
+                self._enhancement_feat_weight,
+                self._enhancement_illum_weight,
+                self._enhancement_context_bias,
                 self._offset,
                 self._scaling,
                 self._rotation,
@@ -343,9 +416,52 @@ class GaussianModel:
     
     def restore(self, model_args, training_args):
         if self.use_residual:
+            has_enhancement_context = len(model_args) == 21
+            has_enhancement_sg = len(model_args) == 18
             has_reflectance_detail = len(model_args) == 15
             has_b0 = len(model_args) == 14
-            if has_reflectance_detail:
+            if has_enhancement_context:
+                (self._anchor,
+                self._anchor_feat,
+                self._base_log_reflectance,
+                self._reflectance_offset_delta,
+                self._enhancement_sg_axis,
+                self._enhancement_sg_sharpness,
+                self._enhancement_sg_amplitude,
+                self._enhancement_feat_weight,
+                self._enhancement_illum_weight,
+                self._enhancement_context_bias,
+                self._anchor_feat_residual,
+                self._offset,
+                self._offset_residual,
+                self._scaling,
+                self._scaling_residual,
+                self._rotation,
+                self._opacity,
+                self.max_radii2D,
+                denom,
+                opt_dict,
+                self.spatial_lr_scale) = model_args
+            elif has_enhancement_sg:
+                (self._anchor,
+                self._anchor_feat,
+                self._base_log_reflectance,
+                self._reflectance_offset_delta,
+                self._enhancement_sg_axis,
+                self._enhancement_sg_sharpness,
+                self._enhancement_sg_amplitude,
+                self._anchor_feat_residual,
+                self._offset,
+                self._offset_residual,
+                self._scaling,
+                self._scaling_residual,
+                self._rotation,
+                self._opacity,
+                self.max_radii2D,
+                denom,
+                opt_dict,
+                self.spatial_lr_scale) = model_args
+            elif has_reflectance_detail:
                 (self._anchor,
                 self._anchor_feat,
                 self._base_log_reflectance,
@@ -404,6 +520,7 @@ class GaussianModel:
                 )
                 self.illumination_mode = "legacy"
                 self.legacy_compatibility_mode = True
+            self._ensure_enhancement_sg_params()
             self.training_setup(training_args)
             self.denom = denom
             try:
@@ -411,9 +528,46 @@ class GaussianModel:
             except ValueError:
                 print("Optimizer checkpoint is not compatible with SG parameter groups; optimizer state is reinitialized.")
         else:
+            has_enhancement_context = len(model_args) == 18
+            has_enhancement_sg = len(model_args) == 15
             has_reflectance_detail = len(model_args) == 12
             has_b0 = len(model_args) == 11
-            if has_reflectance_detail:
+            if has_enhancement_context:
+                (self._anchor,
+                self._anchor_feat,
+                self._base_log_reflectance,
+                self._reflectance_offset_delta,
+                self._enhancement_sg_axis,
+                self._enhancement_sg_sharpness,
+                self._enhancement_sg_amplitude,
+                self._enhancement_feat_weight,
+                self._enhancement_illum_weight,
+                self._enhancement_context_bias,
+                self._offset,
+                self._scaling,
+                self._rotation,
+                self._opacity,
+                self.max_radii2D,
+                denom,
+                opt_dict,
+                self.spatial_lr_scale) = model_args
+            elif has_enhancement_sg:
+                (self._anchor,
+                self._anchor_feat,
+                self._base_log_reflectance,
+                self._reflectance_offset_delta,
+                self._enhancement_sg_axis,
+                self._enhancement_sg_sharpness,
+                self._enhancement_sg_amplitude,
+                self._offset,
+                self._scaling,
+                self._rotation,
+                self._opacity,
+                self.max_radii2D,
+                denom,
+                opt_dict,
+                self.spatial_lr_scale) = model_args
+            elif has_reflectance_detail:
                 (self._anchor,
                 self._anchor_feat,
                 self._base_log_reflectance,
@@ -463,6 +617,7 @@ class GaussianModel:
                 )
                 self.illumination_mode = "legacy"
                 self.legacy_compatibility_mode = True
+            self._ensure_enhancement_sg_params()
             self.training_setup(training_args)
             self.denom = denom
             try:
@@ -562,9 +717,26 @@ class GaussianModel:
         self._last_reflectance_decoder_mean = torch.abs(torch.tanh(decoder_out)).mean()
         return torch.clamp(reflectance * decoder_refine, 1e-3, 1.0)
 
-    @property
-    def get_enhancement_net(self):
-        return self.enhancement_net
+    def get_enhanced_illumination(self, feat, illumination_feat, view_dirs, visible_mask):
+        self._ensure_enhancement_sg_params()
+        axis = F.normalize(self._enhancement_sg_axis[visible_mask], dim=-1)
+        sharpness = F.softplus(self._enhancement_sg_sharpness[visible_mask])
+        amplitude = torch.sigmoid(self._enhancement_sg_amplitude[visible_mask])
+
+        view_dirs = view_dirs.view(-1, 1, 3)
+        cosine = torch.sum(axis * view_dirs, dim=-1, keepdim=True).clamp(-1.0, 1.0)
+        sg_term = amplitude * torch.exp(sharpness * (cosine - 1.0))
+
+        illumination_context = torch.sigmoid(illumination_feat) if self.legacy_compatibility_mode else illumination_feat
+        illumination_context = illumination_context.detach()
+        feat_gain = feat.detach().matmul(self._enhancement_feat_weight).view(-1, 1, 3)
+        illum_gain = illumination_context.view(-1, self.n_offsets, 1) * self._enhancement_illum_weight.view(1, self.n_offsets, 3)
+        context_gain = feat_gain + illum_gain
+        input_gate = torch.sigmoid(context_gain + self._enhancement_context_bias)
+
+        base_illumination = illumination_context.view(-1, self.n_offsets, 1).expand(-1, -1, 3)
+        enhanced = torch.clamp(base_illumination + input_gate * sg_term, 0.0, 1.0)
+        return enhanced.reshape(-1, 3)
 
     @property
     def get_illumination_mlp(self):
@@ -865,6 +1037,11 @@ class GaussianModel:
             scales_residual = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 6) 
         base_log_reflectance = self._estimate_initial_b0(fused_point_cloud, cameras)
         reflectance_offset_delta = torch.zeros((fused_point_cloud.shape[0], self.n_offsets, 3), dtype=torch.float, device="cuda")
+        enhancement_sg_axis, enhancement_sg_sharpness, enhancement_sg_amplitude = self._init_enhancement_sg_params(
+            fused_point_cloud.shape[0],
+            device="cuda",
+            dtype=torch.float,
+        )
 
 
         self._anchor = nn.Parameter(fused_point_cloud.requires_grad_(True))
@@ -872,6 +1049,9 @@ class GaussianModel:
         self._anchor_feat = nn.Parameter(anchors_feat.requires_grad_(True))
         self._base_log_reflectance = nn.Parameter(base_log_reflectance.requires_grad_(True))
         self._reflectance_offset_delta = nn.Parameter(reflectance_offset_delta.requires_grad_(True))
+        self._enhancement_sg_axis = nn.Parameter(enhancement_sg_axis.requires_grad_(True))
+        self._enhancement_sg_sharpness = nn.Parameter(enhancement_sg_sharpness.requires_grad_(True))
+        self._enhancement_sg_amplitude = nn.Parameter(enhancement_sg_amplitude.requires_grad_(True))
         if self.use_residual:
             self._anchor_feat_residual = nn.Parameter(anchors_feat_residual.requires_grad_(True))
             self._offset_residual = nn.Parameter(offsets_residual.requires_grad_(True))
@@ -886,6 +1066,7 @@ class GaussianModel:
 
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
+        self._ensure_enhancement_sg_params()
 
         self.opacity_accum = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
 
@@ -912,7 +1093,12 @@ class GaussianModel:
                 {'params': self.mlp_feature_bank.parameters(), 'lr': training_args.mlp_featurebank_lr_init, "name": "mlp_featurebank"},
                 {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
                 {'params': self.mlp_sg_illumination.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_sg_illumination"},
-                {'params': self.enhancement_net.parameters(), 'lr': training_args.mlp_enhance_lr_init  , "name": "enhancement_net"},
+                {'params': [self._enhancement_sg_axis], 'lr': training_args.mlp_enhance_lr_init, "name": "enhancement_sg_axis"},
+                {'params': [self._enhancement_sg_sharpness], 'lr': training_args.mlp_enhance_lr_init, "name": "enhancement_sg_sharpness"},
+                {'params': [self._enhancement_sg_amplitude], 'lr': training_args.mlp_enhance_lr_init, "name": "enhancement_sg_amplitude"},
+                {'params': [self._enhancement_feat_weight], 'lr': training_args.mlp_enhance_lr_init, "name": "enhancement_context_feat"},
+                {'params': [self._enhancement_illum_weight], 'lr': training_args.mlp_enhance_lr_init, "name": "enhancement_context_illum"},
+                {'params': [self._enhancement_context_bias], 'lr': training_args.mlp_enhance_lr_init, "name": "enhancement_context_bias"},
                 # {'params': self.embedding_appearance.parameters(), 'lr': training_args.appearance_lr_init, "name": "embedding_appearance"},
             ]
         elif self.appearance_residual_dim > 0:
@@ -930,7 +1116,12 @@ class GaussianModel:
                 {'params': self.mlp_opacity.parameters(), 'lr': training_args.mlp_opacity_lr_init, "name": "mlp_opacity"},
                 {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
                 {'params': self.mlp_sg_illumination.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_sg_illumination"},
-                {'params': self.enhancement_net.parameters(), 'lr': training_args.mlp_enhance_lr_init , "name": "enhancement_net"},
+                {'params': [self._enhancement_sg_axis], 'lr': training_args.mlp_enhance_lr_init, "name": "enhancement_sg_axis"},
+                {'params': [self._enhancement_sg_sharpness], 'lr': training_args.mlp_enhance_lr_init, "name": "enhancement_sg_sharpness"},
+                {'params': [self._enhancement_sg_amplitude], 'lr': training_args.mlp_enhance_lr_init, "name": "enhancement_sg_amplitude"},
+                {'params': [self._enhancement_feat_weight], 'lr': training_args.mlp_enhance_lr_init, "name": "enhancement_context_feat"},
+                {'params': [self._enhancement_illum_weight], 'lr': training_args.mlp_enhance_lr_init, "name": "enhancement_context_illum"},
+                {'params': [self._enhancement_context_bias], 'lr': training_args.mlp_enhance_lr_init, "name": "enhancement_context_bias"},
                 {'params': self.embedding_appearance.parameters(), 'lr': training_args.appearance_lr_init, "name": "embedding_appearance"},
             ]
         else:
@@ -948,7 +1139,12 @@ class GaussianModel:
                 {'params': self.mlp_opacity.parameters(), 'lr': training_args.mlp_opacity_lr_init, "name": "mlp_opacity"},
                 {'params': self.mlp_cov.parameters(), 'lr': training_args.mlp_cov_lr_init, "name": "mlp_cov"},
                 {'params': self.mlp_sg_illumination.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_sg_illumination"},
-                {'params': self.enhancement_net.parameters(), 'lr': training_args.mlp_enhance_lr_init  , "name": "enhancement_net"},
+                {'params': [self._enhancement_sg_axis], 'lr': training_args.mlp_enhance_lr_init, "name": "enhancement_sg_axis"},
+                {'params': [self._enhancement_sg_sharpness], 'lr': training_args.mlp_enhance_lr_init, "name": "enhancement_sg_sharpness"},
+                {'params': [self._enhancement_sg_amplitude], 'lr': training_args.mlp_enhance_lr_init, "name": "enhancement_sg_amplitude"},
+                {'params': [self._enhancement_feat_weight], 'lr': training_args.mlp_enhance_lr_init, "name": "enhancement_context_feat"},
+                {'params': [self._enhancement_illum_weight], 'lr': training_args.mlp_enhance_lr_init, "name": "enhancement_context_illum"},
+                {'params': [self._enhancement_context_bias], 'lr': training_args.mlp_enhance_lr_init, "name": "enhancement_context_bias"},
             ]
         if self.use_residual:
             l.append({'params': [self._anchor_feat_residual], 'lr': training_args.feature_lr , "name": "anchor_feat_residual"})
@@ -995,7 +1191,7 @@ class GaussianModel:
                                                     lr_final=training_args.mlp_color_lr_final,
                                                     lr_delay_mult=training_args.mlp_color_lr_delay_mult,
                                                     max_steps=training_args.mlp_color_lr_max_steps)
-        self.enhancement_net_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_enhance_lr_init ,
+        self.enhancement_sg_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_enhance_lr_init ,
                                                     lr_final=training_args.mlp_enhance_lr_final,
                                                     lr_delay_mult=training_args.mlp_color_lr_delay_mult,
                                                     max_steps=training_args.mlp_color_lr_max_steps)
@@ -1066,8 +1262,8 @@ class GaussianModel:
             if param_group["name"] == "mlp_sg_illumination":
                 lr = self.mlp_sg_illumination_scheduler_args(iteration)
                 param_group['lr'] = lr
-            if param_group["name"] == "enhancement_net":
-                lr = self.enhancement_net_scheduler_args(iteration)
+            if param_group["name"] in {"enhancement_sg_axis", "enhancement_sg_sharpness", "enhancement_sg_amplitude", "enhancement_context_feat", "enhancement_context_illum", "enhancement_context_bias"}:
+                lr = self.enhancement_sg_scheduler_args(iteration)
                 param_group['lr'] = lr
             if param_group["name"] == "base_log_reflectance":
                 lr = self.b0_scheduler_args(iteration)
@@ -1109,7 +1305,7 @@ class GaussianModel:
 
     def freeze(self):
         for param_group in self.optimizer.param_groups:
-            if param_group["name"] != "enhancement_net" and param_group["name"] != "base_log_reflectance" and param_group["name"] != "reflectance_offset_delta" and param_group["name"] != "mlp_reflectance_decoder":
+            if param_group["name"] not in {"enhancement_sg_axis", "enhancement_sg_sharpness", "enhancement_sg_amplitude", "enhancement_context_feat", "enhancement_context_illum", "enhancement_context_bias", "base_log_reflectance", "reflectance_offset_delta", "mlp_reflectance_decoder"}:
                 param_group['lr'] = 0
 
                 
@@ -1125,6 +1321,12 @@ class GaussianModel:
             l.append('b0_{}'.format(i))
         for i in range(self._reflectance_offset_delta.shape[1] * self._reflectance_offset_delta.shape[2]):
             l.append('b0_detail_{}'.format(i))
+        for i in range(self._enhancement_sg_axis.shape[1] * self._enhancement_sg_axis.shape[2]):
+            l.append('enh_sg_axis_{}'.format(i))
+        for i in range(self._enhancement_sg_sharpness.shape[1] * self._enhancement_sg_sharpness.shape[2]):
+            l.append('enh_sg_sharpness_{}'.format(i))
+        for i in range(self._enhancement_sg_amplitude.shape[1] * self._enhancement_sg_amplitude.shape[2]):
+            l.append('enh_sg_amplitude_{}'.format(i))
         l.append('opacity')
         for i in range(self._scaling.shape[1]):
             l.append('scale_{}'.format(i))
@@ -1147,6 +1349,9 @@ class GaussianModel:
         anchor_feat = self._anchor_feat.detach().cpu().numpy()
         base_log_reflectance = self._base_log_reflectance.detach().cpu().numpy()
         reflectance_offset_delta = self._reflectance_offset_delta.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        enhancement_sg_axis = self._enhancement_sg_axis.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        enhancement_sg_sharpness = self._enhancement_sg_sharpness.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+        enhancement_sg_amplitude = self._enhancement_sg_amplitude.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         offset = self._offset.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
         opacities = self._opacity.detach().cpu().numpy()
         scale = self._scaling.detach().cpu().numpy()
@@ -1161,9 +1366,9 @@ class GaussianModel:
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(anchor.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((anchor, normals, offset, anchor_feat, base_log_reflectance, reflectance_offset_delta, opacities, scale, rotation, filter_3D), axis=1)
+        attributes = np.concatenate((anchor, normals, offset, anchor_feat, base_log_reflectance, reflectance_offset_delta, enhancement_sg_axis, enhancement_sg_sharpness, enhancement_sg_amplitude, opacities, scale, rotation, filter_3D), axis=1)
         if self.use_residual:
-            attributes = np.concatenate((anchor, normals, offset, anchor_feat, base_log_reflectance, reflectance_offset_delta, opacities, scale, rotation, filter_3D, anchor_feat_residual, scale_residual, offset_residual), axis=1)
+            attributes = np.concatenate((anchor, normals, offset, anchor_feat, base_log_reflectance, reflectance_offset_delta, enhancement_sg_axis, enhancement_sg_sharpness, enhancement_sg_amplitude, opacities, scale, rotation, filter_3D, anchor_feat_residual, scale_residual, offset_residual), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -1218,6 +1423,31 @@ class GaussianModel:
         else:
             reflectance_offset_delta = np.zeros((anchor.shape[0], self.n_offsets, 3), dtype=np.float32)
 
+        enh_axis_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("enh_sg_axis_")]
+        enh_axis_names = sorted(enh_axis_names, key=lambda x: int(x.split('_')[-1]))
+        enh_sharpness_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("enh_sg_sharpness_")]
+        enh_sharpness_names = sorted(enh_sharpness_names, key=lambda x: int(x.split('_')[-1]))
+        enh_amplitude_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("enh_sg_amplitude_")]
+        enh_amplitude_names = sorted(enh_amplitude_names, key=lambda x: int(x.split('_')[-1]))
+        if len(enh_axis_names) > 0 and len(enh_sharpness_names) > 0 and len(enh_amplitude_names) > 0:
+            enhancement_sg_axis = np.zeros((anchor.shape[0], len(enh_axis_names)), dtype=np.float32)
+            enhancement_sg_sharpness = np.zeros((anchor.shape[0], len(enh_sharpness_names)), dtype=np.float32)
+            enhancement_sg_amplitude = np.zeros((anchor.shape[0], len(enh_amplitude_names)), dtype=np.float32)
+            for idx, attr_name in enumerate(enh_axis_names):
+                enhancement_sg_axis[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32)
+            for idx, attr_name in enumerate(enh_sharpness_names):
+                enhancement_sg_sharpness[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32)
+            for idx, attr_name in enumerate(enh_amplitude_names):
+                enhancement_sg_amplitude[:, idx] = np.asarray(plydata.elements[0][attr_name]).astype(np.float32)
+            enhancement_sg_axis = enhancement_sg_axis.reshape((anchor.shape[0], 3, self.n_offsets)).transpose(0, 2, 1)
+            enhancement_sg_sharpness = enhancement_sg_sharpness.reshape((anchor.shape[0], 1, self.n_offsets)).transpose(0, 2, 1)
+            enhancement_sg_amplitude = enhancement_sg_amplitude.reshape((anchor.shape[0], 3, self.n_offsets)).transpose(0, 2, 1)
+        else:
+            axis, sharpness, amplitude = self._init_enhancement_sg_params(anchor.shape[0], device="cuda", dtype=torch.float)
+            enhancement_sg_axis = axis.detach().cpu().numpy()
+            enhancement_sg_sharpness = sharpness.detach().cpu().numpy()
+            enhancement_sg_amplitude = amplitude.detach().cpu().numpy()
+
         offset_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_offset")]
         offset_names = sorted(offset_names, key = lambda x: int(x.split('_')[-1]))
         offsets = np.zeros((anchor.shape[0], len(offset_names)))
@@ -1252,6 +1482,9 @@ class GaussianModel:
         self._anchor_feat = nn.Parameter(torch.tensor(anchor_feats, dtype=torch.float, device="cuda").requires_grad_(True))
         self._base_log_reflectance = nn.Parameter(torch.tensor(base_log_reflectance, dtype=torch.float, device="cuda").requires_grad_(True))
         self._reflectance_offset_delta = nn.Parameter(torch.tensor(reflectance_offset_delta, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._enhancement_sg_axis = nn.Parameter(torch.tensor(enhancement_sg_axis, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._enhancement_sg_sharpness = nn.Parameter(torch.tensor(enhancement_sg_sharpness, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._enhancement_sg_amplitude = nn.Parameter(torch.tensor(enhancement_sg_amplitude, dtype=torch.float, device="cuda").requires_grad_(True))
 
         self._offset = nn.Parameter(torch.tensor(offsets, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
         self._anchor = nn.Parameter(torch.tensor(anchor, dtype=torch.float, device="cuda").requires_grad_(True))
@@ -1291,7 +1524,7 @@ class GaussianModel:
                 'artifact_net' in group['name'] or \
                 'residual_net' in group['name'] or \
                 'embedding' in group['name'] or \
-                'enhancement_net' in group['name'] or \
+                'enhancement_context' in group['name'] or \
                 'pose' in group['name']:
                 continue
             assert len(group["params"]) == 1
@@ -1350,7 +1583,7 @@ class GaussianModel:
                 'noise_net' in group['name'] or \
                 'artifact_net' in group['name'] or \
                 'residual_net' in group['name'] or \
-                'enhancement_net' in group['name'] or \
+                'enhancement_context' in group['name'] or \
                 'embedding' in group['name'] or \
                 'pose' in group['name']:
                 continue
@@ -1395,6 +1628,9 @@ class GaussianModel:
         self._anchor_feat = optimizable_tensors["anchor_feat"]
         self._base_log_reflectance = optimizable_tensors["base_log_reflectance"]
         self._reflectance_offset_delta = optimizable_tensors["reflectance_offset_delta"]
+        self._enhancement_sg_axis = optimizable_tensors["enhancement_sg_axis"]
+        self._enhancement_sg_sharpness = optimizable_tensors["enhancement_sg_sharpness"]
+        self._enhancement_sg_amplitude = optimizable_tensors["enhancement_sg_amplitude"]
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
@@ -1479,6 +1715,11 @@ class GaussianModel:
                         dim=0,
                     )[remove_duplicates]
                 new_reflectance_offset_delta = torch.zeros((candidate_anchor.shape[0], self.n_offsets, 3), dtype=torch.float, device="cuda")
+                new_enhancement_sg_axis, new_enhancement_sg_sharpness, new_enhancement_sg_amplitude = self._init_enhancement_sg_params(
+                    candidate_anchor.shape[0],
+                    device="cuda",
+                    dtype=torch.float,
+                )
 
                 new_offsets = torch.zeros_like(candidate_anchor).unsqueeze(dim=1).repeat([1,self.n_offsets,1]).float().cuda()
 
@@ -1497,6 +1738,9 @@ class GaussianModel:
                     "anchor_feat": new_feat,
                     "base_log_reflectance": new_base_log_reflectance,
                     "reflectance_offset_delta": new_reflectance_offset_delta,
+                    "enhancement_sg_axis": new_enhancement_sg_axis,
+                    "enhancement_sg_sharpness": new_enhancement_sg_sharpness,
+                    "enhancement_sg_amplitude": new_enhancement_sg_amplitude,
                     "offset": new_offsets,
                     "opacity": new_opacities,
                 }
@@ -1522,6 +1766,9 @@ class GaussianModel:
                 self._anchor_feat = optimizable_tensors["anchor_feat"]
                 self._base_log_reflectance = optimizable_tensors["base_log_reflectance"]
                 self._reflectance_offset_delta = optimizable_tensors["reflectance_offset_delta"]
+                self._enhancement_sg_axis = optimizable_tensors["enhancement_sg_axis"]
+                self._enhancement_sg_sharpness = optimizable_tensors["enhancement_sg_sharpness"]
+                self._enhancement_sg_amplitude = optimizable_tensors["enhancement_sg_amplitude"]
                 self._offset = optimizable_tensors["offset"]
                 self._opacity = optimizable_tensors["opacity"]
                 if self.use_residual:
@@ -1638,10 +1885,11 @@ class GaussianModel:
             reflectance_decoder.save(os.path.join(path, 'reflectance_decoder.pt'))
             self.mlp_reflectance_decoder.train()
 
-            self.enhancement_net.eval()
-            enhancement_net = torch.jit.trace(self.enhancement_net, (torch.rand(1, self.feat_dim + self.n_offsets).cuda()))
-            enhancement_net.save(os.path.join(path, 'enhancement_net.pt'))
-            self.enhancement_net.train()
+            torch.save({
+                'enhancement_feat_weight': self._enhancement_feat_weight.detach(),
+                'enhancement_illum_weight': self._enhancement_illum_weight.detach(),
+                'enhancement_context_bias': self._enhancement_context_bias.detach(),
+            }, os.path.join(path, 'enhancement_context.pth'))
 
             if self.use_residual:
                 residual_input = torch.rand(1, self.feat_dim+3+self.residual_dist_dim + self.appearance_residual_dim).cuda()
@@ -1690,7 +1938,11 @@ class GaussianModel:
                     'cov_mlp': self.mlp_cov.state_dict(),
                     'sg_illumination_mlp': self.mlp_sg_illumination.state_dict(),
                     'reflectance_decoder': self.mlp_reflectance_decoder.state_dict(),
-                    'enhancement_net': self.enhancement_net.state_dict(),
+                    'enhancement_context': {
+                        'feat_weight': self._enhancement_feat_weight.detach(),
+                        'illum_weight': self._enhancement_illum_weight.detach(),
+                        'bias': self._enhancement_context_bias.detach(),
+                    },
                     'feature_bank_mlp': self.mlp_feature_bank.state_dict(),
                     'appearance': self.embedding_appearance.state_dict(),
                     'illumination_mode': self.illumination_mode,
@@ -1713,7 +1965,11 @@ class GaussianModel:
                     'cov_mlp': self.mlp_cov.state_dict(),
                     'sg_illumination_mlp': self.mlp_sg_illumination.state_dict(),
                     'reflectance_decoder': self.mlp_reflectance_decoder.state_dict(),
-                    'enhancement_net': self.enhancement_net.state_dict(),
+                    'enhancement_context': {
+                        'feat_weight': self._enhancement_feat_weight.detach(),
+                        'illum_weight': self._enhancement_illum_weight.detach(),
+                        'bias': self._enhancement_context_bias.detach(),
+                    },
                     'appearance': self.embedding_appearance.state_dict(),
                     'illumination_mode': self.illumination_mode,
                     }
@@ -1735,7 +1991,11 @@ class GaussianModel:
                     'cov_mlp': self.mlp_cov.state_dict(),
                     'sg_illumination_mlp': self.mlp_sg_illumination.state_dict(),
                     'reflectance_decoder': self.mlp_reflectance_decoder.state_dict(),
-                    'enhancement_net': self.enhancement_net.state_dict(),
+                    'enhancement_context': {
+                        'feat_weight': self._enhancement_feat_weight.detach(),
+                        'illum_weight': self._enhancement_illum_weight.detach(),
+                        'bias': self._enhancement_context_bias.detach(),
+                    },
                     'illumination_mode': self.illumination_mode,
                     }
                 if self.use_residual:
@@ -1762,6 +2022,7 @@ class GaussianModel:
             legacy_reflectance_path = os.path.join(path, 'reflectance_mlp.pt')
             legacy_illumination_path = os.path.join(path, 'illumination_mlp.pt')
             reflectance_decoder_path = os.path.join(path, 'reflectance_decoder.pt')
+            enhancement_context_path = os.path.join(path, 'enhancement_context.pth')
             if self.use_sg_illumination and os.path.exists(sg_path):
                 self.mlp_sg_illumination = torch.jit.load(sg_path).cuda()
                 self.sg_illumination_available = True
@@ -1778,7 +2039,13 @@ class GaussianModel:
                 self.mlp_reflectance_decoder = torch.jit.load(reflectance_decoder_path).cuda()
             if self.legacy_compatibility_mode and os.path.exists(legacy_illumination_path):
                 self.mlp_illumination = torch.jit.load(legacy_illumination_path).cuda()
-            self.enhancement_net = torch.jit.load(os.path.join(path, 'enhancement_net.pt')).cuda()
+            if os.path.exists(enhancement_context_path):
+                enhancement_context = torch.load(enhancement_context_path)
+                self._enhancement_feat_weight = nn.Parameter(enhancement_context['enhancement_feat_weight'].cuda().requires_grad_(True))
+                self._enhancement_illum_weight = nn.Parameter(enhancement_context['enhancement_illum_weight'].cuda().requires_grad_(True))
+                self._enhancement_context_bias = nn.Parameter(enhancement_context['enhancement_context_bias'].cuda().requires_grad_(True))
+            else:
+                self._ensure_enhancement_sg_params()
             if self.use_residual:
                 noise_path = os.path.join(path, 'noise_net.pt')
                 artifact_path = os.path.join(path, 'artifact_net.pt')
@@ -1823,7 +2090,13 @@ class GaussianModel:
                 self.mlp_reflectance_decoder.load_state_dict(checkpoint['reflectance_decoder'])
             if self.legacy_compatibility_mode and 'illumination_mlp' in checkpoint:
                 self.mlp_illumination.load_state_dict(checkpoint['illumination_mlp'])
-            self.enhancement_net.load_state_dict(checkpoint['enhancement_net'])
+            if 'enhancement_context' in checkpoint:
+                enhancement_context = checkpoint['enhancement_context']
+                self._enhancement_feat_weight = nn.Parameter(enhancement_context['feat_weight'].cuda().requires_grad_(True))
+                self._enhancement_illum_weight = nn.Parameter(enhancement_context['illum_weight'].cuda().requires_grad_(True))
+                self._enhancement_context_bias = nn.Parameter(enhancement_context['bias'].cuda().requires_grad_(True))
+            else:
+                self._ensure_enhancement_sg_params()
             if self.use_residual:
                 if self.use_dual_transient and 'noise_net' in checkpoint:
                     self.noise_net.load_state_dict(checkpoint['noise_net'])
