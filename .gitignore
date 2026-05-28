@@ -77,3 +77,5 @@ submodules/**/third_party/glm/test/
 submodules/**/.git/
 submodules/Retinexformer/
 submodules/Retinexformer/
+datasets/
+submodules/HVI-CIDNet/

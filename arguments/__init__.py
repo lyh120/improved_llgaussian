@@ -113,6 +113,18 @@ class ModelParams(ParamGroup):
         self.enhancement_color_reg = 0.06
         self.enhancement_color_std_reg = 0.02
         self.enhancement_green_bias_reg = 0.05
+        self.enhancement_prior = "cidnet"
+        self.cidnet_conda_env = "CIDNet"
+        self.cidnet_root = "./submodules/HVI-CIDNet"
+        self.cidnet_weights = "./submodules/HVI-CIDNet/weights/LOLv2_real/w_perc.pth"
+        self.cidnet_refresh_interval = 2000
+        self.cidnet_mlp_steps = 100
+        self.cidnet_target_exposure = 0.5
+        self.cidnet_refresh_reg = 0.5
+        self.cidnet_color_reg = 0.2
+        self.cidnet_param_reg = 0.1
+        self.cidnet_mv_reg = 0.5
+        self.cidnet_force_refresh = False
         self.residual_hardmask_percentile = 0.8
         self.residual_higherror_percentile = 0.8
         self.residual_highlight_percentile = 0.9
@@ -260,6 +272,18 @@ def _backfill_model_compatibility(merged_dict):
         "enhancement_color_reg": 0.06,
         "enhancement_color_std_reg": 0.02,
         "enhancement_green_bias_reg": 0.05,
+        "enhancement_prior": "cidnet",
+        "cidnet_conda_env": "CIDNet",
+        "cidnet_root": "./submodules/HVI-CIDNet",
+        "cidnet_weights": "./submodules/HVI-CIDNet/weights/LOLv2_real/w_perc.pth",
+        "cidnet_refresh_interval": 2000,
+        "cidnet_mlp_steps": 100,
+        "cidnet_target_exposure": 0.5,
+        "cidnet_refresh_reg": 0.5,
+        "cidnet_color_reg": 0.2,
+        "cidnet_param_reg": 0.1,
+        "cidnet_mv_reg": 0.5,
+        "cidnet_force_refresh": False,
         "b0_lr": 0.001,
         "reflectance_offset_lr": 0.008,
         "reflectance_decoder_lr": 0.002,

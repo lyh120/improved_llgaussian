@@ -478,18 +478,21 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         # input_concated_residual = torch.cat([color_residual, torch.zeros(color_residual.shape[0], input_concated.shape[1]-color_residual.shape[1]-feat_downsampled_residual.shape[1]).cuda().detach(), feat_downsampled_residual.detach()], dim=1)
         # print("reflectance:", reflectance.mean(), "color_residual:", color_residual.mean())
        
-        rendered_noise,_ = rasterizer_residual(
-            # means3D = xyz_residual,
-            # means2D = screenspace_points_residual,
-            means3D = means3D_residual,
-            means2D = means2D_residual,
-            shs = None,
-            colors_precomp = color_noise,
-            opacities = opacity_residual,
-            scales = scaling_residual,
-            rotations = gaussians_rot_residual_trans,
-            # rotations = rot_residual,
-            cov3D_precomp = None)
+        if pc.use_dual_transient:
+            rendered_noise,_ = rasterizer_residual(
+                # means3D = xyz_residual,
+                # means2D = screenspace_points_residual,
+                means3D = means3D_residual,
+                means2D = means2D_residual,
+                shs = None,
+                colors_precomp = color_noise,
+                opacities = opacity_residual,
+                scales = scaling_residual,
+                rotations = gaussians_rot_residual_trans,
+                # rotations = rot_residual,
+                cov3D_precomp = None)
+        else:
+            rendered_noise = torch.zeros((3, int(viewpoint_camera.image_height), int(viewpoint_camera.image_width)), device="cuda")
         rendered_artifact,_ = rasterizer_residual(
             means3D = means3D_residual,
             means2D = means2D_residual,

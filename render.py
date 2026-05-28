@@ -176,6 +176,16 @@ def _load_image_tensor_from_pattern(pattern, device):
     return tf.to_tensor(image).to(device)
 
 
+def _resolve_bright_gt_root(source_path):
+    for candidate in (
+        os.path.join(source_path, "gt", "images"),
+        os.path.join(source_path, "gt"),
+    ):
+        if os.path.isdir(candidate):
+            return candidate
+    return None
+
+
 def _align_tensor_pair(pred, target):
     if pred.shape[-2:] == target.shape[-2:]:
         return pred, target
@@ -513,7 +523,7 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
 
         bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-        bright_gt_root = os.path.join(dataset.source_path, "gt", "images")
+        bright_gt_root = _resolve_bright_gt_root(dataset.source_path)
         if not os.path.exists(dataset.model_path):
             os.makedirs(dataset.model_path)
         if not skip_train:

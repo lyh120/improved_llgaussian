@@ -40,7 +40,6 @@ import torchvision.transforms.functional as tf
 
 sys.modules['torchvision.transforms.functional_tensor'] = tf
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.append("./submodules/StableSR")
 sys.path.append("./submodules/Depth-Anything-V2")
 
 # from lpipsPyTorch import lpips
@@ -58,7 +57,6 @@ from utils.visualize_utils import minmax_normalize, visualize_camera_trajectorie
 import numpy as np
 import cv2
 from utils.pose_utils import save_pose, load_pose
-from torchvision import transforms
 import matplotlib.cm as cm
 
 try:
@@ -75,7 +73,6 @@ except ImportError:
     OptimizationParams = arguments_module.OptimizationParams
 
 from depth_anything_v2.dpt import DepthAnythingV2
-from utils.StableSR_utlis import get_SRModel,SD_refine
 lpips_fn = lpips.LPIPS(net='vgg').to('cuda')
 
 try:
@@ -215,6 +212,231 @@ def _visible_count_per_view(visible_count, image_names):
     }
 
 
+def _resolve_project_path(path):
+    if os.path.isabs(path):
+        return path
+    return os.path.abspath(os.path.join(PROJECT_ROOT, path))
+
+
+def _find_source_image(images_dir, image_name):
+    for suffix in (".png", ".jpg", ".jpeg", ".JPG", ".bmp"):
+        candidate = os.path.join(images_dir, image_name + suffix)
+        if os.path.exists(candidate):
+            return os.path.basename(candidate)
+    raise FileNotFoundError(f"Could not find source image for {image_name} in {images_dir}")
+
+
+def _write_cidnet_manifest(dataset, cameras, prior_root):
+    images_dir = os.path.join(dataset.source_path, dataset.images)
+    if not os.path.isdir(images_dir):
+        raise FileNotFoundError(f"CIDNet input image directory does not exist: {images_dir}")
+
+    manifest = {
+        "images_dir": images_dir,
+        "images": [
+            {
+                "uid": int(camera.uid),
+                "image_name": camera.image_name,
+                "file_name": _find_source_image(images_dir, camera.image_name),
+                "target_width": int(camera.image_width),
+                "target_height": int(camera.image_height),
+            }
+            for camera in cameras
+        ],
+    }
+    os.makedirs(prior_root, exist_ok=True)
+    manifest_path = os.path.join(prior_root, "train_manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as fp:
+        json.dump(manifest, fp, indent=2)
+    return manifest_path, images_dir
+
+
+def _cidnet_round_dir(prior_root, round_idx):
+    return os.path.join(prior_root, f"round_{round_idx:03d}")
+
+
+def _cidnet_round_complete(round_dir, cameras):
+    image_dir = os.path.join(round_dir, "images")
+    if not os.path.isdir(image_dir):
+        return False
+    if not os.path.exists(os.path.join(round_dir, "params.json")):
+        return False
+    return all(os.path.exists(os.path.join(image_dir, camera.image_name + ".png")) for camera in cameras)
+
+
+def load_cidnet_prior_round(round_dir, cameras):
+    image_dir = os.path.join(round_dir, "images")
+    refined_images = {}
+    missing = []
+    for camera in cameras:
+        candidates = [
+            os.path.join(image_dir, camera.image_name + ".png"),
+            os.path.join(image_dir, f"{camera.uid}.png"),
+        ]
+        image_path = next((path for path in candidates if os.path.exists(path)), None)
+        if image_path is None:
+            missing.append(camera.image_name)
+            continue
+        refined_images[camera.uid] = tf.to_tensor(Image.open(image_path).convert("RGB"))
+    if missing:
+        raise FileNotFoundError(f"CIDNet prior round is missing images: {missing[:5]} from {image_dir}")
+    return refined_images
+
+
+def _stablesr_prior_dir(dataset, enhance_ratio):
+    return os.path.join(dataset.source_path, "diffusion_prior_" + str(enhance_ratio))
+
+
+def _stablesr_round_complete(prior_dir, cameras):
+    if not os.path.isdir(prior_dir):
+        return False
+    return all(os.path.exists(os.path.join(prior_dir, f"{camera.uid}.png")) for camera in cameras)
+
+
+def load_stablesr_prior(prior_dir, cameras):
+    refined_images = {}
+    missing = []
+    for camera in cameras:
+        candidates = [
+            os.path.join(prior_dir, f"{camera.uid}.png"),
+            os.path.join(prior_dir, camera.image_name + ".png"),
+        ]
+        image_path = next((path for path in candidates if os.path.exists(path)), None)
+        if image_path is None:
+            missing.append(camera.image_name)
+            continue
+        refined_images[camera.uid] = tf.to_tensor(Image.open(image_path).convert("RGB"))
+    if missing:
+        raise FileNotFoundError(f"StableSR prior is missing images: {missing[:5]} from {prior_dir}")
+    return refined_images
+
+
+def build_or_load_stablesr_prior(dataset, cameras, enhance_ratio, logger=None):
+    prior_dir = _stablesr_prior_dir(dataset, enhance_ratio)
+    os.makedirs(prior_dir, exist_ok=True)
+    if _stablesr_round_complete(prior_dir, cameras):
+        if logger is not None:
+            logger.info(f"[INFO] Loading existing StableSR prior images from {prior_dir}")
+        return load_stablesr_prior(prior_dir, cameras)
+
+    if logger is not None:
+        logger.info(f"[INFO] Generating StableSR prior images in {prior_dir}")
+
+    stablesr_root = os.path.join(PROJECT_ROOT, "submodules", "StableSR")
+    if stablesr_root not in sys.path:
+        sys.path.append(stablesr_root)
+    from utils.StableSR_utlis import SD_refine, get_SRModel
+
+    sd_model, vq_model, sd_opt = get_SRModel()
+    refined_images = {}
+    try:
+        for camera in tqdm(cameras, desc="StableSR prior"):
+            input_image = torch.clamp(camera.original_image.cuda() * enhance_ratio, 0.0, 1.0)
+            refined = SD_refine(sd_model, vq_model, input_image.unsqueeze(0), sd_opt)
+            refined = torch.clamp(refined.detach().cpu(), 0.0, 1.0)
+            refined_images[camera.uid] = refined
+            torchvision.utils.save_image(refined, os.path.join(prior_dir, f"{camera.uid}.png"))
+    finally:
+        sd_model.cpu()
+        vq_model.cpu()
+        del sd_model
+        del vq_model
+        torch.cuda.empty_cache()
+
+    return refined_images
+
+
+def log_cidnet_round_stats(round_dir, logger=None):
+    if logger is None:
+        return
+    stats_path = os.path.join(round_dir, "stats.json")
+    if not os.path.exists(stats_path):
+        logger.info(f"[INFO] CIDNet stats not found: {stats_path}")
+        return
+    with open(stats_path, "r", encoding="utf-8") as fp:
+        stats = json.load(fp)
+    gamma_stats = stats.get("gamma", {})
+    alpha_stats = stats.get("alpha", {})
+    logger.info(
+        "[INFO] CIDNet stats %s | gamma mean/min/max: %.4f/%.4f/%.4f | "
+        "alpha mean/min/max: %.4f/%.4f/%.4f | gamma abs delta: %s | alpha abs delta: %s",
+        os.path.basename(round_dir),
+        gamma_stats.get("mean", 0.0),
+        gamma_stats.get("min", 0.0),
+        gamma_stats.get("max", 0.0),
+        alpha_stats.get("mean", 0.0),
+        alpha_stats.get("min", 0.0),
+        alpha_stats.get("max", 0.0),
+        stats.get("gamma_abs_delta_from_previous_mean"),
+        stats.get("alpha_abs_delta_from_previous_mean"),
+    )
+
+
+def get_refined_image(refined_image_dict, camera, fallback_image=None):
+    refined_image = refined_image_dict.get(camera.uid)
+    if refined_image is not None:
+        return refined_image
+    if fallback_image is not None:
+        return fallback_image.detach().cpu()
+    raise KeyError(f"No refined image loaded for camera uid={camera.uid}, name={camera.image_name}")
+
+
+def refresh_cidnet_prior(dataset, prior_root, manifest_path, images_dir, round_idx, previous_round_dir=None, logger=None):
+    if dataset.enhancement_prior != "cidnet":
+        raise ValueError(f"Unsupported enhancement_prior: {dataset.enhancement_prior}")
+
+    script_path = os.path.join(PROJECT_ROOT, "scripts", "cidnet_refresh.py")
+    output_round = _cidnet_round_dir(prior_root, round_idx)
+    controller_path = os.path.join(prior_root, "mlp_controller.pt")
+    cidnet_root = _resolve_project_path(dataset.cidnet_root)
+    cidnet_weights = _resolve_project_path(dataset.cidnet_weights)
+    cmd = [
+        "conda",
+        "run",
+        "--no-capture-output",
+        "-n",
+        dataset.cidnet_conda_env,
+        "python",
+        script_path,
+        "--cidnet_root",
+        cidnet_root,
+        "--weights",
+        cidnet_weights,
+        "--input_dir",
+        images_dir,
+        "--manifest",
+        manifest_path,
+        "--output_round",
+        output_round,
+        "--controller",
+        controller_path,
+        "--mlp_steps",
+        str(dataset.cidnet_mlp_steps),
+        "--target_exposure",
+        str(dataset.cidnet_target_exposure),
+        "--refresh_reg",
+        str(dataset.cidnet_refresh_reg),
+        "--color_reg",
+        str(dataset.cidnet_color_reg),
+        "--param_reg",
+        str(dataset.cidnet_param_reg),
+        "--mv_reg",
+        str(dataset.cidnet_mv_reg),
+    ]
+    if previous_round_dir:
+        cmd.extend(["--previous_round", previous_round_dir])
+    if logger is not None:
+        logger.info(f"Refreshing CIDNet prior round {round_idx:03d}: {output_round}")
+    result = subprocess.run(cmd, cwd=PROJECT_ROOT, text=True)
+    if result.returncode != 0:
+        message = (
+            f"CIDNet refresh failed for round {round_idx:03d}.\n"
+            f"Command: {' '.join(cmd)}\n"
+        )
+        raise RuntimeError(message)
+    return output_round
+
+
 def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb=None, logger=None, ply_path=None, mode="train"):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
@@ -286,7 +508,6 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
 
-    enhanced_image_dict = {}
     refined_image_dict = {}
 
 
@@ -295,55 +516,38 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     for cam in cams:
         means += cam.original_image.mean(dim=(1,2))
     mean = (means / len(cams)).mean()
-    enhance_ratio = int(0.45/mean)
+    enhance_ratio = max(1, int(0.45 / mean))
     first_iter += 1
 
-    ## diffusion prior setup
-    diff_path = os.path.join(dataset.source_path, "diffusion_prior_" + str(enhance_ratio))
-    os.makedirs(diff_path, exist_ok=True)
-    if os.listdir(diff_path):  # Check if the directory is not empty
-        print(f"[INFO] Loading existing diffusion prior images from {diff_path}")
-        for path_name in os.listdir(diff_path):
-            uid = int(path_name.split('.')[0])
-            refined_image_dict[uid] = transforms.ToTensor()(Image.open(os.path.join(diff_path, path_name)).convert("RGB"))
-    else:
-        cams = scene.getTrainCameras().copy()
-        print(f"[INFO] Loading SD models...")
-        sd_model, vq_model, sd_opt = get_SRModel()
-        print(f"[INFO] SD models loaded!")
-
-        print("SD rendering progress")
-        progress_bar = tqdm(cams, desc="SD rendering progress")
-
-        for cam in progress_bar:
-            uid = cam.uid
-            input_image = cam.original_image.cuda() * enhance_ratio
-            # # Save input image for debugging
-            # if not os.path.exists("./input_image"):
-            #     os.makedirs("./input_images")
-            # torchvision.utils.save_image(input_image, os.path.join("input_images", f"input_image_{uid}.png"))
-
-            # Process the image
-            input_image = input_image.unsqueeze(0)
-            output = SD_refine(sd_model, vq_model, input_image, sd_opt)
-            output_image = output.squeeze(0)
-            refined_image_dict[cam.uid] = output_image
-            # Save refined image
-            torchvision.utils.save_image(output_image, os.path.join(diff_path, f"{uid}.png"))
-            # # Save refined image for debugging
-            # if not os.path.exists("./refined_image"):
-            #     os.makedirs("./refined_images")
-            # torchvision.utils.save_image(output_image, os.path.join("refined_images", f"refined_image_{uid}.png"))
-
-            # Update progress bar
-            progress_bar.set_description(f"SD rendering progress (UID: {uid})")
-
-        # Clean up
-        sd_model.to('cpu')
-        del sd_model  
-        del vq_model  
-        del sd_opt  
-        progress_bar.close()
+    cidnet_prior_root = os.path.join(dataset.source_path, "cidnet_prior")
+    cidnet_manifest_path = None
+    cidnet_images_dir = None
+    cidnet_round_idx = 0
+    cidnet_round_dir = _cidnet_round_dir(cidnet_prior_root, cidnet_round_idx)
+    last_cidnet_refresh_iter = first_iter - 1
+    if mode != "warmup":
+        if dataset.enhancement_prior == "cidnet":
+            if dataset.cidnet_force_refresh and os.path.isdir(cidnet_prior_root):
+                logger.info(f"[INFO] Removing existing CIDNet prior cache: {cidnet_prior_root}")
+                shutil.rmtree(cidnet_prior_root)
+            cidnet_manifest_path, cidnet_images_dir = _write_cidnet_manifest(dataset, cams, cidnet_prior_root)
+            if _cidnet_round_complete(cidnet_round_dir, cams):
+                logger.info(f"[INFO] Loading existing CIDNet prior images from {cidnet_round_dir}")
+            else:
+                refresh_cidnet_prior(
+                    dataset,
+                    cidnet_prior_root,
+                    cidnet_manifest_path,
+                    cidnet_images_dir,
+                    cidnet_round_idx,
+                    logger=logger,
+                )
+            refined_image_dict = load_cidnet_prior_round(cidnet_round_dir, cams)
+            log_cidnet_round_stats(cidnet_round_dir, logger)
+        elif dataset.enhancement_prior == "stablesr":
+            refined_image_dict = build_or_load_stablesr_prior(dataset, cams, enhance_ratio, logger)
+        else:
+            raise ValueError(f"Unsupported enhancement_prior: {dataset.enhancement_prior}")
           
     timing_stats = {}
     total_start_time = time.time()
@@ -367,6 +571,34 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
+
+        if (
+            mode != "warmup"
+            and dataset.enhancement_prior == "cidnet"
+            and dataset.cidnet_refresh_interval > 0
+            and iteration >= opt.update_from
+            and iteration - last_cidnet_refresh_iter >= dataset.cidnet_refresh_interval
+        ):
+            previous_round_dir = cidnet_round_dir
+            cidnet_round_idx += 1
+            cidnet_round_dir = _cidnet_round_dir(cidnet_prior_root, cidnet_round_idx)
+            if _cidnet_round_complete(cidnet_round_dir, cams):
+                logger.info(f"[INFO] Loading cached CIDNet prior round {cidnet_round_idx:03d}")
+            else:
+                refresh_cidnet_prior(
+                    dataset,
+                    cidnet_prior_root,
+                    cidnet_manifest_path,
+                    cidnet_images_dir,
+                    cidnet_round_idx,
+                    previous_round_dir=previous_round_dir,
+                    logger=logger,
+                )
+            refined_image_dict = load_cidnet_prior_round(cidnet_round_dir, cams)
+            log_cidnet_round_stats(cidnet_round_dir, logger)
+            last_cidnet_refresh_iter = iteration
+            if wandb is not None:
+                wandb.log({"cidnet_prior_round": cidnet_round_idx, "iteration": iteration})
         
 
         # Pick a random Camera
@@ -418,7 +650,11 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 noise_image = render_pkg.get("render_noise", torch.zeros_like(gt_image))
                 artifact_image = render_pkg.get("render_artifact", torch.zeros_like(gt_image))
                 residual_image = render_pkg["render_residual"]
-                if residual_active:
+                if not dataset.use_dual_transient:
+                    noise_image_for_loss = torch.zeros_like(noise_image)
+                    artifact_image_for_loss = residual_image
+                    residual_image_for_loss = residual_image
+                elif residual_active:
                     noise_mask, artifact_mask, noise_mask_coverage, artifact_mask_coverage = build_dual_transient_masks(
                         base_image,
                         gt_image,
@@ -537,7 +773,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     L_Smooth(illumination_enhanced_image / enhance_ratio, gt_image, kernel_size=9)
                     * dataset.enhancement_smooth_reg
                 )
-                refined_target = refined_image_dict[viewpoint_cam.uid].cuda()
+                refined_target = get_refined_image(refined_image_dict, viewpoint_cam).cuda()
                 image_enhanced_pred = torch.clamp(illumination_enhanced_image * reflectance_image, 0.0, 1.0)
                 pred_mean = image_enhanced_pred.mean(dim=(1, 2))
                 target_mean = refined_target.mean(dim=(1, 2))
@@ -573,7 +809,15 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     enhancement_guidance_weight = 1.0 - 0.7 * guidance_progress
                     L_diff = L_diff_illumination + dataset.enhancement_reflectance_reg * L_diff_reflectance
                     loss += enhancement_guidance_weight * L_diff
-            if dataset.use_residual and residual_active:
+            if dataset.use_residual and not dataset.use_dual_transient:
+                scaling_residual_reg = scaling_residual.prod(dim=1).mean()
+                artifact_image_for_loss = residual_image
+                L_artifact_sparse = torch.mean(residual_image) * weight_scheduler(iteration)
+                L_residual_reg = L_artifact_sparse
+                artifact_abs_mean = torch.abs(residual_image).mean()
+                artifact_chroma_mean = torch.abs(residual_image - residual_image.mean(dim=0, keepdim=True)).mean()
+                loss += L_residual_reg + 0.05 * scaling_residual_reg
+            elif dataset.use_residual and residual_active:
                 scaling_residual_reg = scaling_residual.prod(dim=1).mean()
                 L_noise_sparse = torch.mean(torch.abs(noise_image_for_loss)) * weight_scheduler(iteration)
                 L_artifact_sparse = torch.mean(torch.abs(artifact_image_for_loss)) * weight_scheduler(iteration)
@@ -625,35 +869,41 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                            'residual_chroma_boost': L_residual_chroma_boost})
             else:
                 residual_chroma_mean = torch.abs(residual_image_for_loss - residual_image_for_loss.mean(dim=0, keepdim=True)).mean()
-                wandb.log({'loss':loss, 'iteration':iteration,
-                           'illumination_mean': illumination_image.mean(),
-                           'sg_energy': L_sg_energy,
-                           'sg_lambda_mean': L_sg_sharpness,
-                           'reflectance_consistency': L_reflectance_consistency,
-                           'reflectance_edge_mean': L_reflectance_edge,
-                           'reflectance_edge_uplift_mean': L_reflectance_edge_uplift,
-                           'reflectance_contrast_mean': L_reflectance_contrast,
-                           'reflectance_highfreq_mean': L_reflectance_highfreq,
-                           'reflectance_highlight_mean': L_reflectance_highlight,
-                           'reflectance_detail_mean': L_reflectance_detail,
-                           'reflectance_decoder_mean': L_reflectance_decoder,
-                           'residual_mix_weight': residual_mix_weight,
-                           'noise_mask_coverage': noise_mask_coverage,
-                           'artifact_mask_coverage': artifact_mask_coverage,
-                           'noise_abs_mean': noise_abs_mean,
-                           'artifact_abs_mean': artifact_abs_mean,
-                           'noise_zero_mean': L_noise_zero_mean,
-                           'noise_highfreq_mean': L_noise_highfreq,
-                           'artifact_chroma_mean': artifact_chroma_mean,
-                           'residual_chroma_mean': residual_chroma_mean,
-                           'residual_chroma_boost': L_residual_chroma_boost,
-                           'residual_enabled': float(residual_active),
-                           'enhancement_guidance_weight': enhancement_guidance_weight,
-                           'enhancement_color_mean': L_enhanced_color,
-                           'enhancement_color_std': L_enhanced_color_std,
-                           'enhancement_green_bias': L_enhanced_green_bias,
-                           'enhancement_illumination_guidance': L_diff_illumination,
-                           'enhancement_reflectance_guidance': L_diff_reflectance})
+                residual_log = {'loss':loss, 'iteration':iteration,
+                                'illumination_mean': illumination_image.mean(),
+                                'sg_energy': L_sg_energy,
+                                'sg_lambda_mean': L_sg_sharpness,
+                                'reflectance_consistency': L_reflectance_consistency,
+                                'reflectance_edge_mean': L_reflectance_edge,
+                                'reflectance_edge_uplift_mean': L_reflectance_edge_uplift,
+                                'reflectance_contrast_mean': L_reflectance_contrast,
+                                'reflectance_highfreq_mean': L_reflectance_highfreq,
+                                'reflectance_highlight_mean': L_reflectance_highlight,
+                                'reflectance_detail_mean': L_reflectance_detail,
+                                'reflectance_decoder_mean': L_reflectance_decoder,
+                                'residual_enabled': float(residual_active),
+                                'residual_abs_mean': torch.abs(residual_image_for_loss).mean(),
+                                'residual_reg': L_residual_reg,
+                                'residual_chroma_mean': residual_chroma_mean,
+                                'enhancement_guidance_weight': enhancement_guidance_weight,
+                                'enhancement_color_mean': L_enhanced_color,
+                                'enhancement_color_std': L_enhanced_color_std,
+                                'enhancement_green_bias': L_enhanced_green_bias,
+                                'enhancement_illumination_guidance': L_diff_illumination,
+                                'enhancement_reflectance_guidance': L_diff_reflectance}
+                if dataset.use_dual_transient:
+                    residual_log.update({
+                        'residual_mix_weight': residual_mix_weight,
+                        'noise_mask_coverage': noise_mask_coverage,
+                        'artifact_mask_coverage': artifact_mask_coverage,
+                        'noise_abs_mean': noise_abs_mean,
+                        'artifact_abs_mean': artifact_abs_mean,
+                        'noise_zero_mean': L_noise_zero_mean,
+                        'noise_highfreq_mean': L_noise_highfreq,
+                        'artifact_chroma_mean': artifact_chroma_mean,
+                        'residual_chroma_boost': L_residual_chroma_boost,
+                    })
+                wandb.log(residual_log)
             if (iteration - 1) % 600 == 0:
                 gt_image = torch.clamp(gt_image * enhance_ratio, 0.0, 1.0)
                 image = torch.clamp(image_tmp * enhance_ratio, 0.0, 1.0)
@@ -693,16 +943,11 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 enhanced_image_pil = torchvision.transforms.ToPILImage()(enhanced_image)
                 
 
-                wandb.log({'loss':loss, 'iteration':iteration,
+                image_log = {'loss':loss, 'iteration':iteration,
                         'gt_image':wandb.Image(torchvision.transforms.ToPILImage()(gt_image)),
                         'image':wandb.Image(torchvision.transforms.ToPILImage()(image)),
                         'depth':wandb.Image(1-minmax_normalize(depth_image)),
                         'residual_image':wandb.Image(torchvision.transforms.ToPILImage()(residual_image_vis)),
-                        'noise_image':wandb.Image(torchvision.transforms.ToPILImage()(noise_image_vis)),
-                        'artifact_image':wandb.Image(torchvision.transforms.ToPILImage()(artifact_image_vis)),
-                        'residual_image_total':wandb.Image(torchvision.transforms.ToPILImage()(residual_image_vis)),
-                        'noise_image_raw':wandb.Image(torchvision.transforms.ToPILImage()(noise_image_raw)),
-                        'artifact_image_raw':wandb.Image(torchvision.transforms.ToPILImage()(artifact_image_raw)),
                         'residual_image_raw':wandb.Image(torchvision.transforms.ToPILImage()(residual_image_raw)),
                         'residual_abs_mean_raw': residual_abs.mean(),
                         'residual_abs_mean_used': residual_abs_used.mean(),
@@ -714,16 +959,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         'reflectance_detail_mean': L_reflectance_detail,
                         'reflectance_decoder_mean': L_reflectance_decoder,
                         'reflectance_highlight_mean': L_reflectance_highlight,
-                        'noise_mask_coverage': noise_mask_coverage,
-                        'artifact_mask_coverage': artifact_mask_coverage,
-                        'noise_abs_mean': noise_abs_mean,
-                        'artifact_abs_mean': artifact_abs_mean,
-                        'noise_zero_mean': L_noise_zero_mean,
-                        'noise_highfreq_mean': L_noise_highfreq,
-                        'artifact_chroma_mean': artifact_chroma_mean,
                         'residual_chroma_mean': residual_chroma_mean,
-                        'residual_mix_weight': residual_mix_weight,
-                        'residual_chroma_boost': L_residual_chroma_boost,
                         'enhancement_color_mean': L_enhanced_color,
                         'enhancement_color_std': L_enhanced_color_std,
                         'enhancement_green_bias': L_enhanced_green_bias,
@@ -735,8 +971,26 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         'clear_image':wandb.Image(enhanced_image_pil),
                         'illumination_enhanced':wandb.Image(torchvision.transforms.ToPILImage()(illumination_enhanced_image)),
                         'image_enhanced':wandb.Image(torchvision.transforms.ToPILImage()(illumination_enhanced_image * reflectance_image)),
-                        'refined_image':wandb.Image(torchvision.transforms.ToPILImage()(refined_image_dict[viewpoint_cam.uid].cuda())),
-                })
+                        'refined_image':wandb.Image(torchvision.transforms.ToPILImage()(get_refined_image(refined_image_dict, viewpoint_cam, gt_image).cuda())),
+                }
+                if dataset.use_dual_transient:
+                    image_log.update({
+                        'noise_image':wandb.Image(torchvision.transforms.ToPILImage()(noise_image_vis)),
+                        'artifact_image':wandb.Image(torchvision.transforms.ToPILImage()(artifact_image_vis)),
+                        'residual_image_total':wandb.Image(torchvision.transforms.ToPILImage()(residual_image_vis)),
+                        'noise_image_raw':wandb.Image(torchvision.transforms.ToPILImage()(noise_image_raw)),
+                        'artifact_image_raw':wandb.Image(torchvision.transforms.ToPILImage()(artifact_image_raw)),
+                        'noise_mask_coverage': noise_mask_coverage,
+                        'artifact_mask_coverage': artifact_mask_coverage,
+                        'noise_abs_mean': noise_abs_mean,
+                        'artifact_abs_mean': artifact_abs_mean,
+                        'noise_zero_mean': L_noise_zero_mean,
+                        'noise_highfreq_mean': L_noise_highfreq,
+                        'artifact_chroma_mean': artifact_chroma_mean,
+                        'residual_mix_weight': residual_mix_weight,
+                        'residual_chroma_boost': L_residual_chroma_boost,
+                    })
+                wandb.log(image_log)
 
             # debug
             if iteration % 600 == 0:
@@ -747,11 +1001,6 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 print("residual_image_raw_mean", residual_image_raw.mean())
                 print("residual_abs_mean_raw", residual_abs.mean())
                 print("residual_abs_mean_used", residual_abs_used.mean())
-                print("noise_abs_mean", noise_abs_mean)
-                print("artifact_abs_mean", artifact_abs_mean)
-                print("noise_zero_mean", L_noise_zero_mean)
-                print("noise_highfreq_mean", L_noise_highfreq)
-                print("artifact_chroma_mean", artifact_chroma_mean)
                 print("reflectance_edge_mean", L_reflectance_edge)
                 print("reflectance_edge_uplift_mean", L_reflectance_edge_uplift)
                 print("reflectance_contrast_mean", L_reflectance_contrast)
@@ -760,10 +1009,16 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 print("reflectance_decoder_mean", L_reflectance_decoder)
                 print("reflectance_highlight_mean", L_reflectance_highlight)
                 print("residual_chroma_mean", residual_chroma_mean)
-                print("residual_mix_weight", residual_mix_weight)
-                print("noise_mask_coverage", noise_mask_coverage)
-                print("artifact_mask_coverage", artifact_mask_coverage)
-                print("residual_chroma_boost", L_residual_chroma_boost)
+                if dataset.use_dual_transient:
+                    print("noise_abs_mean", noise_abs_mean)
+                    print("artifact_abs_mean", artifact_abs_mean)
+                    print("noise_zero_mean", L_noise_zero_mean)
+                    print("noise_highfreq_mean", L_noise_highfreq)
+                    print("artifact_chroma_mean", artifact_chroma_mean)
+                    print("residual_mix_weight", residual_mix_weight)
+                    print("noise_mask_coverage", noise_mask_coverage)
+                    print("artifact_mask_coverage", artifact_mask_coverage)
+                    print("residual_chroma_boost", L_residual_chroma_boost)
                 print("enhancement_color_mean", L_enhanced_color)
                 print("enhancement_color_std", L_enhanced_color_std)
                 print("enhancement_green_bias", L_enhanced_green_bias)
