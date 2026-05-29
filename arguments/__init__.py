@@ -124,6 +124,8 @@ class ModelParams(ParamGroup):
         self.cidnet_color_reg = 0.2
         self.cidnet_param_reg = 0.1
         self.cidnet_mv_reg = 0.5
+        self.cidnet_gamma_init = 1.6
+        self.cidnet_alpha_init = 1.6
         self.cidnet_force_refresh = False
         self.residual_hardmask_percentile = 0.8
         self.residual_higherror_percentile = 0.8
@@ -283,6 +285,8 @@ def _backfill_model_compatibility(merged_dict):
         "cidnet_color_reg": 0.2,
         "cidnet_param_reg": 0.1,
         "cidnet_mv_reg": 0.5,
+        "cidnet_gamma_init": 1.6,
+        "cidnet_alpha_init": 1.6,
         "cidnet_force_refresh": False,
         "b0_lr": 0.001,
         "reflectance_offset_lr": 0.008,

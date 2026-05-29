@@ -14,8 +14,11 @@ from tqdm import tqdm
 
 
 class GammaAlphaMLP(nn.Module):
-    def __init__(self, in_dim=18, hidden_dim=32):
+    def __init__(self, in_dim=18, hidden_dim=32, gamma_init=1.6, alpha_init=1.6, radius=0.2):
         super().__init__()
+        self.gamma_init = float(gamma_init)
+        self.alpha_init = float(alpha_init)
+        self.radius = float(radius)
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
             nn.ReLU(inplace=True),
@@ -28,16 +31,18 @@ class GammaAlphaMLP(nn.Module):
     def _init_output_bias(self):
         final = self.net[-1]
         nn.init.zeros_(final.weight)
-        gamma_sigmoid = (1.6 - 1.4) / 0.4
-        alpha_sigmoid = (1.6 - 1.4) / 0.4
+        gamma_sigmoid = 0.5
+        alpha_sigmoid = 0.5
         with torch.no_grad():
             final.bias[0] = math.log(gamma_sigmoid / (1.0 - gamma_sigmoid))
             final.bias[1] = math.log(alpha_sigmoid / (1.0 - alpha_sigmoid))
 
     def forward(self, features):
         raw = self.net(features)
-        gamma = 1.4 + 0.4 * torch.sigmoid(raw[:, 0])
-        alpha = 1.4 + 0.4 * torch.sigmoid(raw[:, 1])
+        gamma_min = self.gamma_init - self.radius
+        alpha_min = self.alpha_init - self.radius
+        gamma = gamma_min + 2.0 * self.radius * torch.sigmoid(raw[:, 0])
+        alpha = alpha_min + 2.0 * self.radius * torch.sigmoid(raw[:, 1])
         return gamma, alpha
 
 
@@ -165,6 +170,9 @@ def main():
     parser.add_argument("--color_reg", type=float, default=0.2)
     parser.add_argument("--param_reg", type=float, default=0.1)
     parser.add_argument("--mv_reg", type=float, default=0.5)
+    parser.add_argument("--gamma_init", type=float, default=1.6)
+    parser.add_argument("--alpha_init", type=float, default=1.6)
+    parser.add_argument("--param_radius", type=float, default=0.2)
     parser.add_argument("--lr", type=float, default=1e-3)
     args = parser.parse_args()
 
@@ -196,7 +204,11 @@ def main():
     for param in model.parameters():
         param.requires_grad_(False)
 
-    controller = GammaAlphaMLP().to(device)
+    controller = GammaAlphaMLP(
+        gamma_init=args.gamma_init,
+        alpha_init=args.alpha_init,
+        radius=args.param_radius,
+    ).to(device)
     if controller_path.exists():
         controller.load_state_dict(torch.load(controller_path, map_location=device))
 
@@ -249,7 +261,7 @@ def main():
             gamma_var = torch.mean(torch.abs(gamma_all - gamma_all.mean()))
             alpha_var = torch.mean(torch.abs(alpha_all - alpha_all.mean()))
             mv_loss = gamma_var + alpha_var
-            param_loss = torch.mean((gamma_all - 1.6) ** 2 + (alpha_all - 1.6) ** 2)
+            param_loss = torch.mean((gamma_all - args.gamma_init) ** 2 + (alpha_all - args.alpha_init) ** 2)
             regularizer_loss = args.mv_reg * mv_loss + args.param_reg * param_loss
             regularizer_loss.backward()
             optimizer.step()
@@ -258,6 +270,13 @@ def main():
     params = {"round": int(output_round.name.split("_")[-1]), "images": {}}
     stats = {
         "target_exposure": args.target_exposure,
+        "gamma_init": args.gamma_init,
+        "alpha_init": args.alpha_init,
+        "param_radius": args.param_radius,
+        "gamma_min": args.gamma_init - args.param_radius,
+        "gamma_max": args.gamma_init + args.param_radius,
+        "alpha_min": args.alpha_init - args.param_radius,
+        "alpha_max": args.alpha_init + args.param_radius,
         "mean_exposure": 0.0,
         "mean_color_bias": 0.0,
         "mean_refresh_l1": 0.0,
@@ -307,8 +326,12 @@ def main():
     stats["mean_exposure"] = float(sum(exposures) / max(1, len(exposures)))
     stats["mean_color_bias"] = float(sum(color_biases) / max(1, len(color_biases)))
     stats["mean_refresh_l1"] = float(sum(refresh_l1s) / max(1, len(refresh_l1s)))
-    stats["gamma_boundary_ratio"] = float(((gamma_values <= 1.41) | (gamma_values >= 1.79)).float().mean().item())
-    stats["alpha_boundary_ratio"] = float(((alpha_values <= 1.41) | (alpha_values >= 1.79)).float().mean().item())
+    gamma_low = args.gamma_init - args.param_radius + 0.01
+    gamma_high = args.gamma_init + args.param_radius - 0.01
+    alpha_low = args.alpha_init - args.param_radius + 0.01
+    alpha_high = args.alpha_init + args.param_radius - 0.01
+    stats["gamma_boundary_ratio"] = float(((gamma_values <= gamma_low) | (gamma_values >= gamma_high)).float().mean().item())
+    stats["alpha_boundary_ratio"] = float(((alpha_values <= alpha_low) | (alpha_values >= alpha_high)).float().mean().item())
     stats["gamma"] = tensor_stats(gamma_values)
     stats["alpha"] = tensor_stats(alpha_values)
     if gamma_deltas:

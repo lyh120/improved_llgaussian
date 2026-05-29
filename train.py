@@ -422,6 +422,10 @@ def refresh_cidnet_prior(dataset, prior_root, manifest_path, images_dir, round_i
         str(dataset.cidnet_param_reg),
         "--mv_reg",
         str(dataset.cidnet_mv_reg),
+        "--gamma_init",
+        str(dataset.cidnet_gamma_init),
+        "--alpha_init",
+        str(dataset.cidnet_alpha_init),
     ]
     if previous_round_dir:
         cmd.extend(["--previous_round", previous_round_dir])
@@ -577,6 +581,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             and dataset.enhancement_prior == "cidnet"
             and dataset.cidnet_refresh_interval > 0
             and iteration >= opt.update_from
+            and iteration < opt.update_until
             and iteration - last_cidnet_refresh_iter >= dataset.cidnet_refresh_interval
         ):
             previous_round_dir = cidnet_round_dir
