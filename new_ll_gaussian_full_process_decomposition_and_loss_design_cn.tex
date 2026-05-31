@@ -1,0 +1,842 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{ctex}
+
+\title{LL-Gaussian New Full-Process Decomposition and Loss Design}
+\author{LL-Gaussian New Structure Notes}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+本文档用于整理下一版 LL-Gaussian 的全过程结构设计。它沿用当前项目中
+``反射率--光照--瞬时残差--增强光照'' 的低光分解思路，但将主路径重新整理为
+\textbf{B0 + offset detail + reflectance decoder} 的反射率表达、
+\textbf{SG low-light illumination} 的低光光照表达、
+\textbf{SG enhanced illumination} 的增强光照表达，以及
+\textbf{single-head residual} 的瞬时误差吸收表达。
+
+本文尤其明确一点：新结构中 residual 保持单头即可，不再把 residual 拆成
+noise head 和 artifact head。Residual 的职责是局部、延迟、受 mask 约束地吸收
+$R \odot L$ 主分解无法解释的瞬时误差，而不是成为第二套图像生成分支。
+\end{abstract}
+
+\section{Design Goal}
+
+新结构的核心目标是让低光重建和增强结果具备更清晰的分工：
+\begin{itemize}[leftmargin=1.5em]
+    \item $R$ 负责稳定材质颜色、纹理、边缘和局部结构；
+    \item $L$ 负责当前低光观测下的视角相关光照变化；
+    \item $L^{\text{enh}}$ 负责把同一反射率重光照到增强状态；
+    \item $E$ 作为单头 residual，只负责局部困难区域的瞬时补偿；
+    \item 最终增强结果默认不引入 residual，避免噪声吸收分支污染正式增强输出。
+\end{itemize}
+
+给定一张低光观测图像 $I$，训练期主重建写为
+\begin{equation}
+    I^{\text{rec}}
+    =
+    \mathrm{clip}
+    \left(
+        R \odot L + E_{\text{used}},
+        0, 1
+    \right),
+\end{equation}
+其中
+\begin{equation}
+    E_{\text{used}} = w_{\text{res}}(t) \, M_{\text{res}} \odot E.
+\end{equation}
+
+增强结果写为
+\begin{equation}
+    I^{\text{enh}} = \mathrm{clip}\left(R \odot L^{\text{enh}}, 0, 1\right).
+\end{equation}
+
+因此，主路线可以概括为
+\begin{equation}
+    \boxed{
+    I \approx R \odot L + w_{\text{res}} M_{\text{res}} \odot E,
+    \qquad
+    I^{\text{enh}} \approx R \odot L^{\text{enh}}
+    }
+\end{equation}
+
+\section{Full Process Overview}
+
+新结构的完整流程分为七个阶段：
+\begin{enumerate}[leftmargin=1.8em]
+    \item 数据读取与相机、点云、depth prior 初始化；
+    \item Gaussian anchor 与 offset 表达初始化；
+    \item 反射率 $R$、低光光照 $L$、增强光照 $L^{\text{enh}}$、单头 residual $E$ 的网络参数初始化；
+    \item 每次迭代根据当前相机执行 differentiable splatting，得到多张渲染图；
+    \item 根据训练阶段组合 reconstruction、SG、reflectance、enhancement、residual、geometry 等损失；
+    \item 按 warmup、normal、residual ramp、enhancement guidance 等时间调度逐步开放分支；
+    \item 训练结束后渲染 train/test/interp，并分别输出低光重建、增强结果、诊断图和指标。
+\end{enumerate}
+
+\section{Scene Representation}
+
+\subsection{Anchor and Offset}
+
+场景仍由 Gaussian anchors 和局部 offsets 表达。第 $i$ 个 anchor 具有：
+\begin{itemize}[leftmargin=1.5em]
+    \item anchor position $\mathbf{x}_i$；
+    \item anchor feature $\mathbf{f}_i$；
+    \item $K$ 个 offset $\mathbf{o}_{i,k}$；
+    \item opacity、scaling、rotation 等 Gaussian 参数；
+    \item 反射率底色 $B_i^0$；
+    \item offset 级反射率 detail $\Delta^R_{i,k}$；
+    \item 增强光照 SG 参数；
+    \item 可选 residual 相关 feature、offset、scaling 参数。
+\end{itemize}
+
+一次渲染中，只有当前视角可见且通过 opacity/filter 选择的 anchor-offset 会参与 rasterization。
+因此本文中的 $R$、$L$、$L^{\text{enh}}$、$E$ 都先在 offset 级生成，再通过 splatting 投影到图像空间。
+
+\subsection{Initialization}
+
+初始化建议保持当前代码中的三层策略：
+\begin{itemize}[leftmargin=1.5em]
+    \item anchor 和 offset 来自输入点云；
+    \item $B^0$ 使用第一帧或代表帧做 Retinex 风格初始化；
+    \item offset detail 初始化为零，让初始反射率主要由 $B^0$ 控制；
+    \item reflectance decoder 初始化为接近零修正；
+    \item SG illumination 和 enhanced SG illumination 初始化为稳定、低能量、不过尖锐的状态；
+    \item residual 初始化为接近零输出，且训练早期不参与主重建。
+\end{itemize}
+
+\section{Reflectance Branch}
+
+\subsection{Three-Level Reflectance}
+
+新结构保留当前较有效的三层反射率设计。
+
+\paragraph{(1) Anchor-level base reflectance.}
+每个 anchor 学习一个三通道对数反射率：
+\begin{equation}
+    B_i^0 \in \mathbb{R}^3,
+    \qquad
+    R_i^{\text{base}} = \exp(B_i^0).
+\end{equation}
+
+$B^0$ 负责材质底色和低频颜色稳定性，不期望吸收明显高光、噪声或局部曝光异常。
+
+\paragraph{(2) Offset-level log-detail.}
+每个 offset 学习一个有界 detail：
+\begin{equation}
+    \Delta^R_{i,k} \in \mathbb{R}^3.
+\end{equation}
+
+在 log-reflectance 空间中加入 detail：
+\begin{equation}
+    R_{i,k}^{\text{detail}}
+    =
+    \exp\left(
+        B_i^0 + s_R \tanh(\Delta^R_{i,k})
+    \right),
+\end{equation}
+其中 $s_R$ 是 detail scale。该分支用于恢复局部纹理、边缘和小尺度材质变化。
+
+\paragraph{(3) View-independent decoder refinement.}
+在 $B^0 + \Delta^R$ 之后，使用一个不接 view direction 的轻量 decoder 做局部微调：
+\begin{equation}
+    D^R_{i,k}
+    =
+    f_{\theta_R}\left(\mathbf{f}_i, \mathbf{o}_{i,k}\right).
+\end{equation}
+
+最终 offset 级反射率写为
+\begin{equation}
+    R_{i,k}
+    =
+    \mathrm{clip}
+    \left(
+        R_{i,k}^{\text{detail}}
+        \odot
+        \left(1 + \gamma_R \tanh(D^R_{i,k})\right),
+        \epsilon_R,
+        1
+    \right).
+\end{equation}
+
+这里 decoder 只作为局部 refine，不应替代 $B^0$ 和 offset detail 成为自由颜色生成器。
+
+\subsection{Reflectance Responsibility}
+
+反射率分支的职责边界如下：
+\begin{itemize}[leftmargin=1.5em]
+    \item 允许学习物体固有颜色、纹理、边缘、可重复出现的细节；
+    \item 不应学习视角相关照明；
+    \item 不应吸收随机噪声；
+    \item 不应吸收只在少量视角出现的彩色高光或曝光异常；
+    \item 不应为了匹配增强伪 GT 而被长期拉平。
+\end{itemize}
+
+\section{Low-Light Illumination Branch}
+
+\subsection{SG Illumination}
+
+低光光照使用 spherical Gaussian 表达。对每个 offset，SG branch 输出 $M$ 个 lobes：
+\begin{equation}
+    \left\{
+        \left(
+            \bm{\mu}_{i,k,m},
+            \lambda_{i,k,m},
+            \mathbf{a}_{i,k,m}
+        \right)
+    \right\}_{m=1}^{M}.
+\end{equation}
+
+其中：
+\begin{itemize}[leftmargin=1.5em]
+    \item $\bm{\mu}_{i,k,m}$ 为单位方向；
+    \item $\lambda_{i,k,m}$ 为 sharpness；
+    \item $\mathbf{a}_{i,k,m}$ 为 RGB amplitude；
+    \item 当前视角方向记为 $\mathbf{v}_{i}$。
+\end{itemize}
+
+低光光照为
+\begin{equation}
+    L_{i,k}
+    =
+    \frac{1}{M}
+    \sum_{m=1}^{M}
+    \mathbf{a}_{i,k,m}
+    \exp
+    \left(
+        \lambda_{i,k,m}
+        \left(
+            \bm{\mu}_{i,k,m}^{\top}\mathbf{v}_{i} - 1
+        \right)
+    \right).
+\end{equation}
+
+\subsection{Illumination Responsibility}
+
+$L$ 只解释当前低光图像中的光照和曝光状态：
+\begin{itemize}[leftmargin=1.5em]
+    \item 允许随视角和局部几何变化；
+    \item 允许表达低光照明不均、暗角、方向性照明；
+    \item 不应承担纹理锐化的主要职责；
+    \item 不应把材质颜色完整吸收进去；
+    \item 不应为了重建误差而退化成高频彩色贴图。
+\end{itemize}
+
+\section{Enhanced Illumination Branch}
+
+\subsection{Enhanced SG}
+
+增强分支仍坚持 ``同一反射率，不同光照'' 的重光照原则。增强光照记为
+\begin{equation}
+    L^{\text{enh}}_{i,k}.
+\end{equation}
+
+建议使用 anchor/offset 级增强 SG 参数与轻量上下文特征共同生成增强光照：
+\begin{equation}
+    L^{\text{enh}}_{i,k}
+    =
+    h_{\theta_E}
+    \left(
+        \mathrm{stopgrad}(\mathbf{f}_i),
+        \mathrm{stopgrad}(\phi^L_{i,k}),
+        \Theta^{\text{enh-sg}}_{i,k}
+    \right),
+\end{equation}
+其中 $\phi^L_{i,k}$ 是低光 illumination branch 的中间特征，$\Theta^{\text{enh-sg}}$ 是增强 SG 参数。
+
+增强图像为
+\begin{equation}
+    I^{\text{enh}} = R \odot L^{\text{enh}}.
+\end{equation}
+
+\subsection{Enhanced Branch Responsibility}
+
+增强分支的职责是：
+\begin{itemize}[leftmargin=1.5em]
+    \item 提升全局与局部亮度；
+    \item 保持颜色自然，避免绿色偏色和通道漂移；
+    \item 尽量不改变 $R$ 中的材质身份；
+    \item 不依赖 residual 输出正式增强结果；
+    \item 只通过有限的 pseudo target guidance 获得增强方向，而不是完全复制伪 GT。
+\end{itemize}
+
+\section{Single-Head Residual Branch}
+
+\subsection{Why Single Head}
+
+新结构中 residual 明确保持单头：
+\begin{equation}
+    E_{i,k} = r_{\theta_E}\left(\mathbf{f}_i, \mathbf{o}_{i,k}, \psi_{i,k}\right),
+\end{equation}
+其中 $\psi_{i,k}$ 包含 view direction、distance、appearance embedding 等当前 residual 输入特征。
+
+不再引入 noise head 和 artifact head 的原因是：
+\begin{itemize}[leftmargin=1.5em]
+    \item 当前主问题不是 residual 类型不够细，而是 residual 和 $R/L$ 的职责边界要更稳；
+    \item 单头 residual 更容易调度、可视化和正则；
+    \item 单头可以避免两个 residual head 之间互相补偿、互相逃逸；
+    \item 单头与当前最终渲染 ``默认不带 residual'' 的策略更一致。
+\end{itemize}
+
+\subsection{Single-Head Residual Equation}
+
+单头 residual 的训练期使用形式为
+\begin{equation}
+    E_{\text{used}}
+    =
+    w_{\text{res}}(t)
+    M_{\text{res}}
+    \odot
+    E.
+\end{equation}
+
+其中：
+\begin{itemize}[leftmargin=1.5em]
+    \item $E$ 是 residual net 的原始输出；
+    \item $M_{\text{res}}$ 是 residual hard mask；
+    \item $w_{\text{res}}(t)$ 是 residual ramp 权重；
+    \item residual 未启用时 $E_{\text{used}}=0$。
+\end{itemize}
+
+推荐 residual 输出使用有界激活，例如 $\tanh$：
+\begin{equation}
+    E = \eta_E \tanh(\hat{E}),
+\end{equation}
+其中 $\eta_E$ 控制最大补偿幅度。若沿用当前代码的 sigmoid 单头兼容路径，也需要通过正则和 ramp 防止其成为全局正向补光器。
+
+\subsection{Residual Mask}
+
+单头 residual mask 建议由两类困难区域合成：
+\begin{equation}
+    M_{\text{res}} = M_{\text{err}} \cup M_{\text{highlight}}.
+\end{equation}
+
+其中：
+\begin{align}
+    M_{\text{err}}
+    &=
+    \mathrm{TopK}
+    \left(
+        \left\|I - \mathrm{stopgrad}(R \odot L)\right\|_1,
+        p_{\text{err}}
+    \right), \\
+    M_{\text{highlight}}
+    &=
+    \mathrm{TopK}
+    \left(
+        S_{\text{chroma-highlight}}(I, R),
+        p_{\text{hl}}
+    \right).
+\end{align}
+
+这样 residual 主要在高重建误差区域、彩色高光或局部异常区域工作，不参与整图低频拟合。
+
+\subsection{Residual Scheduling}
+
+Residual 不应从训练一开始参与主重建。建议使用：
+\begin{equation}
+    w_{\text{res}}(t)
+    =
+    \begin{cases}
+        0, & t < t_{\text{start}}, \\
+        \min\left(1, \frac{t - t_{\text{start}} + 1}{T_{\text{ramp}}}\right), & t \ge t_{\text{start}}.
+    \end{cases}
+\end{equation}
+
+其中 $t_{\text{start}}$ 控制 residual 开启时间，$T_{\text{ramp}}$ 控制线性爬坡长度。该调度保证 $R \odot L$ 先承担主体结构，然后 residual 再处理局部困难误差。
+
+\section{Rendering Equations}
+
+\subsection{Training Render}
+
+训练期对当前视角得到：
+\begin{align}
+    I^{\text{base}} &= R \odot L, \\
+    I^{\text{rec}}  &= \mathrm{clip}\left(I^{\text{base}} + w_{\text{res}} M_{\text{res}} \odot E, 0, 1\right), \\
+    I^{\text{enh}}  &= \mathrm{clip}\left(R \odot L^{\text{enh}}, 0, 1\right).
+\end{align}
+
+其中 $I^{\text{rec}}$ 用于低光监督，$I^{\text{enh}}$ 用于增强监督和指标。
+
+\subsection{Final Render}
+
+最终常规低光渲染建议输出：
+\begin{equation}
+    I^{\text{render}} = R \odot L.
+\end{equation}
+
+最终增强渲染建议输出：
+\begin{equation}
+    I^{\text{render-enh}} = R \odot L^{\text{enh}}.
+\end{equation}
+
+Residual 默认不参与最终输出。若需要诊断 residual，可额外导出：
+\begin{equation}
+    I^{\text{diagnostic-res}} = E,
+    \qquad
+    I^{\text{diagnostic-used}} = w_{\text{res}}M_{\text{res}}\odot E.
+\end{equation}
+
+\section{Loss Design}
+
+\subsection{Main Reconstruction Loss}
+
+主重建监督使用 $I^{\text{rec}}$ 对齐低光 GT $I$：
+\begin{equation}
+    \mathcal{L}_{\text{rec}}
+    =
+    (1-\lambda_{\text{ssim}})
+    \mathcal{L}_{1+}
+    \left(
+        I^{\text{rec}}, I
+    \right)
+    +
+    \lambda_{\text{ssim}}
+    \left(
+        1 - \mathrm{SSIM}(I^{\text{rec}}, I)
+    \right).
+\end{equation}
+
+其中 $\mathcal{L}_{1+}$ 是亮度加权 L1，用于强化暗区误差：
+\begin{equation}
+    \mathcal{L}_{1+}
+    =
+    \left|
+        \frac{
+            I^{\text{rec}} - I
+        }{
+            \alpha \, \mathrm{stopgrad}(I^{\text{rec}}) + \phi
+        }
+    \right|.
+\end{equation}
+
+\subsection{Illumination and Geometry Loss}
+
+低光 illumination 仍使用像素约束和平滑约束：
+\begin{equation}
+    \mathcal{L}_{L}
+    =
+    \lambda_{\text{illu}}
+    \mathcal{L}_{\text{illu}}(I, L)
+    +
+    \lambda_{\text{smooth}}
+    \mathcal{L}_{\text{smooth}}(L, I).
+\end{equation}
+
+几何部分保留 scaling 和 depth prior：
+\begin{equation}
+    \mathcal{L}_{\text{geo}}
+    =
+    \lambda_{\text{scale}}
+    \mathcal{L}_{\text{scale}}
+    +
+    \lambda_{\text{depth}}
+    \mathcal{L}_{\text{depth}}.
+\end{equation}
+
+\subsection{SG Regularization}
+
+SG illumination 需要限制能量和 sharpness：
+\begin{equation}
+    \mathcal{L}_{\text{sg}}
+    =
+    \lambda_{\text{sg-energy}}
+    \mathcal{L}_{\text{sg-energy}}
+    +
+    \lambda_{\text{sg-sharp}}
+    \mathcal{L}_{\text{sg-sharp}}.
+\end{equation}
+
+该项避免 SG 变成极尖、极不稳定的方向性贴图，同时维持低光照明的可解释性。
+
+\subsection{Reflectance Loss}
+
+反射率损失分为稳定、结构、异常抑制和参数幅度四类：
+\begin{align}
+    \mathcal{L}_{R}
+    ={}&
+    \lambda_{\text{cons}}
+    \mathcal{L}_{\text{cons}}(R)
+    +
+    \lambda_{\text{smooth-R}}
+    \mathcal{L}_{\text{smooth-R}}(R, L)
+    \nonumber \\
+    &+
+    \lambda_{\text{edge}}
+    \mathcal{L}_{\text{edge}}(R, I)
+    +
+    \lambda_{\text{edge-up}}
+    \mathcal{L}_{\text{edge-up}}(R, I)
+    \nonumber \\
+    &+
+    \lambda_{\text{contrast}}
+    \mathcal{L}_{\text{contrast}}(R, I)
+    +
+    \lambda_{\text{hf}}
+    \mathcal{L}_{\text{hf}}(R, I)
+    \nonumber \\
+    &+
+    \lambda_{\text{highlight}}
+    \mathcal{L}_{\text{highlight}}(R)
+    +
+    \lambda_{\text{detail}}
+    \mathcal{L}_{\text{detail}}
+    +
+    \lambda_{\text{decoder}}
+    \mathcal{L}_{\text{decoder}}
+    +
+    \lambda_{\text{B0}}
+    \mathcal{L}_{\text{B0-3D}}.
+\end{align}
+
+各项职责为：
+\begin{itemize}[leftmargin=1.5em]
+    \item $\mathcal{L}_{\text{cons}}$：抑制反射率中的随机噪声；
+    \item $\mathcal{L}_{\text{smooth-R}}$：在 illumination 权重下做轻量平滑；
+    \item $\mathcal{L}_{\text{edge}}$：让 $R$ 的结构边缘对齐输入图像结构；
+    \item $\mathcal{L}_{\text{edge-up}}$：只惩罚 $R$ 边缘弱于目标结构的位置；
+    \item $\mathcal{L}_{\text{contrast}}$：鼓励局部灰度对比；
+    \item $\mathcal{L}_{\text{hf}}$：鼓励 Laplacian 高频结构；
+    \item $\mathcal{L}_{\text{highlight}}$：抑制反射率吸收彩色亮斑；
+    \item $\mathcal{L}_{\text{detail}}$：约束 offset detail 幅度；
+    \item $\mathcal{L}_{\text{decoder}}$：约束 decoder refinement 幅度；
+    \item $\mathcal{L}_{\text{B0-3D}}$：约束 3D 邻近 anchors 的底色平滑。
+\end{itemize}
+
+\subsection{Single-Head Residual Loss}
+
+单头 residual 的损失建议写为：
+\begin{align}
+    \mathcal{L}_{\text{res}}
+    ={}&
+    \lambda_{\text{res-sparse}}
+    \mathbb{E}
+    \left[
+        \left|M_{\text{res}}\odot E\right|
+    \right]
+    +
+    \lambda_{\text{res-scale}}
+    \mathcal{L}_{\text{scale-res}}
+    \nonumber \\
+    &+
+    \lambda_{\text{res-zero}}
+    \left\|
+        \mathrm{mean}(M_{\text{res}}\odot E)
+    \right\|_1
+    +
+    \lambda_{\text{res-chroma}}
+    \mathcal{L}_{\text{res-chroma}}(E, R).
+\end{align}
+
+其中：
+\begin{itemize}[leftmargin=1.5em]
+    \item sparse 项限制 residual 总幅度；
+    \item scale 项限制 residual Gaussian 的体积；
+    \item zero-mean 项防止 residual 变成全局补光；
+    \item chroma 项只作为轻量引导，把局部彩色异常从 $R$ 中迁移出来；
+    \item 不再区分 noise sparse、artifact sparse、noise high-frequency 等双头专属项。
+\end{itemize}
+
+如果训练中发现 residual 过度接管重建，应优先调整：
+\begin{itemize}[leftmargin=1.5em]
+    \item 推迟 $t_{\text{start}}$；
+    \item 拉长 $T_{\text{ramp}}$；
+    \item 提高 $\lambda_{\text{res-sparse}}$；
+    \item 降低 mask 覆盖率；
+    \item 降低 residual 输出幅度 $\eta_E$。
+\end{itemize}
+
+\subsection{Enhancement Loss}
+
+增强监督由亮度提升、平滑、颜色统计和 refined target guidance 组成。
+
+\paragraph{(1) Brightness degree.}
+\begin{equation}
+    \mathcal{L}_{\text{degree}}
+    =
+    \lambda_{\text{local}}
+    \mathcal{L}_{\text{degree-local}}
+    +
+    \lambda_{\text{global}}
+    \mathcal{L}_{\text{degree-global}}.
+\end{equation}
+
+\paragraph{(2) Enhanced smoothness.}
+\begin{equation}
+    \mathcal{L}_{\text{enh-smooth}}
+    =
+    \mathcal{L}_{\text{smooth}}
+    \left(
+        \frac{L^{\text{enh}}}{\rho},
+        I
+    \right),
+\end{equation}
+其中 $\rho$ 是增强倍率或局部亮度参考。
+
+\paragraph{(3) Color statistic alignment.}
+对增强结果 $I^{\text{enh}}$ 和 refined target $\hat{I}$ 施加弱颜色统计约束：
+\begin{align}
+    \mathcal{L}_{\text{color-mean}}
+    &=
+    \left\|
+        \mu(I^{\text{enh}}) - \mu(\hat{I})
+    \right\|_1, \\
+    \mathcal{L}_{\text{color-std}}
+    &=
+    \left\|
+        \sigma(I^{\text{enh}}) - \sigma(\hat{I})
+    \right\|_1.
+\end{align}
+
+\paragraph{(4) Green bias penalty.}
+\begin{equation}
+    \mathcal{L}_{\text{green}}
+    =
+    \mathbb{E}
+    \left[
+        \max
+        \left(
+            0,
+            I^{\text{enh}}_G
+            -
+            \frac{I^{\text{enh}}_R + I^{\text{enh}}_B}{2}
+            -
+            \tau_G
+        \right)
+    \right].
+\end{equation}
+
+\paragraph{(5) Refined target guidance.}
+在指定迭代之后加入 refined target guidance：
+\begin{align}
+    \mathcal{L}_{\text{diff-illu}}
+    &=
+    \left\|
+        L^{\text{enh}} \odot \mathrm{stopgrad}(R)
+        -
+        \hat{I}
+    \right\|_1, \\
+    \mathcal{L}_{\text{diff-refl}}
+    &=
+    \left\|
+        \mathrm{stopgrad}(L^{\text{enh}}) \odot R
+        -
+        \hat{I}
+    \right\|_1.
+\end{align}
+
+总 guidance 为
+\begin{equation}
+    \mathcal{L}_{\text{diff}}
+    =
+    w_{\text{diff}}(t)
+    \left(
+        \mathcal{L}_{\text{diff-illu}}
+        +
+        \lambda_{\text{diff-R}}
+        \mathcal{L}_{\text{diff-refl}}
+    \right).
+\end{equation}
+
+其中 $\lambda_{\text{diff-R}}$ 应保持较小，避免伪 GT 长期把 $R$ 拉平；$w_{\text{diff}}(t)$ 可随训练进度衰减。
+
+\section{Training Schedule}
+
+\subsection{Warmup Stage}
+
+Warmup 阶段目标是先稳定 $R \odot L$：
+\begin{itemize}[leftmargin=1.5em]
+    \item 使用主重建、illumination、geometry、轻量 reflectance 结构项；
+    \item 不启用 residual；
+    \item 不启用强 refined target guidance；
+    \item 不让增强分支主导整体优化。
+\end{itemize}
+
+Warmup 总损失可写为
+\begin{equation}
+    \mathcal{L}_{\text{warmup}}
+    =
+    \mathcal{L}_{\text{rec}}
+    +
+    \mathcal{L}_{L}
+    +
+    \mathcal{L}_{\text{geo}}
+    +
+    \mathcal{L}_{R}.
+\end{equation}
+
+\subsection{Normal Stage Before Residual}
+
+进入 normal 训练后，但 residual 尚未开启时：
+\begin{equation}
+    I^{\text{rec}} = R \odot L.
+\end{equation}
+
+该阶段继续强化 $R$ 的结构清晰度和 $L$ 的光照解释，并逐步引入 SG regularization 与 enhancement loss。
+
+\subsection{Residual Ramp Stage}
+
+当 $t \ge t_{\text{start}}$ 后，启用单头 residual：
+\begin{equation}
+    I^{\text{rec}} = R \odot L + w_{\text{res}}(t)M_{\text{res}}\odot E.
+\end{equation}
+
+该阶段重点监控：
+\begin{itemize}[leftmargin=1.5em]
+    \item residual mix weight；
+    \item residual mask coverage；
+    \item residual abs mean；
+    \item residual chroma mean；
+    \item reflectance highfreq、edge uplift 和 decoder mean。
+\end{itemize}
+
+\subsection{Enhancement Guidance Stage}
+
+当 refined target 可用且迭代达到指定阈值后，加入 $\mathcal{L}_{\text{diff}}$。该 guidance 应更偏向训练 $L^{\text{enh}}$，而不是直接强拉 $R$：
+\begin{equation}
+    \lambda_{\text{diff-R}} \ll 1.
+\end{equation}
+
+\subsection{Total Objective}
+
+完整目标函数为
+\begin{align}
+    \mathcal{L}_{\text{total}}
+    ={}&
+    \mathcal{L}_{\text{rec}}
+    +
+    \mathcal{L}_{L}
+    +
+    \mathcal{L}_{\text{geo}}
+    +
+    \mathcal{L}_{\text{sg}}
+    +
+    \mathcal{L}_{R}
+    \nonumber \\
+    &+
+    \mathcal{L}_{\text{res}}
+    +
+    \mathcal{L}_{\text{degree}}
+    +
+    \lambda_{\text{enh-smooth}}
+    \mathcal{L}_{\text{enh-smooth}}
+    +
+    \mathcal{L}_{\text{diff}}
+    \nonumber \\
+    &+
+    \lambda_{\text{mean}}
+    \mathcal{L}_{\text{color-mean}}
+    +
+    \lambda_{\text{std}}
+    \mathcal{L}_{\text{color-std}}
+    +
+    \lambda_{\text{green}}
+    \mathcal{L}_{\text{green}}.
+\end{align}
+
+\section{Logging and Diagnostics}
+
+建议保留以下日志项：
+\begin{itemize}[leftmargin=1.5em]
+    \item reconstruction：loss、Ll1、SSIM、PSNR；
+    \item illumination：illumination mean、SG energy、SG lambda mean；
+    \item reflectance：edge、edge uplift、contrast、highfreq、highlight、detail、decoder；
+    \item residual：residual enabled、mix weight、mask coverage、abs mean、raw image、used image；
+    \item enhancement：degree local/global、color mean/std、green bias、diff illumination、diff reflectance；
+    \item geometry：depth similarity、scaling regularization、visible count。
+\end{itemize}
+
+Residual 诊断图建议分三类：
+\begin{itemize}[leftmargin=1.5em]
+    \item raw residual：$E$ 的真实输出；
+    \item used residual：$w_{\text{res}}M_{\text{res}}\odot E$；
+    \item normalized abs residual：仅用于观察结构，不代表真实贡献量级。
+\end{itemize}
+
+\section{Rendering and Evaluation}
+
+\subsection{Low-Light Test}
+
+低光测试使用
+\begin{equation}
+    I^{\text{render}} = R \odot L.
+\end{equation}
+
+指标文件建议为：
+\begin{itemize}[leftmargin=1.5em]
+    \item \texttt{metrics\_lowlight.json}：对测试视角原始低光 GT；
+    \item 保存 PSNR、SSIM、LPIPS 的 summary 和 per-view 结果。
+\end{itemize}
+
+\subsection{Enhanced Test}
+
+增强测试使用
+\begin{equation}
+    I^{\text{render-enh}} = R \odot L^{\text{enh}}.
+\end{equation}
+
+指标文件建议为：
+\begin{itemize}[leftmargin=1.5em]
+    \item \texttt{metrics\_enhanced\_gt.json}：对数据集 \texttt{gt/images}；
+    \item 不把 residual 加入增强指标；
+    \item 可额外输出 residual 诊断图，但不参与正式增强评价。
+\end{itemize}
+
+\subsection{Interp Video}
+
+插值视频路径没有真实 GT，对应策略为：
+\begin{itemize}[leftmargin=1.5em]
+    \item 只导出低光重建、增强结果和可选 depth；
+    \item 不计算 GT 指标；
+    \item 视频封装使用稳定的 OpenCV \texttt{VideoWriter}。
+\end{itemize}
+
+\section{Implementation Checklist}
+
+若把本文档作为下一步代码修改参考，建议按以下顺序落地：
+\begin{enumerate}[leftmargin=1.8em]
+    \item 确认命令行默认 \texttt{use\_dual\_transient=False}，训练脚本不再打开双头 residual；
+    \item 保留 \texttt{residual\_net} 单头，逐步弱化或移除 \texttt{noise\_net/artifact\_net} 主路径依赖；
+    \item 将 residual mask 统一为单个 \texttt{residual\_mask}；
+    \item 将 residual loss 统一为 sparse、zero-mean、scale、chroma 四类；
+    \item wandb 中保留 \texttt{residual\_image\_raw} 和 \texttt{residual\_image}，删除双头专属日志；
+    \item final render 默认不加 residual，仅保留 \texttt{include\_residual\_render} 作为诊断开关；
+    \item 检查 checkpoint/PLY 兼容逻辑，旧 artifact residual 可映射到新 single-head residual；
+    \item 重新跑 8k 诊断训练，重点观察 $R$ 清晰度、residual coverage 和增强颜色稳定性；
+    \item 再跑 30k 正式训练，比较 \texttt{metrics\_lowlight.json} 与 \texttt{metrics\_enhanced\_gt.json}。
+\end{enumerate}
+
+\section{Practical Interpretation}
+
+新结构可以理解为：
+\begin{itemize}[leftmargin=1.5em]
+    \item $R$ 是 ``可复用的场景材质层''；
+    \item $L$ 是 ``当前低光拍摄条件''；
+    \item $L^{\text{enh}}$ 是 ``目标增强照明条件''；
+    \item $E$ 是 ``训练期局部误差缓冲器''；
+    \item final enhanced output 只依赖 $R \odot L^{\text{enh}}$。
+\end{itemize}
+
+因此，single-head residual 不是退化设计，而是为了让分解边界更清楚：
+它只给 $R \odot L$ 留一个局部缓冲空间，不额外引入一套难以解释的双头瞬时分解。
+
+\section{Open Directions}
+
+后续可继续探索：
+\begin{itemize}[leftmargin=1.5em]
+    \item 更稳的 residual mask 覆盖率调度；
+    \item 更直接的增强结构监督，减少对 refined pseudo target 的长期依赖；
+    \item 更物理一致的 enhanced SG 初始化；
+    \item 更干净的 checkpoint 兼容路径，把旧双头参数自动迁移到单头 residual；
+    \item 让 $R$ 的高频结构提升与 residual 的局部补偿进一步解耦。
+\end{itemize}
+
+\end{document}
