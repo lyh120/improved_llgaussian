@@ -45,6 +45,8 @@ class CameraInfo(NamedTuple):
     image_name: str
     width: int
     height: int
+    depth_prior: np.array = None
+    structure_prior: np.array = None
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -108,7 +110,54 @@ def loadCameras(poses, viewpoint_stack):
             viewpoint_stack[idx].camera_center = viewpoint_stack[idx].world_view_transform.inverse()[3, :3]
     return viewpoint_stack
 
-def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
+def _load_prior_image(prior_path, image_name, expected_size, kind):
+    if not os.path.exists(prior_path):
+        raise FileNotFoundError(f"Missing {kind} prior for image '{image_name}': expected {prior_path}")
+    prior = cv2.imread(prior_path, cv2.IMREAD_UNCHANGED)
+    if prior is None:
+        raise FileNotFoundError(f"Unable to read {kind} prior for image '{image_name}': {prior_path}")
+    if prior.ndim == 3:
+        prior = cv2.cvtColor(prior, cv2.COLOR_BGR2GRAY)
+    prior = prior.astype(np.float32)
+    if prior.max() > 1.0:
+        prior /= 255.0 if prior.max() <= 255.0 else prior.max()
+    width, height = expected_size
+    prior = cv2.resize(prior, (width, height), interpolation=cv2.INTER_LINEAR)
+    return prior
+
+
+def _resolve_depth_prior_path(depth_folder, image_name):
+    candidates = [
+        os.path.join(depth_folder, f"depth_{image_name}.png"),
+        os.path.join(depth_folder, f"{image_name}.png"),
+        os.path.join(depth_folder, f"depth_{image_name}.jpg"),
+        os.path.join(depth_folder, f"{image_name}.jpg"),
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return candidates[0]
+
+
+def _resolve_structure_prior_path(structure_folder, image_basename, image_name):
+    candidates = [
+        os.path.join(structure_folder, image_basename),
+        os.path.join(structure_folder, f"{image_name}.png"),
+        os.path.join(structure_folder, f"{image_name}.jpg"),
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return candidates[0]
+
+
+def readColmapCameras(
+    cam_extrinsics,
+    cam_intrinsics,
+    images_folder,
+    depth_prior_folder=None,
+    structure_prior_folder=None,
+):
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
@@ -141,14 +190,32 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         
         # print(f'FovX: {FovX}, FovY: {FovY}')
 
-        image_path = os.path.join(images_folder, os.path.basename(extr.name))
+        image_basename = os.path.basename(extr.name)
+        image_path = os.path.join(images_folder, image_basename)
         image_name = os.path.basename(image_path).split(".")[0]
         image = Image.open(image_path)
+        depth_prior = None
+        structure_prior = None
+        if depth_prior_folder is not None:
+            depth_prior = _load_prior_image(
+                _resolve_depth_prior_path(depth_prior_folder, image_name),
+                image_name,
+                image.size,
+                "depth",
+            )
+        if structure_prior_folder is not None:
+            structure_prior = _load_prior_image(
+                _resolve_structure_prior_path(structure_prior_folder, image_basename, image_name),
+                image_name,
+                image.size,
+                "structure",
+            )
 
         # print(f'image: {image.size}')
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                              image_path=image_path, image_name=image_name, width=width, height=height)
+                              image_path=image_path, image_name=image_name, width=width, height=height,
+                              depth_prior=depth_prior, structure_prior=structure_prior)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos
@@ -193,7 +260,17 @@ def _resolve_colmap_sparse_dir(path):
         return sparse_dir
     return sparse_zero_dir
 
-def readColmapSceneInfo(path, images, eval, lod, llffhold=8):
+def readColmapSceneInfo(
+    path,
+    images,
+    eval,
+    lod,
+    llffhold=8,
+    use_depth_prior_files=False,
+    use_structure_prior_files=False,
+    depth_prior_dir="depth_maps",
+    structure_prior_dir="W_0.8",
+):
     sparse_dir = _resolve_colmap_sparse_dir(path)
     try:
         cameras_extrinsic_file = os.path.join(sparse_dir, "images.bin")
@@ -207,7 +284,15 @@ def readColmapSceneInfo(path, images, eval, lod, llffhold=8):
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
     reading_dir = "images" if images == None else images
-    cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir))
+    depth_prior_folder = os.path.join(path, depth_prior_dir) if use_depth_prior_files else None
+    structure_prior_folder = os.path.join(path, structure_prior_dir) if use_structure_prior_files else None
+    cam_infos_unsorted = readColmapCameras(
+        cam_extrinsics=cam_extrinsics,
+        cam_intrinsics=cam_intrinsics,
+        images_folder=os.path.join(path, reading_dir),
+        depth_prior_folder=depth_prior_folder,
+        structure_prior_folder=structure_prior_folder,
+    )
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
     if eval:

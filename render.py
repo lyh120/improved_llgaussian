@@ -510,7 +510,9 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
 
         gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
                               dataset.appearance_residual_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_reflectance_dist, dataset.add_illumination_dist, dataset.add_residual_dist, dataset.use_residual, dataset.use_dual_transient, dataset.use_3D_filter,
-                              use_sg_illumination=use_sg_illumination, illumination_mode=illumination_mode, sg_lobes=sg_lobes, sg_lambda_min=sg_lambda_min)
+                              use_sg_illumination=use_sg_illumination, illumination_mode=illumination_mode, sg_lobes=sg_lobes, sg_lambda_min=sg_lambda_min,
+                              depth_prior_feature_dim=getattr(dataset, "depth_prior_feature_dim", 1), structure_prior_feature_dim=getattr(dataset, "structure_prior_feature_dim", 1),
+                              depth_prior_feature_lr_scale=getattr(dataset, "depth_prior_feature_lr_scale", 0.05), structure_prior_feature_lr_scale=getattr(dataset, "structure_prior_feature_lr_scale", 0.05))
         scene = Scene(dataset, gaussians, depth_piror_model=None, load_iteration=iteration, shuffle=False)
         
         gaussians.eval()

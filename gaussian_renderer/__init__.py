@@ -54,6 +54,8 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
         visible_mask = torch.ones(pc.get_anchor.shape[0], dtype=torch.bool, device = pc.get_anchor.device)
     
     feat = pc._anchor_feat[visible_mask]
+    depth_prior_feat = pc._features_depth_prior[visible_mask]
+    structure_prior_feat = pc._features_structure_prior[visible_mask]
     anchor = pc.get_anchor[visible_mask]
     grid_offsets = pc._offset[visible_mask]
     grid_scaling = pc.get_scaling[visible_mask]
@@ -149,6 +151,8 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
         illumination_feat,
         ob_view,
         visible_mask,
+        depth_prior_feat=depth_prior_feat,
+        structure_prior_feat=structure_prior_feat,
     )
     if pc.use_residual and pc.appearance_residual_dim>0:
         if pc.add_residual_dist:
@@ -182,6 +186,8 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     illumination = illumination.reshape([anchor.shape[0]*pc.n_offsets, 1]) # [mask]
     reflectance = reflectance.reshape([anchor.shape[0]*pc.n_offsets, 3]) # [mask]
     illumination_enhanced = illumination_enhanced.reshape([anchor.shape[0]*pc.n_offsets, 3])
+    depth_prior_feature = repeat(torch.sigmoid(depth_prior_feat), 'n c -> (n k) c', k=pc.n_offsets)
+    structure_prior_feature = repeat(torch.sigmoid(structure_prior_feat), 'n c -> (n k) c', k=pc.n_offsets)
 
     
 
@@ -213,10 +219,10 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     # combine for parallel masking
     concatenated = torch.cat([grid_scaling, anchor], dim=-1)
     concatenated_repeated = repeat(concatenated, 'n (c) -> (n k) (c)', k=pc.n_offsets)
-    concatenated_all = torch.cat([concatenated_repeated, reflectance, illumination, illumination_enhanced, scale_rot, offsets], dim=-1)
+    concatenated_all = torch.cat([concatenated_repeated, reflectance, illumination, illumination_enhanced, depth_prior_feature, structure_prior_feature, scale_rot, offsets], dim=-1)
     masked = concatenated_all[mask]
 
-    scaling_repeat, repeat_anchor, reflectance, illumination, illumination_enhanced, scale_rot, offsets = masked.split([6, 3, 3, 1, 3, 7, 3], dim=-1)
+    scaling_repeat, repeat_anchor, reflectance, illumination, illumination_enhanced, depth_prior_feature, structure_prior_feature, scale_rot, offsets = masked.split([6, 3, 3, 1, 3, pc.depth_prior_feature_dim, pc.structure_prior_feature_dim, 7, 3], dim=-1)
     
 
     if pc.use_residual:
@@ -264,9 +270,9 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     # feat_downsampled = feat_repeated.detach()
 
     if is_training:
-        return xyz, reflectance, illumination, illumination_enhanced, opacity, scaling, rot, neural_opacity, mask, xyz_residual, color_noise, color_artifact, scaling_residual, rot_residual, opacity_residual, sg_stats
+        return xyz, reflectance, illumination, illumination_enhanced, depth_prior_feature, structure_prior_feature, opacity, scaling, rot, neural_opacity, mask, xyz_residual, color_noise, color_artifact, scaling_residual, rot_residual, opacity_residual, sg_stats
     else:
-        return xyz, reflectance, illumination, illumination_enhanced, opacity, scaling, rot, xyz_residual, color_noise, color_artifact, scaling_residual, rot_residual, opacity_residual, sg_stats
+        return xyz, reflectance, illumination, illumination_enhanced, depth_prior_feature, structure_prior_feature, opacity, scaling, rot, xyz_residual, color_noise, color_artifact, scaling_residual, rot_residual, opacity_residual, sg_stats
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, kernel_size: float, scaling_modifier = 1.0, visible_mask=None, retain_grad=False, camera_pose=None):
     """
@@ -278,9 +284,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # is_enhancing = pc.render_enhancement
         
     if is_training:
-        xyz, reflectance, illumination, illumination_enhanced, opacity, scaling, rot, neural_opacity, mask, xyz_residual, color_noise, color_artifact, scaling_residual, rot_residual, opacity_residual, sg_stats = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
+        xyz, reflectance, illumination, illumination_enhanced, depth_prior_feature, structure_prior_feature, opacity, scaling, rot, neural_opacity, mask, xyz_residual, color_noise, color_artifact, scaling_residual, rot_residual, opacity_residual, sg_stats = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
     else:
-        xyz, reflectance, illumination, illumination_enhanced, opacity, scaling, rot, xyz_residual, color_noise, color_artifact, scaling_residual, rot_residual, opacity_residual, sg_stats = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
+        xyz, reflectance, illumination, illumination_enhanced, depth_prior_feature, structure_prior_feature, opacity, scaling, rot, xyz_residual, color_noise, color_artifact, scaling_residual, rot_residual, opacity_residual, sg_stats = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
     
     # print("ill_shape:", illumination.shape)
     # print("ref_shape:", reflectance.shape)
@@ -402,6 +408,37 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         # rotations = rot,
         rotations = gaussians_rot_trans,
         cov3D_precomp = None)
+
+    rendered_prior_alpha, _, _ = rasterizer(
+        means3D=means3D.detach(),
+        means2D=means2D,
+        shs=None,
+        colors_precomp=torch.ones_like(depth_prior_feature[:, :1]).repeat(1, 3),
+        opacities=opacity,
+        scales=scaling,
+        rotations=gaussians_rot_trans,
+        cov3D_precomp=None)
+    rendered_depth_prior_sum, _, _ = rasterizer(
+        means3D=means3D.detach(),
+        means2D=means2D,
+        shs=None,
+        colors_precomp=depth_prior_feature[:, :1].repeat(1, 3),
+        opacities=opacity,
+        scales=scaling,
+        rotations=gaussians_rot_trans,
+        cov3D_precomp=None)
+    rendered_structure_prior_sum, _, _ = rasterizer(
+        means3D=means3D.detach(),
+        means2D=means2D,
+        shs=None,
+        colors_precomp=structure_prior_feature[:, :1].repeat(1, 3),
+        opacities=opacity,
+        scales=scaling,
+        rotations=gaussians_rot_trans,
+        cov3D_precomp=None)
+    rendered_prior_alpha = rendered_prior_alpha[:1].clamp(0.0, 1.0)
+    rendered_depth_prior_feature = (rendered_depth_prior_sum[:1] / rendered_prior_alpha.clamp_min(1e-4)).clamp(0.0, 1.0)
+    rendered_structure_prior_feature = (rendered_structure_prior_sum[:1] / rendered_prior_alpha.clamp_min(1e-4)).clamp(0.0, 1.0)
 
     # rendered_feat,_,_ = rasterizer(
     #     # means3D = xyz,
@@ -530,6 +567,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                     "render_reflectance":rendered_reflectance,
                     "render_illumination":rendered_illumination,
                     "render_illumination_enhanced":rendered_illumination_enhanced,
+                    "render_depth_prior_feature": rendered_depth_prior_feature,
+                    "render_structure_prior_feature": rendered_structure_prior_feature,
+                    "render_prior_alpha": rendered_prior_alpha,
+                    "render_depth_prior_alpha": rendered_prior_alpha,
+                    "render_structure_prior_alpha": rendered_prior_alpha,
                     "render_depth":depth_map,
                     # "render_depth_variance":depth_variance_map,
                     "render_noise": rendered_noise * 0.1,
@@ -552,6 +594,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                     "render_reflectance":rendered_reflectance,
                     "render_illumination":rendered_illumination,
                     "render_illumination_enhanced":rendered_illumination_enhanced,
+                    "render_depth_prior_feature": rendered_depth_prior_feature,
+                    "render_structure_prior_feature": rendered_structure_prior_feature,
+                    "render_prior_alpha": rendered_prior_alpha,
+                    "render_depth_prior_alpha": rendered_prior_alpha,
+                    "render_structure_prior_alpha": rendered_prior_alpha,
                     "render_noise": rendered_noise * 0.1,
                     "render_artifact": rendered_artifact * 0.1,
                     "render_residual":rendered_residual * 0.1 ,
@@ -668,6 +715,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 "render_reflectance":rendered_reflectance,
                 "render_illumination":rendered_illumination,
                 "render_illumination_enhanced":rendered_illumination_enhanced,
+                "render_depth_prior_feature": rendered_depth_prior_feature,
+                "render_structure_prior_feature": rendered_structure_prior_feature,
+                "render_prior_alpha": rendered_prior_alpha,
+                "render_depth_prior_alpha": rendered_prior_alpha,
+                "render_structure_prior_alpha": rendered_prior_alpha,
                 "render_depth":depth_map,
                 # "render_depth_variance":depth_variance_map,
                 # "render_residual":rendered_residual
@@ -686,6 +738,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 "render_reflectance":rendered_reflectance,
                 "render_illumination":rendered_illumination,
                 "render_illumination_enhanced":rendered_illumination_enhanced,
+                "render_depth_prior_feature": rendered_depth_prior_feature,
+                "render_structure_prior_feature": rendered_structure_prior_feature,
+                "render_prior_alpha": rendered_prior_alpha,
+                "render_depth_prior_alpha": rendered_prior_alpha,
+                "render_structure_prior_alpha": rendered_prior_alpha,
                 "render_depth":depth_map,
                 # "render_depth_variance":depth_variance_map,
                 # "render_residual":rendered_residual,
@@ -706,6 +763,8 @@ def generate_neural_gaussians_fast(viewpoint_camera, pc : GaussianModel, visible
         visible_mask = torch.ones(pc.get_anchor.shape[0], dtype=torch.bool, device = pc.get_anchor.device)
     
     feat = pc._anchor_feat[visible_mask]
+    depth_prior_feat = pc._features_depth_prior[visible_mask]
+    structure_prior_feat = pc._features_structure_prior[visible_mask]
     anchor = pc.get_anchor[visible_mask]
     grid_offsets = pc._offset[visible_mask]
     grid_scaling = pc.get_scaling[visible_mask]
@@ -762,6 +821,8 @@ def generate_neural_gaussians_fast(viewpoint_camera, pc : GaussianModel, visible
         illumination_feat,
         ob_view,
         visible_mask,
+        depth_prior_feat=depth_prior_feat,
+        structure_prior_feat=structure_prior_feat,
     )
 
 

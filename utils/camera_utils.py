@@ -49,10 +49,30 @@ def loadCam(args, id, cam_info, resolution_scale):
     if resized_image_rgb.shape[1] == 4:
         loaded_mask = resized_image_rgb[3:4, ...]
 
+    gt_depth_prior = None
+    gt_structure_prior = None
+    if getattr(cam_info, "depth_prior", None) is not None:
+        gt_depth_prior = torch.from_numpy(cam_info.depth_prior).float().unsqueeze(0)
+        gt_depth_prior = torch.nn.functional.interpolate(
+            gt_depth_prior.unsqueeze(0),
+            size=(resolution[1], resolution[0]),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+    if getattr(cam_info, "structure_prior", None) is not None:
+        gt_structure_prior = torch.from_numpy(cam_info.structure_prior).float().unsqueeze(0)
+        gt_structure_prior = torch.nn.functional.interpolate(
+            gt_structure_prior.unsqueeze(0),
+            size=(resolution[1], resolution[0]),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0).clamp(0.0, 1.0)
+
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
                   image=gt_image, gt_alpha_mask=loaded_mask,
-                  image_name=cam_info.image_name, uid=id, data_device=args.data_device)
+                  image_name=cam_info.image_name, uid=id, data_device=args.data_device,
+                  gt_depth_prior=gt_depth_prior, gt_structure_prior=gt_structure_prior)
 
 def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []

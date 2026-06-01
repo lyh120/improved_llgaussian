@@ -45,7 +45,7 @@ sys.path.append("./submodules/Depth-Anything-V2")
 # from lpipsPyTorch import lpips
 import lpips
 from random import randint
-from utils.loss_utils import l1_loss, ssim, l1_plus_loss, L_Smooth, L_Illu, L_Gray, L_Green_Bias, L_Depth_similarity, L_Reflectance_Smooth, L_Depth_Smooth, pearson_depth_loss, L_Reflectance_Consistency, L_Reflectance_Edge, L_Reflectance_Edge_Uplift, L_Reflectance_Highlight, L_Reflectance_LocalContrast, L_Reflectance_HighFreq, L_Residual_Chroma_Boost, L_Noise_Zero_Mean, L_Noise_Dark_Weighted, L_Noise_HighFreq, L_SG_Energy, L_SG_Sharpness, L_B0_Spatial_Smooth, build_dual_transient_masks
+from utils.loss_utils import l1_loss, ssim, l1_plus_loss, L_Smooth, L_Illu, L_Gray, L_Green_Bias, L_Depth_similarity, L_Reflectance_Smooth, L_Depth_Smooth, pearson_depth_loss, L_Reflectance_Consistency, L_Reflectance_Edge, L_Reflectance_Edge_Uplift, L_Reflectance_Highlight, L_Reflectance_LocalContrast, L_Reflectance_HighFreq, L_Residual_Chroma_Boost, L_Noise_Zero_Mean, L_Noise_Dark_Weighted, L_Noise_HighFreq, L_SG_Energy, L_SG_Sharpness, L_B0_Spatial_Smooth, L_Depth_Prior_Feature, L_Depth_Prior_Geometry, L_Structure_Prior_Feature, L_Enhanced_SG_Structure_Uplift, L_Enhanced_SG_Prior_Smooth, build_dual_transient_masks, build_residual_hard_mask
 from gaussian_renderer import prefilter_voxel, render, network_gui
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -447,7 +447,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
     gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
                               dataset.appearance_residual_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_reflectance_dist, dataset.add_illumination_dist, dataset.add_residual_dist, dataset.use_residual, dataset.use_dual_transient, dataset.use_3D_filter,
-                              use_sg_illumination=dataset.use_sg_illumination, illumination_mode=dataset.illumination_mode, sg_lobes=dataset.sg_lobes, sg_lambda_min=dataset.sg_lambda_min)
+                              use_sg_illumination=dataset.use_sg_illumination, illumination_mode=dataset.illumination_mode, sg_lobes=dataset.sg_lobes, sg_lambda_min=dataset.sg_lambda_min,
+                              depth_prior_feature_dim=dataset.depth_prior_feature_dim, structure_prior_feature_dim=dataset.structure_prior_feature_dim,
+                              depth_prior_feature_lr_scale=dataset.depth_prior_feature_lr_scale, structure_prior_feature_lr_scale=dataset.structure_prior_feature_lr_scale)
     depth_piror_model = depth_piror_Model()
     if mode == "warmuped":
         scene = Scene(dataset, gaussians, depth_piror_model, ply_path=ply_path, shuffle=False, load_iteration=-1 , only_ply=True)
@@ -624,11 +626,17 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
         t1 = time.time()
         reflectance_image, illumination_image, illumination_enhanced_image, depth_image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity= render_pkg["render_reflectance"], render_pkg["render_illumination"], render_pkg["render_illumination_enhanced"], render_pkg["render_depth"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
+        depth_prior_feature_image = render_pkg.get("render_depth_prior_feature")
+        structure_prior_feature_image = render_pkg.get("render_structure_prior_feature")
+        depth_prior_alpha = render_pkg.get("render_depth_prior_alpha")
+        structure_prior_alpha = render_pkg.get("render_structure_prior_alpha")
         
         
 
         gt_image = viewpoint_cam.original_image.cuda()
         depth_piror_norm = depth_piror_dict[viewpoint_cam.uid]
+        gt_depth_prior_file = getattr(viewpoint_cam, "gt_depth_prior", None)
+        gt_structure_prior = getattr(viewpoint_cam, "gt_structure_prior", None)
         base_image = torch.clamp(reflectance_image * illumination_image, 0.0, 1.0)
 
         residual_active = dataset.use_residual and mode != "warmup" and iteration >= opt.residual_start_iter
@@ -657,8 +665,18 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 residual_image = render_pkg["render_residual"]
                 if not dataset.use_dual_transient:
                     noise_image_for_loss = torch.zeros_like(noise_image)
-                    artifact_image_for_loss = residual_image
-                    residual_image_for_loss = residual_image
+                    if residual_active:
+                        artifact_mask, noise_mask_coverage, artifact_mask_coverage = build_residual_hard_mask(
+                            base_image,
+                            gt_image,
+                            higherror_percentile=dataset.residual_higherror_percentile,
+                            highlight_percentile=dataset.residual_highlight_percentile,
+                        )
+                        artifact_image_for_loss = residual_image * residual_mix_weight * artifact_mask
+                        residual_image_for_loss = artifact_image_for_loss
+                    else:
+                        artifact_image_for_loss = torch.zeros_like(residual_image)
+                        residual_image_for_loss = torch.zeros_like(residual_image)
                 elif residual_active:
                     noise_mask, artifact_mask, noise_mask_coverage, artifact_mask_coverage = build_dual_transient_masks(
                         base_image,
@@ -691,6 +709,32 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         L_illu = L_Illu(gt_image, illumination_image) 
         L_reflectance_smooth = L_Reflectance_Smooth(reflectance_image, illumination_image) * dataset.reflectance_smooth_reg
         L_depth_similarity = (L_Depth_similarity(1 - minmax_normalize(depth_image).squeeze(0), depth_piror_norm.squeeze(0), 128, 0.5) ) * 0.15
+        L_depth_prior_file = torch.tensor(0.0, device=gt_image.device)
+        L_depth_prior_feature = torch.tensor(0.0, device=gt_image.device)
+        depth_prior_mask = depth_prior_alpha > 0.05 if depth_prior_alpha is not None else None
+        structure_prior_mask = structure_prior_alpha > 0.05 if structure_prior_alpha is not None else None
+        depth_prior_alpha_mean = depth_prior_alpha.mean() if depth_prior_alpha is not None else torch.tensor(0.0, device=gt_image.device)
+        structure_prior_alpha_mean = structure_prior_alpha.mean() if structure_prior_alpha is not None else torch.tensor(0.0, device=gt_image.device)
+        render_depth_prior_feature_std = depth_prior_feature_image.std() if depth_prior_feature_image is not None else torch.tensor(0.0, device=gt_image.device)
+        render_structure_prior_feature_std = structure_prior_feature_image.std() if structure_prior_feature_image is not None else torch.tensor(0.0, device=gt_image.device)
+        gt_depth_prior_std = torch.tensor(0.0, device=gt_image.device)
+        gt_structure_prior_std = torch.tensor(0.0, device=gt_image.device)
+        if dataset.use_depth_prior_files and gt_depth_prior_file is not None:
+            gt_depth_prior_file = gt_depth_prior_file.cuda()
+            gt_depth_prior_std = gt_depth_prior_file.std()
+            L_depth_prior_file = L_Depth_Prior_Geometry(depth_image, gt_depth_prior_file, depth_prior_mask)
+            if depth_prior_feature_image is not None:
+                L_depth_prior_feature = L_Depth_Prior_Feature(depth_prior_feature_image, gt_depth_prior_file, depth_prior_mask)
+        L_structure_prior_file = torch.tensor(0.0, device=gt_image.device)
+        L_enhancement_sg_structure = torch.tensor(0.0, device=gt_image.device)
+        L_enhancement_sg_prior_smooth = torch.tensor(0.0, device=gt_image.device)
+        if dataset.use_structure_prior_files and gt_structure_prior is not None and structure_prior_feature_image is not None:
+            gt_structure_prior = gt_structure_prior.cuda().clamp(0.0, 1.0)
+            gt_structure_prior_std = gt_structure_prior.std()
+            L_structure_prior_file = L_Structure_Prior_Feature(structure_prior_feature_image, gt_structure_prior, structure_prior_mask)
+            L_enhancement_sg_structure = L_Enhanced_SG_Structure_Uplift(reflectance_image, illumination_enhanced_image, gt_structure_prior)
+            L_enhancement_sg_prior_smooth = L_Enhanced_SG_Prior_Smooth(illumination_enhanced_image, gt_structure_prior)
+        L_enhancement_prior_gate_abs = gaussians._last_enhancement_prior_gate_abs
         
         if FUSED_SSIM_AVAILABLE:
             ssim_loss = fused_ssim(image_tmp.unsqueeze(0), gt_image.unsqueeze(0))
@@ -736,6 +780,11 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + L_illu + 0.01 * scaling_reg
             if iteration >= opt.update_from:
                 loss += L_smooth * 0.1 +  L_depth_similarity 
+                loss += dataset.depth_prior_file_reg * L_depth_prior_file
+                loss += dataset.depth_prior_file_reg * L_depth_prior_feature
+                loss += dataset.structure_prior_file_reg * L_structure_prior_file
+                loss += dataset.enhancement_sg_structure_reg * L_enhancement_sg_structure
+                loss += dataset.enhancement_sg_prior_smooth_reg * L_enhancement_sg_prior_smooth
             loss += dataset.reflectance_consistency_reg * (L_reflectance_consistency + L_reflectance_smooth)
             loss += dataset.reflectance_edge_reg * L_reflectance_edge
             loss += dataset.reflectance_edge_uplift_reg * L_reflectance_edge_uplift
@@ -750,6 +799,11 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             
             if iteration >= opt.update_from:
                 loss +=  L_smooth + L_depth_similarity
+                loss += dataset.depth_prior_file_reg * L_depth_prior_file
+                loss += dataset.depth_prior_file_reg * L_depth_prior_feature
+                loss += dataset.structure_prior_file_reg * L_structure_prior_file
+                loss += dataset.enhancement_sg_structure_reg * L_enhancement_sg_structure
+                loss += dataset.enhancement_sg_prior_smooth_reg * L_enhancement_sg_prior_smooth
                 loss += dataset.sg_energy_reg * L_sg_energy
                 loss += dataset.sg_smooth_reg * L_sg_sharpness
                 loss += dataset.reflectance_consistency_reg * (L_reflectance_consistency + L_reflectance_smooth)
@@ -816,12 +870,12 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     loss += enhancement_guidance_weight * L_diff
             if dataset.use_residual and not dataset.use_dual_transient:
                 scaling_residual_reg = scaling_residual.prod(dim=1).mean()
-                artifact_image_for_loss = residual_image
-                L_artifact_sparse = torch.mean(residual_image) * weight_scheduler(iteration)
+                L_artifact_sparse = torch.mean(torch.abs(artifact_image_for_loss)) * weight_scheduler(iteration)
                 L_residual_reg = L_artifact_sparse
-                artifact_abs_mean = torch.abs(residual_image).mean()
-                artifact_chroma_mean = torch.abs(residual_image - residual_image.mean(dim=0, keepdim=True)).mean()
-                loss += L_residual_reg + 0.05 * scaling_residual_reg
+                artifact_abs_mean = torch.abs(artifact_image_for_loss).mean()
+                artifact_chroma_mean = torch.abs(artifact_image_for_loss - artifact_image_for_loss.mean(dim=0, keepdim=True)).mean()
+                L_residual_chroma_boost = L_Residual_Chroma_Boost(artifact_image_for_loss, reflectance_image)
+                loss += dataset.artifact_residual_reg * L_residual_reg + dataset.residual_chroma_reg * L_residual_chroma_boost + 0.05 * scaling_residual_reg
             elif dataset.use_residual and residual_active:
                 scaling_residual_reg = scaling_residual.prod(dim=1).mean()
                 L_noise_sparse = torch.mean(torch.abs(noise_image_for_loss)) * weight_scheduler(iteration)
@@ -870,6 +924,18 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                            'reflectance_highlight_mean': L_reflectance_highlight,
                            'reflectance_detail_mean': L_reflectance_detail,
                            'reflectance_decoder_mean': L_reflectance_decoder,
+                           'depth_prior_file_loss': L_depth_prior_file,
+                           'depth_prior_feature_loss': L_depth_prior_feature,
+                           'structure_prior_file_loss': L_structure_prior_file,
+                           'render_depth_prior_feature_std': render_depth_prior_feature_std,
+                           'render_structure_prior_feature_std': render_structure_prior_feature_std,
+                           'depth_prior_alpha_mean': depth_prior_alpha_mean,
+                           'structure_prior_alpha_mean': structure_prior_alpha_mean,
+                           'gt_depth_prior_std': gt_depth_prior_std,
+                           'gt_structure_prior_std': gt_structure_prior_std,
+                           'enhancement_sg_structure_loss': L_enhancement_sg_structure,
+                           'enhancement_sg_prior_smooth_loss': L_enhancement_sg_prior_smooth,
+                           'enhancement_prior_gate_abs': L_enhancement_prior_gate_abs,
                            'residual_mix_weight': residual_mix_weight,
                            'residual_chroma_boost': L_residual_chroma_boost})
             else:
@@ -886,6 +952,18 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                                 'reflectance_highlight_mean': L_reflectance_highlight,
                                 'reflectance_detail_mean': L_reflectance_detail,
                                 'reflectance_decoder_mean': L_reflectance_decoder,
+                                'depth_prior_file_loss': L_depth_prior_file,
+                                'depth_prior_feature_loss': L_depth_prior_feature,
+                                'structure_prior_file_loss': L_structure_prior_file,
+                                'render_depth_prior_feature_std': render_depth_prior_feature_std,
+                                'render_structure_prior_feature_std': render_structure_prior_feature_std,
+                                'depth_prior_alpha_mean': depth_prior_alpha_mean,
+                                'structure_prior_alpha_mean': structure_prior_alpha_mean,
+                                'gt_depth_prior_std': gt_depth_prior_std,
+                                'gt_structure_prior_std': gt_structure_prior_std,
+                                'enhancement_sg_structure_loss': L_enhancement_sg_structure,
+                                'enhancement_sg_prior_smooth_loss': L_enhancement_sg_prior_smooth,
+                                'enhancement_prior_gate_abs': L_enhancement_prior_gate_abs,
                                 'residual_enabled': float(residual_active),
                                 'residual_abs_mean': torch.abs(residual_image_for_loss).mean(),
                                 'residual_reg': L_residual_reg,
@@ -946,6 +1024,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 else:
                     artifact_image_vis = torch.zeros_like(artifact_abs)
                 enhanced_image_pil = torchvision.transforms.ToPILImage()(enhanced_image)
+                depth_prior_feature_log = torch.clamp(depth_prior_feature_image, 0.0, 1.0) if depth_prior_feature_image is not None else torch.zeros_like(depth_image)
+                structure_prior_feature_log = torch.clamp(structure_prior_feature_image, 0.0, 1.0) if structure_prior_feature_image is not None else torch.zeros_like(depth_image)
+                depth_prior_feature_vis = minmax_normalize(depth_prior_feature_log)
+                structure_prior_feature_vis = minmax_normalize(structure_prior_feature_log)
                 
 
                 image_log = {'loss':loss, 'iteration':iteration,
@@ -964,6 +1046,18 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         'reflectance_detail_mean': L_reflectance_detail,
                         'reflectance_decoder_mean': L_reflectance_decoder,
                         'reflectance_highlight_mean': L_reflectance_highlight,
+                        'depth_prior_file_loss': L_depth_prior_file,
+                        'depth_prior_feature_loss': L_depth_prior_feature,
+                        'structure_prior_file_loss': L_structure_prior_file,
+                        'render_depth_prior_feature_std': render_depth_prior_feature_std,
+                        'render_structure_prior_feature_std': render_structure_prior_feature_std,
+                        'depth_prior_alpha_mean': depth_prior_alpha_mean,
+                        'structure_prior_alpha_mean': structure_prior_alpha_mean,
+                        'gt_depth_prior_std': gt_depth_prior_std,
+                        'gt_structure_prior_std': gt_structure_prior_std,
+                        'enhancement_sg_structure_loss': L_enhancement_sg_structure,
+                        'enhancement_sg_prior_smooth_loss': L_enhancement_sg_prior_smooth,
+                        'enhancement_prior_gate_abs': L_enhancement_prior_gate_abs,
                         'residual_chroma_mean': residual_chroma_mean,
                         'enhancement_color_mean': L_enhanced_color,
                         'enhancement_color_std': L_enhanced_color_std,
@@ -973,6 +1067,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         'illumination':wandb.Image(torchvision.transforms.ToPILImage()(illumination_image)),
                         'reflectance':wandb.Image(torchvision.transforms.ToPILImage()(reflectance_image)),
                         'depth_piror_image':wandb.Image(torchvision.transforms.ToPILImage()(depth_piror_norm)),
+                        'render_depth_prior_feature':wandb.Image(torchvision.transforms.ToPILImage()(depth_prior_feature_log)),
+                        'render_depth_prior_feature_vis':wandb.Image(torchvision.transforms.ToPILImage()(depth_prior_feature_vis)),
+                        'render_structure_prior_feature':wandb.Image(torchvision.transforms.ToPILImage()(structure_prior_feature_log)),
+                        'render_structure_prior_feature_vis':wandb.Image(torchvision.transforms.ToPILImage()(structure_prior_feature_vis)),
                         'clear_image':wandb.Image(enhanced_image_pil),
                         'illumination_enhanced':wandb.Image(torchvision.transforms.ToPILImage()(illumination_enhanced_image)),
                         'image_enhanced':wandb.Image(torchvision.transforms.ToPILImage()(illumination_enhanced_image * reflectance_image)),
@@ -1013,6 +1111,18 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 print("reflectance_detail_mean", L_reflectance_detail)
                 print("reflectance_decoder_mean", L_reflectance_decoder)
                 print("reflectance_highlight_mean", L_reflectance_highlight)
+                print("depth_prior_file_loss", L_depth_prior_file)
+                print("depth_prior_feature_loss", L_depth_prior_feature)
+                print("structure_prior_file_loss", L_structure_prior_file)
+                print("render_depth_prior_feature_std", render_depth_prior_feature_std)
+                print("render_structure_prior_feature_std", render_structure_prior_feature_std)
+                print("depth_prior_alpha_mean", depth_prior_alpha_mean)
+                print("structure_prior_alpha_mean", structure_prior_alpha_mean)
+                print("gt_depth_prior_std", gt_depth_prior_std)
+                print("gt_structure_prior_std", gt_structure_prior_std)
+                print("enhancement_sg_structure_loss", L_enhancement_sg_structure)
+                print("enhancement_sg_prior_smooth_loss", L_enhancement_sg_prior_smooth)
+                print("enhancement_prior_gate_abs", L_enhancement_prior_gate_abs)
                 print("residual_chroma_mean", residual_chroma_mean)
                 if dataset.use_dual_transient:
                     print("noise_abs_mean", noise_abs_mean)
@@ -1404,7 +1514,9 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train=False, skip_test=False, wandb=None, tb_writer=None, dataset_name=None, logger=None):
     gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
                               dataset.appearance_residual_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_reflectance_dist, dataset.add_illumination_dist, dataset.add_residual_dist, dataset.use_residual, dataset.use_dual_transient, dataset.use_3D_filter,
-                              use_sg_illumination=dataset.use_sg_illumination, illumination_mode=dataset.illumination_mode, sg_lobes=dataset.sg_lobes, sg_lambda_min=dataset.sg_lambda_min)
+                              use_sg_illumination=dataset.use_sg_illumination, illumination_mode=dataset.illumination_mode, sg_lobes=dataset.sg_lobes, sg_lambda_min=dataset.sg_lambda_min,
+                              depth_prior_feature_dim=dataset.depth_prior_feature_dim, structure_prior_feature_dim=dataset.structure_prior_feature_dim,
+                              depth_prior_feature_lr_scale=dataset.depth_prior_feature_lr_scale, structure_prior_feature_lr_scale=dataset.structure_prior_feature_lr_scale)
     scene = Scene(dataset, gaussians, depth_piror_model=None, load_iteration=iteration, shuffle=False)
     gaussians.eval()
 

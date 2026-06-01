@@ -113,6 +113,18 @@ class ModelParams(ParamGroup):
         self.enhancement_color_reg = 0.06
         self.enhancement_color_std_reg = 0.02
         self.enhancement_green_bias_reg = 0.05
+        self.use_depth_prior_files = False
+        self.use_structure_prior_files = False
+        self.depth_prior_dir = "depth_maps"
+        self.structure_prior_dir = "W_0.8"
+        self.depth_prior_feature_dim = 1
+        self.structure_prior_feature_dim = 1
+        self.depth_prior_feature_lr_scale = 0.05
+        self.structure_prior_feature_lr_scale = 0.05
+        self.depth_prior_file_reg = 0.15
+        self.structure_prior_file_reg = 0.05
+        self.enhancement_sg_structure_reg = 0.02
+        self.enhancement_sg_prior_smooth_reg = 1e-4
         self.enhancement_prior = "cidnet"
         self.cidnet_conda_env = "CIDNet"
         self.cidnet_root = "./submodules/HVI-CIDNet"
@@ -274,6 +286,18 @@ def _backfill_model_compatibility(merged_dict):
         "enhancement_color_reg": 0.06,
         "enhancement_color_std_reg": 0.02,
         "enhancement_green_bias_reg": 0.05,
+        "use_depth_prior_files": False,
+        "use_structure_prior_files": False,
+        "depth_prior_dir": "depth_maps",
+        "structure_prior_dir": "W_0.8",
+        "depth_prior_feature_dim": 1,
+        "structure_prior_feature_dim": 1,
+        "depth_prior_feature_lr_scale": 0.05,
+        "structure_prior_feature_lr_scale": 0.05,
+        "depth_prior_file_reg": 0.15,
+        "structure_prior_file_reg": 0.05,
+        "enhancement_sg_structure_reg": 0.02,
+        "enhancement_sg_prior_smooth_reg": 1e-4,
         "enhancement_prior": "cidnet",
         "cidnet_conda_env": "CIDNet",
         "cidnet_root": "./submodules/HVI-CIDNet",

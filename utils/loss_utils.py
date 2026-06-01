@@ -284,6 +284,106 @@ def L_Reflectance_HighFreq(reflectance_image, gt_image, threshold=0.1, target_ra
     return (F.relu(target - reflectance_hf_norm) * structure_mask).mean()
 
 
+def _gray_gradient(gray_image):
+    dx = gray_image[:, 1:, :-1] - gray_image[:, :-1, :-1]
+    dy = gray_image[:, :-1, 1:] - gray_image[:, :-1, :-1]
+    return torch.sqrt(dx ** 2 + dy ** 2 + 1e-8)
+
+
+def _single_channel(image):
+    if image.dim() == 2:
+        image = image.unsqueeze(0)
+    if image.shape[0] > 1:
+        image = image.mean(dim=0, keepdim=True)
+    return image
+
+
+def _masked_mean(value, mask=None, eps=1e-6):
+    if mask is None:
+        return value.mean()
+    mask = mask.to(dtype=value.dtype, device=value.device)
+    return (value * mask).sum() / (mask.sum() + eps)
+
+
+def _masked_pearson_loss(src, target, mask=None, eps=1e-6, min_std=1e-4):
+    src = _single_channel(src)
+    target = _single_channel(target).to(dtype=src.dtype, device=src.device)
+    if mask is not None:
+        mask = _single_channel(mask).to(dtype=src.dtype, device=src.device)
+    src_mean = _masked_mean(src, mask, eps)
+    target_mean = _masked_mean(target, mask, eps)
+    src_centered = src - src_mean
+    target_centered = target - target_mean
+    src_std = torch.sqrt(_masked_mean(src_centered ** 2, mask, eps) + eps)
+    target_std = torch.sqrt(_masked_mean(target_centered ** 2, mask, eps) + eps)
+    if src_std.detach().item() < min_std or target_std.detach().item() < min_std:
+        return torch.zeros((), dtype=src.dtype, device=src.device)
+    corr = _masked_mean((src_centered / src_std) * (target_centered / target_std), mask, eps)
+    return torch.clamp(1.0 - corr, min=0.0, max=1.0)
+
+
+def _gradient_mask(mask):
+    if mask is None:
+        return None
+    mask = _single_channel(mask)
+    return mask[:, 1:, :-1] * mask[:, :-1, :-1] * mask[:, :-1, 1:]
+
+
+def L_Depth_Prior_Feature(render_depth_prior_feature, gt_depth_prior, valid_mask=None):
+    """Supervise the rasterized depth-prior feature with scale-insensitive depth cues."""
+    pred = _single_channel(render_depth_prior_feature).clamp(0.0, 1.0)
+    target = minmax_normalize(_single_channel(gt_depth_prior.detach())).clamp(0.0, 1.0)
+    mask = _single_channel(valid_mask) if valid_mask is not None else None
+    return _masked_mean(torch.abs(pred - target), mask) + _masked_pearson_loss(pred, target, mask)
+
+
+def L_Structure_Prior_Feature(render_structure_prior_feature, gt_structure_prior, valid_mask=None):
+    """Supervise the rasterized structure-prior feature without clamping away gradients."""
+    pred = _single_channel(render_structure_prior_feature).clamp(0.0, 1.0)
+    target = _single_channel(gt_structure_prior.detach()).clamp(0.0, 1.0)
+    mask = _single_channel(valid_mask) if valid_mask is not None else None
+    pred_grad = _gray_gradient(pred)
+    target_grad = _gray_gradient(target).detach()
+    pred_grad_norm = pred_grad / (pred_grad.mean().detach() + 1e-6)
+    target_grad_norm = target_grad / (target_grad.mean().detach() + 1e-6)
+    grad_mask = _gradient_mask(mask)
+    map_loss = _masked_mean(torch.abs(pred - target), mask)
+    grad_loss = _masked_mean(torch.abs(pred_grad_norm - target_grad_norm), grad_mask)
+    return map_loss + 0.25 * grad_loss
+
+
+def L_Depth_Prior_Geometry(render_depth, gt_depth_prior, valid_mask=None):
+    """Robust geometry-depth prior loss that skips Pearson when either map is flat."""
+    pred = (1.0 - minmax_normalize(_single_channel(render_depth))).clamp(0.0, 1.0)
+    target = minmax_normalize(_single_channel(gt_depth_prior.detach())).clamp(0.0, 1.0)
+    mask = _single_channel(valid_mask) if valid_mask is not None else None
+    return _masked_mean(torch.abs(pred - target), mask) + _masked_pearson_loss(pred, target, mask)
+
+
+def L_Enhanced_SG_Structure_Uplift(reflectance_image, illumination_enhanced_image, gt_structure_prior, threshold=0.1, target_ratio=0.8):
+    """Only penalize enhanced-image structure that is weaker than the W-prior structure."""
+    enhanced_gray = (reflectance_image * illumination_enhanced_image).mean(dim=0, keepdim=True)
+    prior = gt_structure_prior.detach().clamp(0.0, 1.0)
+    enhanced_grad = _gray_gradient(enhanced_gray)
+    prior_grad = _gray_gradient(prior).detach()
+    enhanced_grad_norm = enhanced_grad / (enhanced_grad.mean().detach() + 1e-6)
+    prior_grad_norm = prior_grad / (prior_grad.mean().detach() + 1e-6)
+    structure_mask = torch.clamp(prior_grad_norm - threshold, 0.0, 1.0).detach()
+    target = target_ratio * prior_grad_norm
+    return (F.relu(target - enhanced_grad_norm) * structure_mask).mean()
+
+
+def L_Enhanced_SG_Prior_Smooth(illumination_enhanced_image, gt_structure_prior):
+    """Smooth enhanced illumination mostly where the structure prior has weak edges."""
+    illum_gray = illumination_enhanced_image.mean(dim=0, keepdim=True)
+    prior = gt_structure_prior.detach().clamp(0.0, 1.0)
+    illum_grad = _gray_gradient(illum_gray)
+    prior_grad = _gray_gradient(prior).detach()
+    prior_grad_norm = prior_grad / (prior_grad.mean().detach() + 1e-6)
+    smooth_weight = torch.exp(-5.0 * prior_grad_norm).detach()
+    return (smooth_weight * illum_grad).mean()
+
+
 def L_Residual_Chroma_Boost(residual_image, reflectance_image, threshold=0.6):
     """Encourage residual to carry a small amount of chroma in bright reflectance regions."""
     reflectance_value = reflectance_image.mean(dim=0, keepdim=True).detach()
