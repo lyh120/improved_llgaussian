@@ -1721,7 +1721,7 @@ if __name__ == "__main__":
     if args.warmup:
         import copy
         args_warmup = copy.deepcopy(args)
-        args_warmup.iterations = 2000
+        args_warmup.iterations = max(1, int(getattr(args, "warmup_iterations", 2000)))
         args_warmup.save_iterations.append(args_warmup.iterations)
         print(args.warmup)
         args_warmup.start_stat = 500
@@ -1732,6 +1732,21 @@ if __name__ == "__main__":
         args_warmup.densify_grad_threshold = 0.0002 
         args_warmup.min_opacity = 0.1
         args_warmup.success_threshold = 0.8
+        if getattr(args, "warmup_update_from", -1) >= 0:
+            args_warmup.update_from = args.warmup_update_from
+        if getattr(args, "warmup_update_until", -1) >= 0:
+            args_warmup.update_until = args.warmup_update_until
+        if getattr(args, "warmup_update_interval", -1) > 0:
+            args_warmup.update_interval = args.warmup_update_interval
+        if getattr(args, "warmup_densify_grad_threshold", -1.0) >= 0.0:
+            args_warmup.densify_grad_threshold = args.warmup_densify_grad_threshold
+        if getattr(args, "warmup_min_opacity", -1.0) >= 0.0:
+            args_warmup.min_opacity = args.warmup_min_opacity
+        if getattr(args, "warmup_success_threshold", -1.0) >= 0.0:
+            args_warmup.success_threshold = args.warmup_success_threshold
+        if getattr(args, "disable_warmup_densify", False):
+            args_warmup.update_from = args_warmup.iterations + 1
+            args_warmup.update_until = max(1, args_warmup.iterations)
         training(lp.extract(args_warmup), op.extract(args_warmup), pp.extract(args_warmup), dataset,  args_warmup.test_iterations, args_warmup.save_iterations, args_warmup.checkpoint_iterations, args_warmup.start_checkpoint, args_warmup.debug_from, wandb, logger, mode="warmup")
         logger.info("\n Warmup finished! Reboot from last checkpoints")
         new_ply_path = os.path.join(args.model_path, f'point_cloud/iteration_{args_warmup.iterations}', 'point_cloud.ply')

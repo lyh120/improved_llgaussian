@@ -347,3 +347,98 @@ Observed test metrics (run date: 2026-05-28):
 
 - Test lowlight: `PSNR=46.3889`, `SSIM=0.9843`, `LPIPS=0.1285`
 - Test enhanced_gt: `PSNR=21.2126`, `SSIM=0.8095`, `LPIPS=0.3329`
+
+## Local Experiment Command: LITA Prior No-Residual Shrub 12k
+
+This setting uses external `depth_maps` and `W_0.8` priors, keeps residual disabled,
+and uses a conservative densification schedule for LITA-GS initialized point clouds.
+
+Train:
+
+```bash
+python /home/liuyuhao/ll_further/LL-Gaussian-sg/train.py --eval \
+  -s datasets/shrub \
+  -m outputs/shrub_prior_nores_12kv3_lita_stable \
+  --gpu 1 \
+  --use_sg_illumination --illumination_mode sg \
+  --use_depth_prior_files \
+  --use_structure_prior_files \
+  --depth_prior_dir depth_maps \
+  --structure_prior_dir W_0.8 \
+  --depth_prior_file_reg 0.05 \
+  --structure_prior_file_reg 0.02 \
+  --enhancement_sg_structure_reg 0.01 \
+  --enhancement_sg_prior_smooth_reg 5e-5 \
+  --depth_prior_feature_lr_scale 0.15 \
+  --structure_prior_feature_lr_scale 0.05 \
+  --use_3D_filter --use_wandb --warmup \
+  --iterations 12000 \
+  --save_iterations 12000 \
+  --test_iterations 4000 8000 12000 \
+  --position_lr_max_steps 12000 \
+  --offset_lr_max_steps 12000 \
+  --voxel_size 0.0005 \
+  --prune_ratio 0.85 \
+  --start_stat 500 \
+  --update_from 2200 \
+  --update_until 7000 \
+  --update_interval 150 \
+  --success_threshold 0.9 \
+  --densify_grad_threshold 0.00035 \
+  --min_opacity 0.006 \
+  --mlp_opacity_lr_max_steps 12000 \
+  --mlp_cov_lr_max_steps 12000 \
+  --mlp_color_lr_max_steps 12000 \
+  --mlp_color_lr_init 0.008 \
+  --mlp_color_lr_final 0.00025 \
+  --offset_lr_init 0.001 \
+  --offset_lr_final 0.00001 \
+  --feat_dim 32 \
+  --reflectance_consistency_reg 2e-5 \
+  --reflectance_smooth_reg 0.0 \
+  --reflectance_edge_reg 2e-4 \
+  --reflectance_edge_uplift_reg 3e-3 \
+  --reflectance_contrast_reg 2e-3 \
+  --reflectance_highfreq_reg 3e-3 \
+  --highlight_reflectance_reg 1e-3 \
+  --residual_chroma_reg 5e-4 \
+  --reflectance_detail_reg 1e-6 \
+  --reflectance_decoder_reg 2e-5 \
+  --reflectance_offset_lr 0.008 \
+  --reflectance_decoder_lr 0.002 \
+  --sg_smooth_reg 5e-5 \
+  --b0_spatial_smooth_reg 0.0 \
+  --residual_start_iter 3000 \
+  --residual_ramp_iters 2500 \
+  --enhancement_reflectance_reg 0.06 \
+  --enhancement_degree_reg 0.2 \
+  --enhancement_degree_global_reg 0.05 \
+  --enhancement_smooth_reg 4e-4 \
+  --enhancement_diff_start_iter 3500 \
+  --enhancement_color_reg 0.06 \
+  --enhancement_color_std_reg 0.02 \
+  --enhancement_green_bias_reg 0.06 \
+  --enhancement_prior cidnet \
+  --cidnet_conda_env CIDNet \
+  --cidnet_root ./submodules/HVI-CIDNet \
+  --cidnet_weights ./submodules/HVI-CIDNet/weights/LOLv2_real/w_perc.pth \
+  --cidnet_force_refresh \
+  --cidnet_refresh_interval 3000 \
+  --cidnet_mlp_steps 100 \
+  --cidnet_target_exposure 0.5 \
+  --cidnet_refresh_reg 0.5 \
+  --cidnet_color_reg 0.2 \
+  --cidnet_param_reg 0.1 \
+  --cidnet_mv_reg 0.5
+```
+
+Render / Eval:
+
+```bash
+python /home/liuyuhao/ll_further/LL-Gaussian-sg/render.py \
+  -m outputs/shrub_prior_nores_12kv3_lita_stable \
+  --dataset_path datasets/shrub \
+  --iteration 12000 \
+  --skip_train \
+  --skip_optimize
+```

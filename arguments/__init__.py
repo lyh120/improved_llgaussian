@@ -236,6 +236,14 @@ class OptimizationParams(ParamGroup):
         self.enhancement_from = 10_000
         self.residual_start_iter = 3_000
         self.residual_ramp_iters = 2_500
+        self.disable_warmup_densify = False
+        self.warmup_iterations = 2_000
+        self.warmup_update_from = -1
+        self.warmup_update_until = -1
+        self.warmup_update_interval = -1
+        self.warmup_densify_grad_threshold = -1.0
+        self.warmup_min_opacity = -1.0
+        self.warmup_success_threshold = -1.0
         
         self.min_opacity = 0.005
         self.success_threshold = 0.8
@@ -321,6 +329,14 @@ def _backfill_model_compatibility(merged_dict):
         "b0_spatial_smooth_reg": 0.0,
         "residual_start_iter": 3_000,
         "residual_ramp_iters": 2_500,
+        "disable_warmup_densify": False,
+        "warmup_iterations": 2_000,
+        "warmup_update_from": -1,
+        "warmup_update_until": -1,
+        "warmup_update_interval": -1,
+        "warmup_densify_grad_threshold": -1.0,
+        "warmup_min_opacity": -1.0,
+        "warmup_success_threshold": -1.0,
     }
     for key, value in defaults.items():
         merged_dict.setdefault(key, value)
