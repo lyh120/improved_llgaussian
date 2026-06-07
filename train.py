@@ -708,7 +708,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         L_smooth =  L_Smooth(illumination_image, gt_image, kernel_size=9) * 5e-4
         L_illu = L_Illu(gt_image, illumination_image) 
         L_reflectance_smooth = L_Reflectance_Smooth(reflectance_image, illumination_image) * dataset.reflectance_smooth_reg
-        L_depth_similarity = (L_Depth_similarity(1 - minmax_normalize(depth_image).squeeze(0), depth_piror_norm.squeeze(0), 128, 0.5) ) * 0.15
+        L_depth_similarity = (
+            L_Depth_similarity(1 - minmax_normalize(depth_image).squeeze(0), depth_piror_norm.squeeze(0), 128, 0.5)
+            * getattr(dataset, "depth_similarity_weight", 0.15)
+        )
         L_depth_prior_file = torch.tensor(0.0, device=gt_image.device)
         L_depth_prior_feature = torch.tensor(0.0, device=gt_image.device)
         depth_prior_mask = depth_prior_alpha > 0.05 if depth_prior_alpha is not None else None
@@ -772,11 +775,100 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         L_enhanced_color_std = torch.tensor(0.0, device=gt_image.device)
         L_enhanced_green_bias = torch.tensor(0.0, device=gt_image.device)
 
+        loss_profile = getattr(dataset, "loss_profile", "targeted_v1")
+        if loss_profile not in {"targeted_v1", "legacy_full"}:
+            raise ValueError(f"Unsupported loss_profile: {loss_profile}")
+        use_targeted_loss = loss_profile == "targeted_v1"
+        use_depth_file_loss = dataset.use_depth_prior_files and gt_depth_prior_file is not None
+
         if torch.isnan(scaling_reg) or torch.isinf(scaling_reg):
             print("Warning: scaling_reg is nan or inf")
             print("scaling_reg:", scaling_reg.item())
 
-        if mode == "warmup":
+        if use_targeted_loss:
+            loss = (
+                (1.0 - opt.lambda_dssim) * Ll1
+                + opt.lambda_dssim * ssim_loss
+                + dataset.illumination_reg * L_illu
+                + 0.01 * scaling_reg
+            )
+
+            if iteration >= opt.update_from:
+                loss += L_smooth
+                if use_depth_file_loss:
+                    loss += dataset.depth_prior_file_reg * (L_depth_prior_file + L_depth_prior_feature)
+                else:
+                    loss += L_depth_similarity
+                loss += dataset.structure_prior_file_reg * L_structure_prior_file
+                loss += dataset.enhancement_sg_prior_smooth_reg * L_enhancement_sg_prior_smooth
+                loss += dataset.sg_energy_reg * L_sg_energy
+                loss += dataset.sg_smooth_reg * L_sg_sharpness
+                loss += 2e-3 * L_reflectance_edge_uplift
+                loss += dataset.highlight_reflectance_reg * L_reflectance_highlight
+                loss += dataset.reflectance_detail_reg * L_reflectance_detail
+                loss += dataset.reflectance_decoder_reg * L_reflectance_decoder
+
+            if mode != "warmup" and iteration >= dataset.enhancement_diff_start_iter:
+                L_degree = (
+                    torch.abs(
+                        illumination_enhanced_image.mean(0)
+                        - torch.clamp(illumination_image.mean(0).detach() * enhance_ratio, 0, 1)
+                    ).mean() * 0.1
+                    + torch.abs(
+                        illumination_enhanced_image.mean()
+                        - illumination_image.mean().detach() * enhance_ratio
+                    ).mean() * 0.03
+                )
+                L_smooth_enhancement = (
+                    L_Smooth(illumination_enhanced_image / enhance_ratio, gt_image, kernel_size=9)
+                    * dataset.enhancement_smooth_reg
+                )
+                refined_target = get_refined_image(refined_image_dict, viewpoint_cam).cuda()
+                image_enhanced_pred = torch.clamp(illumination_enhanced_image * reflectance_image, 0.0, 1.0)
+                pred_mean = image_enhanced_pred.mean(dim=(1, 2))
+                target_mean = refined_target.mean(dim=(1, 2))
+                L_enhanced_color = torch.abs(pred_mean - target_mean).mean()
+                L_diff_illumination = torch.abs(
+                    illumination_enhanced_image * reflectance_image.detach() - refined_target
+                ).mean()
+                guidance_progress = min(
+                    1.0,
+                    max(
+                        0.0,
+                        float(iteration - dataset.enhancement_diff_start_iter)
+                        / float(max(1, opt.iterations - dataset.enhancement_diff_start_iter)),
+                    ),
+                )
+                enhancement_guidance_weight = 1.0 - 0.7 * guidance_progress
+                L_diff = L_diff_illumination
+                loss += (
+                    L_degree
+                    + L_smooth_enhancement
+                    + 0.03 * L_enhanced_color
+                    + enhancement_guidance_weight * L_diff
+                )
+
+            if dataset.use_residual and not dataset.use_dual_transient and residual_active:
+                scaling_residual_reg = scaling_residual.prod(dim=1).mean()
+                L_artifact_sparse = torch.mean(torch.abs(artifact_image_for_loss)) * weight_scheduler(iteration)
+                L_residual_reg = L_artifact_sparse
+                artifact_abs_mean = torch.abs(artifact_image_for_loss).mean()
+                artifact_chroma_mean = torch.abs(artifact_image_for_loss - artifact_image_for_loss.mean(dim=0, keepdim=True)).mean()
+                loss += dataset.artifact_residual_reg * L_residual_reg + 0.05 * scaling_residual_reg
+            elif dataset.use_residual and residual_active:
+                scaling_residual_reg = scaling_residual.prod(dim=1).mean()
+                L_noise_sparse = torch.mean(torch.abs(noise_image_for_loss)) * weight_scheduler(iteration)
+                L_artifact_sparse = torch.mean(torch.abs(artifact_image_for_loss)) * weight_scheduler(iteration)
+                L_residual_reg = L_noise_sparse + L_artifact_sparse
+                noise_abs_mean = torch.abs(noise_image_for_loss).mean()
+                artifact_abs_mean = torch.abs(artifact_image_for_loss).mean()
+                artifact_chroma_mean = torch.abs(artifact_image_for_loss - artifact_image_for_loss.mean(dim=0, keepdim=True)).mean()
+                loss += (
+                    dataset.noise_residual_reg * L_noise_sparse
+                    + dataset.artifact_residual_reg * L_artifact_sparse
+                    + 0.05 * scaling_residual_reg
+                )
+        elif mode == "warmup":
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + L_illu + 0.01 * scaling_reg
             if iteration >= opt.update_from:
                 loss += L_smooth * 0.1 +  L_depth_similarity 

@@ -85,8 +85,11 @@ class ModelParams(ParamGroup):
         self.use_3D_filter = False
         self.use_sg_illumination = True
         self.illumination_mode = "sg"
+        self.loss_profile = "targeted_v1"
         self.sg_lobes = 4
         self.sg_lambda_min = 1.0
+        self.illumination_reg = 0.2
+        self.depth_similarity_weight = 0.15
         self.sg_energy_reg = 1e-4
         self.sg_smooth_reg = 5e-5
         self.reflectance_consistency_reg = 2e-5
@@ -257,9 +260,12 @@ def _backfill_model_compatibility(merged_dict):
     defaults = {
         "use_sg_illumination": True,
         "illumination_mode": "sg",
+        "loss_profile": "targeted_v1",
         "use_dual_transient": False,
         "sg_lobes": 4,
         "sg_lambda_min": 1.0,
+        "illumination_reg": 0.2,
+        "depth_similarity_weight": 0.15,
         "sg_energy_reg": 1e-4,
         "sg_smooth_reg": 5e-5,
         "reflectance_consistency_reg": 2e-5,
