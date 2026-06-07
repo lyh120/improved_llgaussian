@@ -84,11 +84,17 @@ class ModelParams(ParamGroup):
         self.use_dual_transient = False
         self.use_3D_filter = False
         self.use_sg_illumination = True
-        self.illumination_mode = "sg"
+        self.use_asg_illumination = True
+        self.illumination_mode = "asg"
         self.sg_lobes = 4
         self.sg_lambda_min = 1.0
         self.sg_energy_reg = 1e-4
         self.sg_smooth_reg = 5e-5
+        self.asg_lobes = 1
+        self.asg_lambda_min = 1.0
+        self.asg_energy_reg = 1e-4
+        self.asg_sharpness_reg = 5e-5
+        self.asg_anisotropy_reg = 1e-5
         self.reflectance_consistency_reg = 2e-5
         self.reflectance_smooth_reg = 0.0
         self.reflectance_edge_reg = 2e-4
@@ -244,12 +250,18 @@ def _backfill_model_compatibility(merged_dict):
 
     defaults = {
         "use_sg_illumination": True,
-        "illumination_mode": "sg",
+        "use_asg_illumination": True,
+        "illumination_mode": "asg",
         "use_dual_transient": False,
         "sg_lobes": 4,
         "sg_lambda_min": 1.0,
         "sg_energy_reg": 1e-4,
         "sg_smooth_reg": 5e-5,
+        "asg_lobes": 1,
+        "asg_lambda_min": 1.0,
+        "asg_energy_reg": 1e-4,
+        "asg_sharpness_reg": 5e-5,
+        "asg_anisotropy_reg": 1e-5,
         "reflectance_consistency_reg": 2e-5,
         "reflectance_smooth_reg": 0.0,
         "reflectance_edge_reg": 2e-4,

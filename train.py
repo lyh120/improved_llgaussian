@@ -45,7 +45,7 @@ sys.path.append("./submodules/Depth-Anything-V2")
 # from lpipsPyTorch import lpips
 import lpips
 from random import randint
-from utils.loss_utils import l1_loss, ssim, l1_plus_loss, L_Smooth, L_Illu, L_Gray, L_Green_Bias, L_Depth_similarity, L_Reflectance_Smooth, L_Depth_Smooth, pearson_depth_loss, L_Reflectance_Consistency, L_Reflectance_Edge, L_Reflectance_Edge_Uplift, L_Reflectance_Highlight, L_Reflectance_LocalContrast, L_Reflectance_HighFreq, L_Residual_Chroma_Boost, L_Noise_Zero_Mean, L_Noise_Dark_Weighted, L_Noise_HighFreq, L_SG_Energy, L_SG_Sharpness, L_B0_Spatial_Smooth, build_dual_transient_masks
+from utils.loss_utils import l1_loss, ssim, l1_plus_loss, L_Smooth, L_Illu, L_Gray, L_Green_Bias, L_Depth_similarity, L_Reflectance_Smooth, L_Depth_Smooth, pearson_depth_loss, L_Reflectance_Consistency, L_Reflectance_Edge, L_Reflectance_Edge_Uplift, L_Reflectance_Highlight, L_Reflectance_LocalContrast, L_Reflectance_HighFreq, L_Residual_Chroma_Boost, L_Noise_Zero_Mean, L_Noise_Dark_Weighted, L_Noise_HighFreq, L_SG_Energy, L_SG_Sharpness, L_ASG_Energy, L_ASG_Sharpness, L_ASG_Anisotropy, L_B0_Spatial_Smooth, build_dual_transient_masks
 from gaussian_renderer import prefilter_voxel, render, network_gui
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -447,7 +447,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
     gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
                               dataset.appearance_residual_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_reflectance_dist, dataset.add_illumination_dist, dataset.add_residual_dist, dataset.use_residual, dataset.use_dual_transient, dataset.use_3D_filter,
-                              use_sg_illumination=dataset.use_sg_illumination, illumination_mode=dataset.illumination_mode, sg_lobes=dataset.sg_lobes, sg_lambda_min=dataset.sg_lambda_min)
+                              use_sg_illumination=dataset.use_sg_illumination, use_asg_illumination=dataset.use_asg_illumination, illumination_mode=dataset.illumination_mode, sg_lobes=dataset.sg_lobes, sg_lambda_min=dataset.sg_lambda_min, asg_lobes=dataset.asg_lobes, asg_lambda_min=dataset.asg_lambda_min)
     depth_piror_model = depth_piror_Model()
     if mode == "warmuped":
         scene = Scene(dataset, gaussians, depth_piror_model, ply_path=ply_path, shuffle=False, load_iteration=-1 , only_ply=True)
@@ -698,9 +698,12 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             ssim_loss = ssim(image_tmp, gt_image)
         ssim_loss = 1.0 - ssim_loss
         scaling_reg = scaling.prod(dim=1).mean()
-        sg_stats = render_pkg.get("sg_stats")
-        L_sg_energy = L_SG_Energy(sg_stats)
-        L_sg_sharpness = L_SG_Sharpness(sg_stats)
+        illumination_stats = render_pkg.get("illumination_stats", render_pkg.get("sg_stats"))
+        L_sg_energy = L_SG_Energy(illumination_stats)
+        L_sg_sharpness = L_SG_Sharpness(illumination_stats)
+        L_asg_energy = L_ASG_Energy(illumination_stats)
+        L_asg_sharpness = L_ASG_Sharpness(illumination_stats)
+        L_asg_anisotropy = L_ASG_Anisotropy(illumination_stats)
         L_reflectance_consistency = L_Reflectance_Consistency(reflectance_image)
         L_reflectance_edge = L_Reflectance_Edge(reflectance_image, gt_image)
         L_reflectance_edge_uplift = L_Reflectance_Edge_Uplift(reflectance_image, gt_image)
@@ -750,8 +753,13 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             
             if iteration >= opt.update_from:
                 loss +=  L_smooth + L_depth_similarity
-                loss += dataset.sg_energy_reg * L_sg_energy
-                loss += dataset.sg_smooth_reg * L_sg_sharpness
+                if dataset.illumination_mode == "asg":
+                    loss += dataset.asg_energy_reg * L_asg_energy
+                    loss += dataset.asg_sharpness_reg * L_asg_sharpness
+                    loss += dataset.asg_anisotropy_reg * L_asg_anisotropy
+                else:
+                    loss += dataset.sg_energy_reg * L_sg_energy
+                    loss += dataset.sg_smooth_reg * L_sg_sharpness
                 loss += dataset.reflectance_consistency_reg * (L_reflectance_consistency + L_reflectance_smooth)
                 loss += dataset.reflectance_edge_reg * L_reflectance_edge
                 loss += dataset.reflectance_edge_uplift_reg * L_reflectance_edge_uplift
@@ -862,6 +870,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                            'illumination_mean': illumination_image.mean(),
                            'sg_energy': L_sg_energy,
                            'sg_lambda_mean': L_sg_sharpness,
+                           'asg_energy': L_asg_energy,
+                           'asg_lambda_mean': L_asg_sharpness,
+                           'asg_anisotropy': L_asg_anisotropy,
                            'reflectance_consistency': L_reflectance_consistency,
                            'reflectance_edge_mean': L_reflectance_edge,
                            'reflectance_edge_uplift_mean': L_reflectance_edge_uplift,
@@ -878,6 +889,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                                 'illumination_mean': illumination_image.mean(),
                                 'sg_energy': L_sg_energy,
                                 'sg_lambda_mean': L_sg_sharpness,
+                                'asg_energy': L_asg_energy,
+                                'asg_lambda_mean': L_asg_sharpness,
+                                'asg_anisotropy': L_asg_anisotropy,
                                 'reflectance_consistency': L_reflectance_consistency,
                                 'reflectance_edge_mean': L_reflectance_edge,
                                 'reflectance_edge_uplift_mean': L_reflectance_edge_uplift,
@@ -1003,6 +1017,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 print("illumination_image", illumination_image.mean())
                 print("sg_energy", L_sg_energy)
                 print("sg_lambda_mean", L_sg_sharpness)
+                print("asg_energy", L_asg_energy)
+                print("asg_lambda_mean", L_asg_sharpness)
+                print("asg_anisotropy", L_asg_anisotropy)
                 print("residual_image_raw_mean", residual_image_raw.mean())
                 print("residual_abs_mean_raw", residual_abs.mean())
                 print("residual_abs_mean_used", residual_abs_used.mean())
@@ -1404,7 +1421,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train=False, skip_test=False, wandb=None, tb_writer=None, dataset_name=None, logger=None):
     gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
                               dataset.appearance_residual_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_reflectance_dist, dataset.add_illumination_dist, dataset.add_residual_dist, dataset.use_residual, dataset.use_dual_transient, dataset.use_3D_filter,
-                              use_sg_illumination=dataset.use_sg_illumination, illumination_mode=dataset.illumination_mode, sg_lobes=dataset.sg_lobes, sg_lambda_min=dataset.sg_lambda_min)
+                              use_sg_illumination=dataset.use_sg_illumination, use_asg_illumination=dataset.use_asg_illumination, illumination_mode=dataset.illumination_mode, sg_lobes=dataset.sg_lobes, sg_lambda_min=dataset.sg_lambda_min, asg_lobes=dataset.asg_lobes, asg_lambda_min=dataset.asg_lambda_min)
     scene = Scene(dataset, gaussians, depth_piror_model=None, load_iteration=iteration, shuffle=False)
     gaussians.eval()
 

@@ -410,6 +410,24 @@ def L_SG_Sharpness(sg_stats):
         return torch.tensor(0.0, device="cuda")
     return sg_stats["sg_lambda_mean"]
 
+
+def L_ASG_Energy(illumination_stats):
+    if not illumination_stats:
+        return torch.tensor(0.0, device="cuda")
+    return illumination_stats.get("asg_energy", illumination_stats.get("illumination_energy", torch.tensor(0.0, device="cuda")))
+
+
+def L_ASG_Sharpness(illumination_stats):
+    if not illumination_stats:
+        return torch.tensor(0.0, device="cuda")
+    return illumination_stats.get("asg_lambda_mean", illumination_stats.get("illumination_lambda_mean", torch.tensor(0.0, device="cuda")))
+
+
+def L_ASG_Anisotropy(illumination_stats):
+    if not illumination_stats:
+        return torch.tensor(0.0, device="cuda")
+    return illumination_stats.get("asg_anisotropy", torch.tensor(0.0, device="cuda"))
+
 def L_Feat_Smooth(feature_image, image, mask, depth_image):
     image = image.detach()
     # 将图像转换为灰度图像

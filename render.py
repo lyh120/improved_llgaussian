@@ -65,6 +65,62 @@ except ImportError:
     PipelineParams = arguments_module.PipelineParams
     get_combined_args = arguments_module.get_combined_args
 
+
+def _cuda_profile_now() -> float:
+    torch.cuda.synchronize()
+    return time.perf_counter()
+
+
+def _summarize_profile(profile_views, warmup_views):
+    ignored = min(max(0, warmup_views), max(0, len(profile_views) - 1))
+    measured = profile_views[ignored:]
+    if not measured:
+        measured = profile_views
+    summary = {
+        "num_views": len(profile_views),
+        "warmup_views_ignored": ignored,
+        "measured_views": len(measured),
+    }
+    timing_keys = [
+        "loop_wall_time",
+        "prefilter_time",
+        "render_core_time",
+        "save_time",
+        "metric_time",
+        "generate_neural_gaussians_time",
+        "rasterize_main_time",
+        "rasterize_residual_time",
+    ]
+    for key in timing_keys:
+        total = sum(float(item.get(key, 0.0)) for item in measured)
+        summary[f"{key}_total"] = total
+        summary[f"{key}_avg"] = total / max(1, len(measured))
+        summary[f"{key}_fps"] = len(measured) / total if total > 0 else 0.0
+    return summary
+
+
+def _print_profile_summary(name, summary):
+    print(
+        f"[profile:{name}] measured_views={summary['measured_views']} "
+        f"(ignored warmup={summary['warmup_views_ignored']})"
+    )
+    for key in [
+        "loop_wall_time",
+        "prefilter_time",
+        "render_core_time",
+        "generate_neural_gaussians_time",
+        "rasterize_main_time",
+        "rasterize_residual_time",
+        "save_time",
+        "metric_time",
+    ]:
+        print(
+            f"[profile:{name}] {key}: "
+            f"total={summary[f'{key}_total']:.6f}s "
+            f"avg={summary[f'{key}_avg']:.6f}s "
+            f"fps={summary[f'{key}_fps']:.3f}"
+        )
+
 def load_pose(path, train_cams):
     w2c_list = np.load(path)
     quat_pose = []
@@ -367,7 +423,20 @@ def render_set_optimize(model_path, name, iteration, views, gaussians, pipeline,
 
 
 
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background, kernel_size, bright_gt_root=None, evaluate_metrics=False):
+def render_set(
+    model_path,
+    name,
+    iteration,
+    views,
+    gaussians,
+    pipeline,
+    background,
+    kernel_size,
+    bright_gt_root=None,
+    evaluate_metrics=False,
+    profile_render_timing=False,
+    profile_warmup_views=1,
+):
 
 
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
@@ -404,15 +473,22 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     visible_count_list = []
     name_list = []
     per_view_dict = {}
-    sg_stats_dict = {}
+    illumination_stats_dict = {}
     lowlight_metrics = {}
     enhanced_metrics = {}
     time_consume = 0
+    profile_views = []
     lpips_fn = None
+    lpips_setup_time = 0.0
     if evaluate_metrics:
+        lpips_setup_start = time.perf_counter()
         import lpips
         lpips_fn = lpips.LPIPS(net='vgg').to("cuda").eval()
+        torch.cuda.synchronize()
+        lpips_setup_time = time.perf_counter() - lpips_setup_start
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
+        profile_item = {"view": view.image_name + ".png"} if profile_render_timing else None
+        loop_wall_start = time.perf_counter() if profile_render_timing else None
 
         torch.cuda.synchronize(); t0 = time.time()
         
@@ -420,16 +496,36 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
             pose = get_tensor_from_camera(view.world_view_transform.transpose(0, 1))
         else:
             pose = gaussians.get_RT(view.uid)
+        profile_prefilter_start = _cuda_profile_now() if profile_render_timing else None
         voxel_visible_mask = prefilter_voxel(view, gaussians, pipeline, background, kernel_size=kernel_size,camera_pose=pose)
-        render_pkg = render(view, gaussians, pipeline, background, visible_mask=voxel_visible_mask, kernel_size=kernel_size,camera_pose=pose)
+        if profile_render_timing:
+            profile_prefilter_end = _cuda_profile_now()
+            profile_item["prefilter_time"] = profile_prefilter_end - profile_prefilter_start
+        render_profile = {} if profile_render_timing else None
+        profile_render_start = _cuda_profile_now() if profile_render_timing else None
+        render_pkg = render(
+            view,
+            gaussians,
+            pipeline,
+            background,
+            visible_mask=voxel_visible_mask,
+            kernel_size=kernel_size,
+            camera_pose=pose,
+            profile_timings=render_profile,
+        )
+        if profile_render_timing:
+            profile_render_end = _cuda_profile_now()
+            profile_item["render_core_time"] = profile_render_end - profile_render_start
+            profile_item.update(render_profile)
         torch.cuda.synchronize(); t1 = time.time()
         time_consume += t1 - t0
-        sg_stats = render_pkg.get("sg_stats")
-        if sg_stats:
-            sg_stats_dict[view.image_name + ".png"] = {
-                "sg_energy": float(sg_stats["sg_energy"].detach().cpu()),
-                "sg_lambda_mean": float(sg_stats["sg_lambda_mean"].detach().cpu()),
-                "sg_lambda_max": float(sg_stats["sg_lambda_max"].detach().cpu()),
+        profile_save_start = time.perf_counter() if profile_render_timing else None
+        illumination_stats = render_pkg.get("illumination_stats", render_pkg.get("sg_stats"))
+        if illumination_stats:
+            illumination_stats_dict[view.image_name + ".png"] = {
+                key: float(value.detach().cpu())
+                for key, value in illumination_stats.items()
+                if torch.is_tensor(value) and value.numel() == 1
             }
 
         rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
@@ -471,6 +567,11 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         depth_est = visualize_cmap(depth_est, np.ones_like(depth_est), cm.get_cmap('turbo'), curve_fn=depth_curve_fn).copy()
         depth_est = torch.as_tensor(depth_est).permute(2,0,1)
         torchvision.utils.save_image(depth_est, os.path.join(render_depth_path, 'color_{0:05d}'.format(idx) + ".png"))
+        if profile_render_timing:
+            torch.cuda.synchronize()
+            profile_save_end = time.perf_counter()
+            profile_item["save_time"] = profile_save_end - profile_save_start
+            profile_metric_start = time.perf_counter()
         if gt is not None:
             torchvision.utils.save_image(gt, os.path.join(gts_path, view.image_name + ".png"))
             if evaluate_metrics and lpips_fn is not None:
@@ -479,6 +580,12 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
             bright_gt = _load_image_tensor_from_pattern(os.path.join(bright_gt_root, view.image_name + ".*"), rendering_enhanced.device)
             if bright_gt is not None:
                 enhanced_metrics[view.image_name + ".png"] = _compute_metrics(rendering_enhanced, bright_gt, lpips_fn)
+        if profile_render_timing:
+            torch.cuda.synchronize()
+            profile_metric_end = time.perf_counter()
+            profile_item["metric_time"] = profile_metric_end - profile_metric_start
+            profile_item["loop_wall_time"] = profile_metric_end - loop_wall_start
+            profile_views.append(profile_item)
 
     img_num = idx + 1
     fps = img_num / time_consume
@@ -486,9 +593,12 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
     with open(os.path.join(model_path, name, "ours_{}".format(iteration), "per_view_count.json"), 'w') as fp:
             json.dump(per_view_dict, fp, indent=True)      
-    if sg_stats_dict:
-        with open(os.path.join(model_path, name, "ours_{}".format(iteration), "sg_stats.json"), 'w') as fp:
-            json.dump(sg_stats_dict, fp, indent=True)
+    if illumination_stats_dict:
+        stats_name = "asg_stats.json" if gaussians.illumination_mode == "asg" else "sg_stats.json"
+        with open(os.path.join(model_path, name, "ours_{}".format(iteration), stats_name), 'w') as fp:
+            json.dump(illumination_stats_dict, fp, indent=True)
+        with open(os.path.join(model_path, name, "ours_{}".format(iteration), "illumination_stats.json"), 'w') as fp:
+            json.dump(illumination_stats_dict, fp, indent=True)
     if evaluate_metrics:
         _dump_metric_report(
             os.path.join(model_path, name, "ours_{}".format(iteration), "metrics_lowlight.json"),
@@ -500,23 +610,53 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
             enhanced_metrics,
             "enhanced_gt",
         )
+    if profile_render_timing and profile_views:
+        profile_summary = _summarize_profile(profile_views, profile_warmup_views)
+        _print_profile_summary(name, profile_summary)
+        profile_report = {
+            "set": name,
+            "iteration": iteration,
+            "illumination_mode": gaussians.illumination_mode,
+            "lpips_setup_time": lpips_setup_time,
+            "summary": profile_summary,
+            "views": profile_views,
+        }
+        with open(os.path.join(model_path, name, "ours_{}".format(iteration), "render_timing_profile.json"), 'w') as fp:
+            json.dump(profile_report, fp, indent=True)
      
-def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, skip_optimize, infer_video : bool, include_residual_render: bool, eval_train_metrics: bool):
+def render_sets(
+    dataset: ModelParams,
+    iteration: int,
+    pipeline: PipelineParams,
+    skip_train: bool,
+    skip_test: bool,
+    skip_optimize,
+    infer_video: bool,
+    include_residual_render: bool,
+    eval_train_metrics: bool,
+    profile_render_timing: bool,
+    profile_warmup_views: int,
+):
     with torch.no_grad():
         use_sg_illumination = getattr(dataset, "use_sg_illumination", getattr(dataset, "use_sg", True))
-        illumination_mode = getattr(dataset, "illumination_mode", "sg")
+        use_asg_illumination = getattr(dataset, "use_asg_illumination", True)
+        illumination_mode = getattr(dataset, "illumination_mode", "asg")
         sg_lobes = getattr(dataset, "sg_lobes", getattr(dataset, "num_sg", 4))
         sg_lambda_min = getattr(dataset, "sg_lambda_min", 1.0)
+        asg_lobes = getattr(dataset, "asg_lobes", 1)
+        asg_lambda_min = getattr(dataset, "asg_lambda_min", 1.0)
 
         gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
                               dataset.appearance_residual_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_reflectance_dist, dataset.add_illumination_dist, dataset.add_residual_dist, dataset.use_residual, dataset.use_dual_transient, dataset.use_3D_filter,
-                              use_sg_illumination=use_sg_illumination, illumination_mode=illumination_mode, sg_lobes=sg_lobes, sg_lambda_min=sg_lambda_min)
+                              use_sg_illumination=use_sg_illumination, use_asg_illumination=use_asg_illumination, illumination_mode=illumination_mode, sg_lobes=sg_lobes, sg_lambda_min=sg_lambda_min, asg_lobes=asg_lobes, asg_lambda_min=asg_lambda_min)
         scene = Scene(dataset, gaussians, depth_piror_model=None, load_iteration=iteration, shuffle=False)
         
         gaussians.eval()
         if not include_residual_render:
             gaussians.use_residual = False
-        if gaussians.illumination_mode == "sg" and use_sg_illumination and gaussians.sg_illumination_available:
+        if gaussians.illumination_mode == "asg" and use_asg_illumination and gaussians.asg_illumination_available:
+            print("Rendering with ASG illumination and B0 reflectance.")
+        elif gaussians.illumination_mode == "sg" and use_sg_illumination and gaussians.sg_illumination_available:
             print("Rendering with SG illumination and B0 reflectance.")
         else:
             print("Rendering in legacy compatibility mode.")
@@ -538,12 +678,27 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
                 dataset.kernel_size,
                 bright_gt_root=bright_gt_root,
                 evaluate_metrics=eval_train_metrics,
+                profile_render_timing=profile_render_timing,
+                profile_warmup_views=profile_warmup_views,
             )
 
     if not skip_test:
         gaussians.init_RT_seq(scene.test_cameras)
         if skip_optimize:
-            render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, dataset.kernel_size, bright_gt_root=bright_gt_root, evaluate_metrics=True)
+            render_set(
+                dataset.model_path,
+                "test",
+                scene.loaded_iter,
+                scene.getTestCameras(),
+                gaussians,
+                pipeline,
+                background,
+                dataset.kernel_size,
+                bright_gt_root=bright_gt_root,
+                evaluate_metrics=True,
+                profile_render_timing=profile_render_timing,
+                profile_warmup_views=profile_warmup_views,
+            )
         else:
             render_set_optimize(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, dataset.kernel_size)
 
@@ -564,6 +719,8 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
                 dataset.kernel_size,
                 bright_gt_root=bright_gt_root,
                 evaluate_metrics=False,
+                profile_render_timing=profile_render_timing,
+                profile_warmup_views=profile_warmup_views,
             )
             image_folder = os.path.join(dataset.model_path, f'interp/ours_{scene.loaded_iter}/render_enhanceds')
             output_video_file = os.path.join(dataset.model_path, f'interp/ours_{scene.loaded_iter}/interp_enhanced_view.mp4')
@@ -586,6 +743,8 @@ if __name__ == "__main__":
     parser.add_argument("--infer_video", action="store_true")
     parser.add_argument("--include_residual_render", action="store_true")
     parser.add_argument("--eval_train_metrics", action="store_true")
+    parser.add_argument("--profile_render_timing", action="store_true")
+    parser.add_argument("--profile_warmup_views", default=1, type=int)
 
     args = get_combined_args(parser)
     if args.dataset_path:
@@ -604,4 +763,6 @@ if __name__ == "__main__":
         args.infer_video,
         args.include_residual_render,
         args.eval_train_metrics,
+        args.profile_render_timing,
+        args.profile_warmup_views,
     )

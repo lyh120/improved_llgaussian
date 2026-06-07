@@ -12,15 +12,31 @@ import torch
 from einops import rearrange, repeat
 
 import math
+import time
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 from diff_gaussian_rasterization_residual import GaussianRasterizationSettings_Residual, GaussianRasterizer_Residual
 from diff_gaussian_rasterization_fast import GaussianRasterizationSettings_Fast, GaussianRasterizer_Fast
 from scene.gaussian_model import GaussianModel
 from utils.pose_utils import get_camera_from_tensor, quadmultiply
-from utils.sg_utils import evaluate_spherical_gaussians
+from utils.sg_utils import evaluate_anisotropic_spherical_gaussians, evaluate_spherical_gaussians
 
 
-def _compute_illumination(feat, ob_view, ob_dist, cat_with_dist, cat_without_dist, pc: GaussianModel):
+def _compute_illumination(feat, ob_view, ob_dist, cat_with_dist, cat_without_dist, pc: GaussianModel, visible_mask):
+    if pc.illumination_mode == "asg" and pc.use_asg_illumination and pc.asg_illumination_available:
+        illumination, illumination_feat, illumination_stats = evaluate_anisotropic_spherical_gaussians(
+            pc._illum_asg_axis[visible_mask],
+            pc._illum_asg_tangent[visible_mask],
+            pc._illum_asg_sharpness[visible_mask],
+            pc._illum_asg_amplitude[visible_mask],
+            pc._illum_asg_bias[visible_mask],
+            pc._illum_asg_dist_weight[visible_mask],
+            ob_view,
+            ob_dist,
+            pc.asg_lambda_min,
+            use_distance=pc.add_illumination_dist,
+        )
+        return illumination, illumination_feat, illumination_stats
+
     if pc.illumination_mode == "sg" and pc.use_sg_illumination and pc.sg_illumination_available:
         sg_input = cat_with_dist if pc.add_illumination_dist else cat_without_dist
         sg_raw = pc.get_sg_illumination_mlp(sg_input)
@@ -143,6 +159,7 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
         cat_local_view_illumination,
         cat_local_view_illumination_wodist,
         pc,
+        visible_mask,
     )
     illumination_enhanced = pc.get_enhanced_illumination(
         feat,
@@ -268,7 +285,17 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     else:
         return xyz, reflectance, illumination, illumination_enhanced, opacity, scaling, rot, xyz_residual, color_noise, color_artifact, scaling_residual, rot_residual, opacity_residual, sg_stats
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, kernel_size: float, scaling_modifier = 1.0, visible_mask=None, retain_grad=False, camera_pose=None):
+def _profile_sync_time() -> float:
+    torch.cuda.synchronize()
+    return time.perf_counter()
+
+
+def _profile_add(profile_timings: dict | None, key: str, value: float) -> None:
+    if profile_timings is not None:
+        profile_timings[key] = profile_timings.get(key, 0.0) + value
+
+
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, kernel_size: float, scaling_modifier = 1.0, visible_mask=None, retain_grad=False, camera_pose=None, profile_timings=None):
     """
     Render the scene. 
     
@@ -276,11 +303,14 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     """
     is_training = pc.get_illumination_mlp.training
     # is_enhancing = pc.render_enhancement
-        
+    profile_start = _profile_sync_time() if profile_timings is not None else None
     if is_training:
         xyz, reflectance, illumination, illumination_enhanced, opacity, scaling, rot, neural_opacity, mask, xyz_residual, color_noise, color_artifact, scaling_residual, rot_residual, opacity_residual, sg_stats = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
     else:
         xyz, reflectance, illumination, illumination_enhanced, opacity, scaling, rot, xyz_residual, color_noise, color_artifact, scaling_residual, rot_residual, opacity_residual, sg_stats = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
+    if profile_timings is not None:
+        profile_after_generate = _profile_sync_time()
+        _profile_add(profile_timings, "generate_neural_gaussians_time", profile_after_generate - profile_start)
     
     # print("ill_shape:", illumination.shape)
     # print("ref_shape:", reflectance.shape)
@@ -364,6 +394,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     #     cov3D_precomp = None)
 
 
+    raster_start = _profile_sync_time() if profile_timings is not None else None
     rendered_reflectance,radii,depth_map= rasterizer(
         # means3D = xyz,
         means3D = means3D,
@@ -402,6 +433,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         # rotations = rot,
         rotations = gaussians_rot_trans,
         cov3D_precomp = None)
+    if profile_timings is not None:
+        raster_after_main = _profile_sync_time()
+        _profile_add(profile_timings, "rasterize_main_time", raster_after_main - raster_start)
 
     # rendered_feat,_,_ = rasterizer(
     #     # means3D = xyz,
@@ -434,6 +468,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # rendered_feat = rendered_combined[6:-3,:,:]
     # rendered_feat_downsampled = rendered_combined[-3:,:,:]
     if pc.use_residual:
+        residual_raster_start = _profile_sync_time() if profile_timings is not None else None
         # raster_settings_residual = GaussianRasterizationSettings_Residual(
         #     image_height=int(viewpoint_camera.image_height),
         #     image_width=int(viewpoint_camera.image_width),
@@ -509,6 +544,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
             # rotations = rot_residual,
             cov3D_precomp = None)
         rendered_residual = rendered_noise + rendered_artifact
+        if profile_timings is not None:
+            residual_raster_after = _profile_sync_time()
+            _profile_add(profile_timings, "rasterize_residual_time", residual_raster_after - residual_raster_start)
         
         # rendered_feat_downsampled_residual,_ = rasterizer_residual(
         #     means3D = means3D_residual,
@@ -546,6 +584,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                     "scaling": scaling,
                     "scaling_residual":scaling_residual,
                     "sg_stats": sg_stats,
+                    "illumination_stats": sg_stats,
                     }
         else:
             return {"render": rendered_reflectance * rendered_illumination,
@@ -565,6 +604,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                     "visibility_filter" : radii > 0,
                     "radii": radii,
                     "sg_stats": sg_stats,
+                    "illumination_stats": sg_stats,
                     }
 
     # rendered_image, radii, depth_map = rasterizer(
@@ -680,6 +720,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 "neural_opacity": neural_opacity,
                 "scaling": scaling,
                 "sg_stats": sg_stats,
+                "illumination_stats": sg_stats,
                 }
     else:
         return {"render": rendered_reflectance * rendered_illumination,
@@ -695,6 +736,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 "visibility_filter" : radii > 0,
                 "radii": radii,
                 "sg_stats": sg_stats,
+                "illumination_stats": sg_stats,
                 }
 
 
@@ -756,6 +798,7 @@ def generate_neural_gaussians_fast(viewpoint_camera, pc : GaussianModel, visible
         cat_local_view_illumination,
         cat_local_view_illumination_wodist,
         pc,
+        visible_mask,
     )
     illumination_enhanced = pc.get_enhanced_illumination(
         feat,
@@ -901,7 +944,7 @@ def render_fast(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Ten
         rotations = gaussians_rot_trans,
         cov3D_precomp = None)  
        
-    return {"render": rendering, "sg_stats": sg_stats}
+    return {"render": rendering, "sg_stats": sg_stats, "illumination_stats": sg_stats}
 
 
 
