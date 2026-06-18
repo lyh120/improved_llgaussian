@@ -14,6 +14,7 @@ import random
 import json
 import importlib.util
 import sys
+import glob
 import torch
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
@@ -126,6 +127,12 @@ class Scene:
 ####
         if self.depth_piror_model:
             self.depth_piror_dict = self.depth_piror_generator(args.source_path)
+        if getattr(args, "use_structure_prior_files", False):
+            self.structure_prior_dict = self.structure_prior_generator(args.source_path, args.structure_prior_dir)
+            for camera in self.getTrainCameras().copy():
+                camera.structure_prior = self.structure_prior_dict[camera.uid]
+        else:
+            self.structure_prior_dict = {}
 
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
@@ -143,7 +150,6 @@ class Scene:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         for camera in self.getTrainCameras().copy():
             gt_path = os.path.join(source_path, 'images', camera.image_name + '.*')
-            import glob
             gt_path = glob.glob(gt_path)[0]
             gt_image = cv2.imread(gt_path)
             depth_piror = self.depth_piror_model.infer_image(gt_image)
@@ -157,5 +163,23 @@ class Scene:
             idx = camera.uid
             depth_piror_dict[idx] = minmax_normalize(depth_piror)
         return depth_piror_dict
+
+    def structure_prior_generator(self, source_path, prior_dir):
+        structure_prior_dict = dict()
+        prior_root = os.path.join(source_path, prior_dir)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if not os.path.isdir(prior_root):
+            raise FileNotFoundError(f"Structure prior directory not found: {prior_root}")
+        for camera in self.getTrainCameras().copy():
+            prior_candidates = glob.glob(os.path.join(prior_root, camera.image_name + ".*"))
+            if not prior_candidates:
+                raise FileNotFoundError(f"Missing structure prior for image {camera.image_name} in {prior_root}")
+            prior = cv2.imread(prior_candidates[0], cv2.IMREAD_GRAYSCALE)
+            if prior is None:
+                raise RuntimeError(f"Failed to read structure prior: {prior_candidates[0]}")
+            prior = cv2.resize(prior, (camera.image_width, camera.image_height), interpolation=cv2.INTER_LINEAR)
+            prior = torch.as_tensor(prior, dtype=torch.float32, device=device).unsqueeze(0) / 255.0
+            structure_prior_dict[camera.uid] = torch.clamp(prior, 0.0, 1.0)
+        return structure_prior_dict
     
 

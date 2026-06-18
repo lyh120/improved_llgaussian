@@ -495,7 +495,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         #     torchvision.utils.save_image(scene.getTrainCameras().copy()[i].original_image * 20, os.path.join(scene.model_path, 'view', f"view{i}.png"))
 
         visualize_camera_trajectories(scene.getTrainCameras().copy(), scene.getTestCameras().copy (), os.path.join(scene.model_path, "camera_pose_downsampled.png"))
-        visualize_anchor_with_camera(scene.getTrainCameras().copy(), scene.getTrainCameras().copy(), gaussians.get_anchor, os.path.join(scene.model_path, "anchor_with_camera_downsampled.png"))
+        try:
+            visualize_anchor_with_camera(scene.getTrainCameras().copy(), scene.getTrainCameras().copy(), gaussians.get_anchor, os.path.join(scene.model_path, "anchor_with_camera_downsampled.png"))
+        except Exception as exc:
+            print(f"[visualize] skipped anchor-camera debug plot: {exc}")
         os.makedirs( os.path.join(scene.model_path, 'fitered'), exist_ok=True)
         plot_point_cloud_projection(gaussians._anchor, scene.getTrainCameras().copy()[0], os.path.join(scene.model_path, 'fitered', f"anchor_in_view0.png"))
         # for i in range(len(scene.getTrainCameras())):
@@ -503,7 +506,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
     if mode == "train" or mode == "warmuped":
         visualize_camera_trajectories(scene.getTrainCameras().copy(), scene.getTestCameras().copy (), os.path.join(scene.model_path, "camera_pose_warmuped.png"))
-        visualize_anchor_with_camera(scene.getTrainCameras().copy(), scene.getTrainCameras().copy(), gaussians.get_anchor, os.path.join(scene.model_path, "anchor_with_camera_downsampled.png"))
+        try:
+            visualize_anchor_with_camera(scene.getTrainCameras().copy(), scene.getTrainCameras().copy(), gaussians.get_anchor, os.path.join(scene.model_path, "anchor_with_camera_downsampled.png"))
+        except Exception as exc:
+            print(f"[visualize] skipped anchor-camera debug plot: {exc}")
         os.makedirs( os.path.join(scene.model_path, 'warmuped'), exist_ok=True)
         plot_point_cloud_projection(gaussians._anchor, scene.getTrainCameras().copy()[0], os.path.join(scene.model_path, 'warmuped', f"anchor_in_view0.png"))
         # for i in range(len(scene.getTrainCameras())):
@@ -619,11 +625,27 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         t1 = time.time()
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe,background, dataset.kernel_size, camera_pose=pose)
         retain_grad = (iteration < opt.update_until and iteration >= 0)
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background, kernel_size=dataset.kernel_size, visible_mask=voxel_visible_mask, retain_grad=retain_grad, camera_pose=pose)
+        should_render_structure_prior = (
+            dataset.use_structure_prior_files
+            and hasattr(viewpoint_cam, "structure_prior")
+            and iteration >= dataset.structure_prior_start_iter
+        )
+        render_pkg = render(
+            viewpoint_cam,
+            gaussians,
+            pipe,
+            background,
+            kernel_size=dataset.kernel_size,
+            visible_mask=voxel_visible_mask,
+            retain_grad=retain_grad,
+            camera_pose=pose,
+            render_structure_prior=should_render_structure_prior,
+        )
         timing_stats['render_time'] = timing_stats.get('render_time', 0) + (time.time() - t1)
 
         t1 = time.time()
         reflectance_image, illumination_image, illumination_enhanced_image, depth_image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity= render_pkg["render_reflectance"], render_pkg["render_illumination"], render_pkg["render_illumination_enhanced"], render_pkg["render_depth"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
+        structure_prior_render = render_pkg.get("render_structure_prior")
         
         
 
@@ -640,6 +662,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         artifact_mask = torch.zeros_like(gt_image[:1])
         noise_mask_coverage = torch.tensor(0.0, device=gt_image.device)
         artifact_mask_coverage = torch.tensor(0.0, device=gt_image.device)
+        structure_prior_loss = torch.tensor(0.0, device=gt_image.device)
+        structure_prior_weight = torch.tensor(0.0, device=gt_image.device)
+        structure_prior_mask_coverage = torch.tensor(0.0, device=gt_image.device)
 
         if mode == "warmup":
             noise_image = torch.zeros_like(gt_image)
@@ -731,6 +756,42 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         L_enhanced_color_std = torch.tensor(0.0, device=gt_image.device)
         L_enhanced_green_bias = torch.tensor(0.0, device=gt_image.device)
 
+        if (
+            dataset.use_structure_prior_files
+            and structure_prior_render is not None
+            and hasattr(viewpoint_cam, "structure_prior")
+            and iteration >= dataset.structure_prior_start_iter
+        ):
+            target_structure_prior = viewpoint_cam.structure_prior.to(gt_image.device)
+            if target_structure_prior.shape[-2:] != structure_prior_render.shape[-2:]:
+                target_structure_prior = torch.nn.functional.interpolate(
+                    target_structure_prior.unsqueeze(0),
+                    size=structure_prior_render.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0)
+            if residual_active:
+                if dataset.use_dual_transient:
+                    residual_mask = torch.clamp(noise_mask.detach() + artifact_mask.detach(), 0.0, 1.0)
+                else:
+                    base_error = torch.mean(torch.abs(base_image.detach() - gt_image), dim=0, keepdim=True)
+                    threshold = torch.quantile(base_error.reshape(-1), dataset.structure_prior_error_percentile)
+                    residual_mask = (base_error > threshold).float()
+                structure_mask = 1.0 - residual_mask.detach()
+            else:
+                structure_mask = torch.ones_like(target_structure_prior)
+            structure_prior_weight = torch.as_tensor(
+                dataset.structure_prior_file_reg * (
+                    1.0 - dataset.structure_prior_residual_decay * residual_mix_weight
+                ),
+                device=gt_image.device,
+                dtype=gt_image.dtype,
+            )
+            structure_prior_mask_coverage = structure_mask.mean()
+            structure_prior_loss = structure_prior_weight * (
+                torch.abs(structure_prior_render - target_structure_prior) * structure_mask
+            ).mean() / (structure_prior_mask_coverage + 1e-6)
+
         if torch.isnan(scaling_reg) or torch.isinf(scaling_reg):
             print("Warning: scaling_reg is nan or inf")
             print("scaling_reg:", scaling_reg.item())
@@ -748,6 +809,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             loss += dataset.reflectance_detail_reg * L_reflectance_detail
             loss += dataset.reflectance_decoder_reg * L_reflectance_decoder
             loss += dataset.b0_spatial_smooth_reg * L_b0_spatial_smooth
+            loss += structure_prior_loss
         else:
             loss = (1.0 - opt.lambda_dssim ) * Ll1 + opt.lambda_dssim *  ssim_loss + L_illu + 0.01 * scaling_reg  
             
@@ -769,6 +831,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 loss += dataset.reflectance_detail_reg * L_reflectance_detail
                 loss += dataset.reflectance_decoder_reg * L_reflectance_decoder
                 loss += dataset.b0_spatial_smooth_reg * L_b0_spatial_smooth
+                loss += structure_prior_loss
 
             L_diff = 0
             if iteration >= opt.update_from:
@@ -881,6 +944,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                            'reflectance_highlight_mean': L_reflectance_highlight,
                            'reflectance_detail_mean': L_reflectance_detail,
                            'reflectance_decoder_mean': L_reflectance_decoder,
+                           'structure_prior_loss': structure_prior_loss,
+                           'structure_prior_weight': structure_prior_weight,
+                           'structure_prior_mask_coverage': structure_prior_mask_coverage,
                            'residual_mix_weight': residual_mix_weight,
                            'residual_chroma_boost': L_residual_chroma_boost})
             else:
@@ -900,6 +966,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                                 'reflectance_highlight_mean': L_reflectance_highlight,
                                 'reflectance_detail_mean': L_reflectance_detail,
                                 'reflectance_decoder_mean': L_reflectance_decoder,
+                                'structure_prior_loss': structure_prior_loss,
+                                'structure_prior_weight': structure_prior_weight,
+                                'structure_prior_mask_coverage': structure_prior_mask_coverage,
                                 'residual_enabled': float(residual_active),
                                 'residual_abs_mean': torch.abs(residual_image_for_loss).mean(),
                                 'residual_reg': L_residual_reg,
@@ -992,6 +1061,15 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         'image_enhanced':wandb.Image(torchvision.transforms.ToPILImage()(illumination_enhanced_image * reflectance_image)),
                         'refined_image':wandb.Image(torchvision.transforms.ToPILImage()(get_refined_image(refined_image_dict, viewpoint_cam, gt_image).cuda())),
                 }
+                if dataset.use_structure_prior_files and structure_prior_render is not None and hasattr(viewpoint_cam, "structure_prior"):
+                    target_structure_prior_vis = viewpoint_cam.structure_prior.to(gt_image.device)
+                    image_log.update({
+                        'structure_prior_loss': structure_prior_loss,
+                        'structure_prior_weight': structure_prior_weight,
+                        'structure_prior_mask_coverage': structure_prior_mask_coverage,
+                        'render_structure_prior': wandb.Image(torchvision.transforms.ToPILImage()(torch.clamp(structure_prior_render, 0.0, 1.0))),
+                        'target_structure_prior': wandb.Image(torchvision.transforms.ToPILImage()(torch.clamp(target_structure_prior_vis, 0.0, 1.0))),
+                    })
                 if dataset.use_dual_transient:
                     image_log.update({
                         'noise_image':wandb.Image(torchvision.transforms.ToPILImage()(noise_image_vis)),
@@ -1029,6 +1107,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 print("reflectance_highfreq_mean", L_reflectance_highfreq)
                 print("reflectance_detail_mean", L_reflectance_detail)
                 print("reflectance_decoder_mean", L_reflectance_decoder)
+                print("structure_prior_loss", structure_prior_loss)
+                print("structure_prior_weight", structure_prior_weight)
+                print("structure_prior_mask_coverage", structure_prior_mask_coverage)
                 print("reflectance_highlight_mean", L_reflectance_highlight)
                 print("residual_chroma_mean", residual_chroma_mean)
                 if dataset.use_dual_transient:
