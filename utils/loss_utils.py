@@ -220,7 +220,21 @@ def L_Reflectance_Edge(reflectance_image, gt_image, threshold=0.03):
     return (torch.abs(ref_grad_norm - gt_grad_norm) * edge_mask).mean()
 
 
-def L_Reflectance_Edge_Uplift(reflectance_image, gt_image, threshold=0.15, target_ratio=0.85):
+def _weighted_mean(loss_map, structure_weight=None):
+    if structure_weight is None:
+        return loss_map.mean()
+    weight = structure_weight.detach()
+    if weight.shape[-2:] != loss_map.shape[-2:]:
+        weight = F.interpolate(
+            weight.unsqueeze(0),
+            size=loss_map.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)
+    return (loss_map * weight).mean() / (weight.mean().detach() + 1e-6)
+
+
+def L_Reflectance_Edge_Uplift(reflectance_image, gt_image, threshold=0.15, target_ratio=0.85, structure_weight=None):
     """Only penalize reflectance edges that are weaker than normalized image structure edges."""
     gt_image = gt_image.detach()
     reflectance_gray = reflectance_image.mean(dim=0, keepdim=True)
@@ -237,7 +251,8 @@ def L_Reflectance_Edge_Uplift(reflectance_image, gt_image, threshold=0.15, targe
     gt_grad_norm = gt_grad / (gt_grad.mean().detach() + 1e-6)
     edge_mask = torch.clamp(gt_grad_norm - threshold, 0.0, 1.0).detach()
     target = target_ratio * gt_grad_norm
-    return (F.relu(target - ref_grad_norm) * edge_mask).mean()
+    loss_map = F.relu(target - ref_grad_norm) * edge_mask
+    return _weighted_mean(loss_map, structure_weight)
 
 
 def _local_std(gray_image, kernel_size=5):
@@ -248,7 +263,7 @@ def _local_std(gray_image, kernel_size=5):
     return torch.sqrt(var + 1e-6).squeeze(0)
 
 
-def L_Reflectance_LocalContrast(reflectance_image, gt_image, threshold=0.1, target_ratio=0.8):
+def L_Reflectance_LocalContrast(reflectance_image, gt_image, threshold=0.1, target_ratio=0.8, structure_weight=None):
     """Encourage reflectance to recover local grayscale contrast without copying highlight colors."""
     gt_image = gt_image.detach()
     reflectance_gray = reflectance_image.mean(dim=0, keepdim=True)
@@ -260,10 +275,11 @@ def L_Reflectance_LocalContrast(reflectance_image, gt_image, threshold=0.1, targ
     gt_std_norm = gt_std / (gt_std.mean().detach() + 1e-6)
     texture_mask = torch.clamp(gt_std_norm - threshold, 0.0, 1.0).detach()
     target = target_ratio * gt_std_norm
-    return (F.relu(target - reflectance_std_norm) * texture_mask).mean()
+    loss_map = F.relu(target - reflectance_std_norm) * texture_mask
+    return _weighted_mean(loss_map, structure_weight)
 
 
-def L_Reflectance_HighFreq(reflectance_image, gt_image, threshold=0.1, target_ratio=0.85):
+def L_Reflectance_HighFreq(reflectance_image, gt_image, threshold=0.1, target_ratio=0.85, structure_weight=None):
     """Encourage reflectance to recover grayscale high-frequency structure via a Laplacian response."""
     gt_image = gt_image.detach()
     reflectance_gray = reflectance_image.mean(dim=0, keepdim=True).unsqueeze(0)
@@ -281,7 +297,8 @@ def L_Reflectance_HighFreq(reflectance_image, gt_image, threshold=0.1, target_ra
     gt_hf_norm = gt_hf / (gt_hf.mean().detach() + 1e-6)
     structure_mask = torch.clamp(gt_hf_norm - threshold, 0.0, 1.0).detach()
     target = target_ratio * gt_hf_norm
-    return (F.relu(target - reflectance_hf_norm) * structure_mask).mean()
+    loss_map = F.relu(target - reflectance_hf_norm) * structure_mask
+    return _weighted_mean(loss_map, structure_weight)
 
 
 def L_Residual_Chroma_Boost(residual_image, reflectance_image, threshold=0.6):

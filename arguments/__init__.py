@@ -121,10 +121,7 @@ class ModelParams(ParamGroup):
         self.enhancement_green_bias_reg = 0.05
         self.use_structure_prior_files = False
         self.structure_prior_dir = "W_0.8"
-        self.structure_prior_file_reg = 0.02
-        self.structure_prior_start_iter = 800
-        self.structure_prior_residual_decay = 0.75
-        self.structure_prior_error_percentile = 0.8
+        self.structure_prior_weight_strength = 0.5
         self.enhancement_prior = "cidnet"
         self.cidnet_conda_env = "CIDNet"
         self.cidnet_root = "./submodules/HVI-CIDNet"
@@ -294,10 +291,7 @@ def _backfill_model_compatibility(merged_dict):
         "enhancement_green_bias_reg": 0.05,
         "use_structure_prior_files": False,
         "structure_prior_dir": "W_0.8",
-        "structure_prior_file_reg": 0.02,
-        "structure_prior_start_iter": 800,
-        "structure_prior_residual_decay": 0.75,
-        "structure_prior_error_percentile": 0.8,
+        "structure_prior_weight_strength": 0.5,
         "enhancement_prior": "cidnet",
         "cidnet_conda_env": "CIDNet",
         "cidnet_root": "./submodules/HVI-CIDNet",

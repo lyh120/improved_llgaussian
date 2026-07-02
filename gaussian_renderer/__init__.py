@@ -199,7 +199,6 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     illumination = illumination.reshape([anchor.shape[0]*pc.n_offsets, 1]) # [mask]
     reflectance = reflectance.reshape([anchor.shape[0]*pc.n_offsets, 3]) # [mask]
     illumination_enhanced = illumination_enhanced.reshape([anchor.shape[0]*pc.n_offsets, 3])
-    structure_prior = torch.sigmoid(pc._structure_prior_feature[visible_mask]).reshape([anchor.shape[0]*pc.n_offsets, 1])
 
     
 
@@ -231,10 +230,10 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     # combine for parallel masking
     concatenated = torch.cat([grid_scaling, anchor], dim=-1)
     concatenated_repeated = repeat(concatenated, 'n (c) -> (n k) (c)', k=pc.n_offsets)
-    concatenated_all = torch.cat([concatenated_repeated, reflectance, illumination, illumination_enhanced, structure_prior, scale_rot, offsets], dim=-1)
+    concatenated_all = torch.cat([concatenated_repeated, reflectance, illumination, illumination_enhanced, scale_rot, offsets], dim=-1)
     masked = concatenated_all[mask]
 
-    scaling_repeat, repeat_anchor, reflectance, illumination, illumination_enhanced, structure_prior, scale_rot, offsets = masked.split([6, 3, 3, 1, 3, 1, 7, 3], dim=-1)
+    scaling_repeat, repeat_anchor, reflectance, illumination, illumination_enhanced, scale_rot, offsets = masked.split([6, 3, 3, 1, 3, 7, 3], dim=-1)
     
 
     if pc.use_residual:
@@ -282,9 +281,9 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     # feat_downsampled = feat_repeated.detach()
 
     if is_training:
-        return xyz, reflectance, illumination, illumination_enhanced, structure_prior, opacity, scaling, rot, neural_opacity, mask, xyz_residual, color_noise, color_artifact, scaling_residual, rot_residual, opacity_residual, sg_stats
+        return xyz, reflectance, illumination, illumination_enhanced, opacity, scaling, rot, neural_opacity, mask, xyz_residual, color_noise, color_artifact, scaling_residual, rot_residual, opacity_residual, sg_stats
     else:
-        return xyz, reflectance, illumination, illumination_enhanced, structure_prior, opacity, scaling, rot, xyz_residual, color_noise, color_artifact, scaling_residual, rot_residual, opacity_residual, sg_stats
+        return xyz, reflectance, illumination, illumination_enhanced, opacity, scaling, rot, xyz_residual, color_noise, color_artifact, scaling_residual, rot_residual, opacity_residual, sg_stats
 
 def _profile_sync_time() -> float:
     torch.cuda.synchronize()
@@ -296,7 +295,7 @@ def _profile_add(profile_timings: dict | None, key: str, value: float) -> None:
         profile_timings[key] = profile_timings.get(key, 0.0) + value
 
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, kernel_size: float, scaling_modifier = 1.0, visible_mask=None, retain_grad=False, camera_pose=None, profile_timings=None, render_structure_prior=False):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, kernel_size: float, scaling_modifier = 1.0, visible_mask=None, retain_grad=False, camera_pose=None, profile_timings=None):
     """
     Render the scene. 
     
@@ -306,9 +305,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     # is_enhancing = pc.render_enhancement
     profile_start = _profile_sync_time() if profile_timings is not None else None
     if is_training:
-        xyz, reflectance, illumination, illumination_enhanced, structure_prior, opacity, scaling, rot, neural_opacity, mask, xyz_residual, color_noise, color_artifact, scaling_residual, rot_residual, opacity_residual, sg_stats = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
+        xyz, reflectance, illumination, illumination_enhanced, opacity, scaling, rot, neural_opacity, mask, xyz_residual, color_noise, color_artifact, scaling_residual, rot_residual, opacity_residual, sg_stats = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
     else:
-        xyz, reflectance, illumination, illumination_enhanced, structure_prior, opacity, scaling, rot, xyz_residual, color_noise, color_artifact, scaling_residual, rot_residual, opacity_residual, sg_stats = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
+        xyz, reflectance, illumination, illumination_enhanced, opacity, scaling, rot, xyz_residual, color_noise, color_artifact, scaling_residual, rot_residual, opacity_residual, sg_stats = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
     if profile_timings is not None:
         profile_after_generate = _profile_sync_time()
         _profile_add(profile_timings, "generate_neural_gaussians_time", profile_after_generate - profile_start)
@@ -434,19 +433,6 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         # rotations = rot,
         rotations = gaussians_rot_trans,
         cov3D_precomp = None)
-    rendered_structure_prior = None
-    if render_structure_prior:
-        structure_prior_rgb = structure_prior.repeat(1, 3)
-        rendered_structure_prior_rgb, _, _ = rasterizer(
-            means3D=means3D.detach(),
-            means2D=means2D.detach(),
-            shs=None,
-            colors_precomp=structure_prior_rgb,
-            opacities=opacity.detach(),
-            scales=scaling.detach(),
-            rotations=gaussians_rot_trans.detach(),
-            cov3D_precomp=None)
-        rendered_structure_prior = rendered_structure_prior_rgb[:1]
     if profile_timings is not None:
         raster_after_main = _profile_sync_time()
         _profile_add(profile_timings, "rasterize_main_time", raster_after_main - raster_start)
@@ -582,7 +568,6 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                     "render_reflectance":rendered_reflectance,
                     "render_illumination":rendered_illumination,
                     "render_illumination_enhanced":rendered_illumination_enhanced,
-                    "render_structure_prior": rendered_structure_prior,
                     "render_depth":depth_map,
                     # "render_depth_variance":depth_variance_map,
                     "render_noise": rendered_noise * 0.1,
@@ -606,7 +591,6 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                     "render_reflectance":rendered_reflectance,
                     "render_illumination":rendered_illumination,
                     "render_illumination_enhanced":rendered_illumination_enhanced,
-                    "render_structure_prior": rendered_structure_prior,
                     "render_noise": rendered_noise * 0.1,
                     "render_artifact": rendered_artifact * 0.1,
                     "render_residual":rendered_residual * 0.1 ,
@@ -724,7 +708,6 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 "render_reflectance":rendered_reflectance,
                 "render_illumination":rendered_illumination,
                 "render_illumination_enhanced":rendered_illumination_enhanced,
-                "render_structure_prior": rendered_structure_prior,
                 "render_depth":depth_map,
                 # "render_depth_variance":depth_variance_map,
                 # "render_residual":rendered_residual
@@ -744,7 +727,6 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 "render_reflectance":rendered_reflectance,
                 "render_illumination":rendered_illumination,
                 "render_illumination_enhanced":rendered_illumination_enhanced,
-                "render_structure_prior": rendered_structure_prior,
                 "render_depth":depth_map,
                 # "render_depth_variance":depth_variance_map,
                 # "render_residual":rendered_residual,
