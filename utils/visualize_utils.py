@@ -359,14 +359,26 @@ def visualize_anchor_with_camera(render_cameras, train_cameras, anchor_points, s
     ################ anchor points ################
     # 获取点云数据
     points = anchor_points.detach().cpu().numpy()
+    points = points[np.isfinite(points).all(axis=1)]
     # 去除过远点
     mask = (np.abs(points[:, 2]) < 10) & (np.abs(points[:, 1]) < 10) & (np.abs(points[:, 0]) < 10)
-    points = points[mask]
+    bounded_points = points[mask]
+    if bounded_points.shape[0] >= 2:
+        points = bounded_points
+    if points.shape[0] == 0:
+        plt.close(fig)
+        print("Warning: anchor visualization skipped because no finite anchors were found.")
+        return
     # 计算点云的主方向（使用PCA）
     center = points.mean(axis=0)
     centered_points = points - center
-    cov_matrix = np.cov(centered_points.T)
-    eigenvalues, eigenvectors = np.linalg.eigh(cov_matrix)
+    cov_matrix = np.cov(centered_points, rowvar=False) if points.shape[0] >= 2 else np.eye(3)
+    if cov_matrix.shape != (3, 3) or not np.isfinite(cov_matrix).all():
+        cov_matrix = np.eye(3)
+    try:
+        _, eigenvectors = np.linalg.eigh(cov_matrix)
+    except np.linalg.LinAlgError:
+        eigenvectors = np.eye(3)
     
     # 根据主方向计算最佳视角
     principal_direction = eigenvectors[:, -1]  # 最大特征值对应的特征向量
@@ -379,7 +391,8 @@ def visualize_anchor_with_camera(render_cameras, train_cameras, anchor_points, s
 
     # 根据深度计算颜色
     depths = points[:, 2] - points[:, 2].min()
-    depths = depths / depths.max()
+    depth_span = depths.max()
+    depths = depths / depth_span if depth_span > np.finfo(np.float32).eps else np.zeros_like(depths)
     # 使用自定义colormap
     plt.cm.viridis(depths)
     # 绘制高质量散点图
@@ -398,6 +411,7 @@ def visualize_anchor_with_camera(render_cameras, train_cameras, anchor_points, s
     max_range = np.array([points[:, 0].max()-points[:, 0].min(),
                         points[:, 1].max()-points[:, 1].min(),
                         points[:, 2].max()-points[:, 2].min()]).max() / 2.0
+    max_range = max(float(max_range), 1e-3)
     mid_x = (points[:, 0].max()+points[:, 0].min()) * 0.5
     mid_y = (points[:, 1].max()+points[:, 1].min()) * 0.5
     mid_z = (points[:, 2].max()+points[:, 2].min()) * 0.5
