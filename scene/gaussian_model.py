@@ -90,6 +90,7 @@ class GaussianModel:
                  use_sg_illumination: bool = True,
                  use_asg_illumination: bool = True,
                  illumination_mode: str = "asg",
+                 reflectance_mode: str = "explicit",
                  sg_lobes: int = 4,
                  sg_lambda_min: float = 1.0,
                  asg_lobes: int = 1,
@@ -119,7 +120,12 @@ class GaussianModel:
         self.use_undependent_illumination = use_undependent_illumination
         self.use_sg_illumination = use_sg_illumination
         self.use_asg_illumination = use_asg_illumination
+        if illumination_mode not in {"asg", "sg", "mlp", "legacy"}:
+            raise ValueError(f"Unsupported illumination mode: {illumination_mode}")
+        if reflectance_mode not in {"explicit", "mlp"}:
+            raise ValueError(f"Unsupported reflectance mode: {reflectance_mode}")
         self.illumination_mode = illumination_mode
+        self.reflectance_mode = "mlp" if illumination_mode == "legacy" else reflectance_mode
         self.sg_lobes = sg_lobes
         self.sg_lambda_min = sg_lambda_min
         self.asg_lobes = asg_lobes
@@ -167,6 +173,8 @@ class GaussianModel:
         self.offset_denom = torch.empty(0)
 
         self.anchor_demon = torch.empty(0)
+        self.anchor_visible_count = torch.empty(0)
+        self.anchor_birth_iteration = torch.empty(0, dtype=torch.long)
                 
         self.optimizer = None
         self.percent_dense = 0
@@ -405,11 +413,14 @@ class GaussianModel:
         self.mlp_opacity.eval()
         self.mlp_cov.eval()
         # self.mlp_color.eval()
-        if self.illumination_mode == "legacy":
+        if self.illumination_mode in {"mlp", "legacy"}:
             self.mlp_illumination.eval()
         if self.illumination_mode == "sg" and self.use_sg_illumination:
             self.mlp_sg_illumination.eval()
-        self.mlp_reflectance_decoder.eval()
+        if self.reflectance_mode == "mlp":
+            self.mlp_reflectance.eval()
+        else:
+            self.mlp_reflectance_decoder.eval()
         if self.use_residual:
             if self.use_dual_transient:
                 self.noise_net.eval()
@@ -427,11 +438,14 @@ class GaussianModel:
         self.mlp_opacity.train()
         self.mlp_cov.train()
         # self.mlp_color.train()
-        if self.illumination_mode == "legacy":
+        if self.illumination_mode in {"mlp", "legacy"}:
             self.mlp_illumination.train()
         if self.illumination_mode == "sg" and self.use_sg_illumination:
             self.mlp_sg_illumination.train()
-        self.mlp_reflectance_decoder.train()
+        if self.reflectance_mode == "mlp":
+            self.mlp_reflectance.train()
+        else:
+            self.mlp_reflectance_decoder.train()
         if self.use_residual:
             if self.use_dual_transient:
                 self.noise_net.train()
@@ -884,7 +898,7 @@ class GaussianModel:
         cosine = torch.sum(axis * view_dirs, dim=-1, keepdim=True).clamp(-1.0, 1.0)
         sg_term = amplitude * torch.exp(sharpness * (cosine - 1.0))
 
-        illumination_context = torch.sigmoid(illumination_feat) if self.legacy_compatibility_mode else illumination_feat
+        illumination_context = torch.sigmoid(illumination_feat) if self.illumination_mode in {"mlp", "legacy"} else illumination_feat
         illumination_context = illumination_context.detach()
         feat_gain = feat.detach().matmul(self._enhancement_feat_weight).view(-1, 1, 3)
         illum_gain = illumination_context.view(-1, self.n_offsets, 1) * self._enhancement_illum_weight.view(1, self.n_offsets, 3)
@@ -1242,6 +1256,8 @@ class GaussianModel:
         self.offset_gradient_accum = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.offset_denom = torch.zeros((self.get_anchor.shape[0]*self.n_offsets, 1), device="cuda")
         self.anchor_demon = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
+        self.anchor_visible_count = torch.zeros((self.get_anchor.shape[0], 1), device="cuda")
+        self.anchor_birth_iteration = torch.zeros((self.get_anchor.shape[0],), dtype=torch.long, device="cuda")
 
 
         
@@ -1333,6 +1349,21 @@ class GaussianModel:
                 {'params': [self._enhancement_illum_weight], 'lr': training_args.mlp_enhance_lr_init, "name": "enhancement_context_illum"},
                 {'params': [self._enhancement_context_bias], 'lr': training_args.mlp_enhance_lr_init, "name": "enhancement_context_bias"},
             ]
+        inactive_groups = set()
+        if self.reflectance_mode == "mlp":
+            inactive_groups.update({"base_log_reflectance", "reflectance_offset_delta", "mlp_reflectance_decoder"})
+        if self.illumination_mode in {"mlp", "legacy"}:
+            inactive_groups.update({"mlp_sg_illumination", "illum_asg_axis", "illum_asg_tangent", "illum_asg_sharpness", "illum_asg_amplitude", "illum_asg_bias", "illum_asg_dist_weight"})
+        elif self.illumination_mode == "asg":
+            inactive_groups.add("mlp_sg_illumination")
+        elif self.illumination_mode == "sg":
+            inactive_groups.update({"illum_asg_axis", "illum_asg_tangent", "illum_asg_sharpness", "illum_asg_amplitude", "illum_asg_bias", "illum_asg_dist_weight"})
+        if inactive_groups:
+            l = [group for group in l if group["name"] not in inactive_groups]
+        if self.reflectance_mode == "mlp":
+            l.append({'params': self.mlp_reflectance.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_reflectance"})
+        if self.illumination_mode in {"mlp", "legacy"}:
+            l.append({'params': self.mlp_illumination.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_illumination"})
         if self.use_residual:
             l.append({'params': [self._anchor_feat_residual], 'lr': training_args.feature_lr , "name": "anchor_feat_residual"})
             l.append({'params': [self._offset_residual], 'lr': training_args.offset_lr_init * self.spatial_lr_scale  , "name": "offset_residual"})
@@ -1375,6 +1406,14 @@ class GaussianModel:
         #                                             lr_delay_mult=training_args.mlp_color_lr_delay_mult,
         #                                             max_steps=training_args.mlp_color_lr_max_steps)
         self.mlp_sg_illumination_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_color_lr_init,
+                                                    lr_final=training_args.mlp_color_lr_final,
+                                                    lr_delay_mult=training_args.mlp_color_lr_delay_mult,
+                                                    max_steps=training_args.mlp_color_lr_max_steps)
+        self.mlp_reflectance_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_color_lr_init,
+                                                    lr_final=training_args.mlp_color_lr_final,
+                                                    lr_delay_mult=training_args.mlp_color_lr_delay_mult,
+                                                    max_steps=training_args.mlp_color_lr_max_steps)
+        self.mlp_illumination_scheduler_args = get_expon_lr_func(lr_init=training_args.mlp_color_lr_init,
                                                     lr_final=training_args.mlp_color_lr_final,
                                                     lr_delay_mult=training_args.mlp_color_lr_delay_mult,
                                                     max_steps=training_args.mlp_color_lr_max_steps)
@@ -1453,6 +1492,12 @@ class GaussianModel:
             if param_group["name"] == "mlp_sg_illumination":
                 lr = self.mlp_sg_illumination_scheduler_args(iteration)
                 param_group['lr'] = lr
+            if param_group["name"] == "mlp_reflectance":
+                lr = self.mlp_reflectance_scheduler_args(iteration)
+                param_group['lr'] = lr
+            if param_group["name"] == "mlp_illumination":
+                lr = self.mlp_illumination_scheduler_args(iteration)
+                param_group['lr'] = lr
             if param_group["name"] in {"illum_asg_axis", "illum_asg_tangent", "illum_asg_sharpness", "illum_asg_amplitude", "illum_asg_bias", "illum_asg_dist_weight"}:
                 lr = self.illum_asg_scheduler_args(iteration)
                 param_group['lr'] = lr
@@ -1499,7 +1544,7 @@ class GaussianModel:
 
     def freeze(self):
         for param_group in self.optimizer.param_groups:
-            if param_group["name"] not in {"enhancement_sg_axis", "enhancement_sg_sharpness", "enhancement_sg_amplitude", "enhancement_context_feat", "enhancement_context_illum", "enhancement_context_bias", "illum_asg_axis", "illum_asg_tangent", "illum_asg_sharpness", "illum_asg_amplitude", "illum_asg_bias", "illum_asg_dist_weight", "base_log_reflectance", "reflectance_offset_delta", "mlp_reflectance_decoder"}:
+            if param_group["name"] not in {"enhancement_sg_axis", "enhancement_sg_sharpness", "enhancement_sg_amplitude", "enhancement_context_feat", "enhancement_context_illum", "enhancement_context_bias", "illum_asg_axis", "illum_asg_tangent", "illum_asg_sharpness", "illum_asg_amplitude", "illum_asg_bias", "illum_asg_dist_weight", "base_log_reflectance", "reflectance_offset_delta", "mlp_reflectance_decoder", "mlp_reflectance", "mlp_illumination"}:
                 param_group['lr'] = 0
 
                 
@@ -1824,6 +1869,7 @@ class GaussianModel:
         
         # update anchor visiting statis
         self.anchor_demon[anchor_visible_mask] += 1 # add for visiting anchor
+        self.anchor_visible_count[anchor_visible_mask] += 1
 
         # update neural gaussian statis
         anchor_visible_mask = anchor_visible_mask.unsqueeze(dim=1).repeat([1, self.n_offsets]).view(-1) # [N * n_offsets]
@@ -1889,17 +1935,29 @@ class GaussianModel:
         self._anchor = optimizable_tensors["anchor"]
         self._offset = optimizable_tensors["offset"]
         self._anchor_feat = optimizable_tensors["anchor_feat"]
-        self._base_log_reflectance = optimizable_tensors["base_log_reflectance"]
-        self._reflectance_offset_delta = optimizable_tensors["reflectance_offset_delta"]
+        if "base_log_reflectance" in optimizable_tensors:
+            self._base_log_reflectance = optimizable_tensors["base_log_reflectance"]
+            self._reflectance_offset_delta = optimizable_tensors["reflectance_offset_delta"]
+        else:
+            self._base_log_reflectance = nn.Parameter(self._base_log_reflectance[valid_points_mask].detach().requires_grad_(True))
+            self._reflectance_offset_delta = nn.Parameter(self._reflectance_offset_delta[valid_points_mask].detach().requires_grad_(True))
         self._enhancement_sg_axis = optimizable_tensors["enhancement_sg_axis"]
         self._enhancement_sg_sharpness = optimizable_tensors["enhancement_sg_sharpness"]
         self._enhancement_sg_amplitude = optimizable_tensors["enhancement_sg_amplitude"]
-        self._illum_asg_axis = optimizable_tensors["illum_asg_axis"]
-        self._illum_asg_tangent = optimizable_tensors["illum_asg_tangent"]
-        self._illum_asg_sharpness = optimizable_tensors["illum_asg_sharpness"]
-        self._illum_asg_amplitude = optimizable_tensors["illum_asg_amplitude"]
-        self._illum_asg_bias = optimizable_tensors["illum_asg_bias"]
-        self._illum_asg_dist_weight = optimizable_tensors["illum_asg_dist_weight"]
+        if "illum_asg_axis" in optimizable_tensors:
+            self._illum_asg_axis = optimizable_tensors["illum_asg_axis"]
+            self._illum_asg_tangent = optimizable_tensors["illum_asg_tangent"]
+            self._illum_asg_sharpness = optimizable_tensors["illum_asg_sharpness"]
+            self._illum_asg_amplitude = optimizable_tensors["illum_asg_amplitude"]
+            self._illum_asg_bias = optimizable_tensors["illum_asg_bias"]
+            self._illum_asg_dist_weight = optimizable_tensors["illum_asg_dist_weight"]
+        else:
+            self._illum_asg_axis = nn.Parameter(self._illum_asg_axis[valid_points_mask].detach().requires_grad_(True))
+            self._illum_asg_tangent = nn.Parameter(self._illum_asg_tangent[valid_points_mask].detach().requires_grad_(True))
+            self._illum_asg_sharpness = nn.Parameter(self._illum_asg_sharpness[valid_points_mask].detach().requires_grad_(True))
+            self._illum_asg_amplitude = nn.Parameter(self._illum_asg_amplitude[valid_points_mask].detach().requires_grad_(True))
+            self._illum_asg_bias = nn.Parameter(self._illum_asg_bias[valid_points_mask].detach().requires_grad_(True))
+            self._illum_asg_dist_weight = nn.Parameter(self._illum_asg_dist_weight[valid_points_mask].detach().requires_grad_(True))
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
@@ -1909,8 +1967,23 @@ class GaussianModel:
             self._offset_residual = optimizable_tensors["offset_residual"]
 
     
-    def anchor_growing(self, grads, threshold, offset_mask):
-        ## 
+    def anchor_growing(
+        self,
+        grads,
+        threshold,
+        offset_mask,
+        max_anchors=60_000,
+        max_new_anchors=512,
+        level_caps=(256, 160, 96),
+        current_iteration=0,
+    ):
+        """Grow a bounded, deterministic set of high-gradient anchor voxels."""
+        if isinstance(level_caps, str):
+            level_caps = tuple(int(value) for value in level_caps.split(",") if value.strip())
+        if not level_caps:
+            level_caps = (max_new_anchors,)
+        growth_stats = {"candidates": 0, "added_by_level": [], "cap_hit": False}
+        total_added = 0
         init_length = self.get_anchor.shape[0]*self.n_offsets
         for i in range(self.update_depth):
             # update threshold
@@ -1918,11 +1991,6 @@ class GaussianModel:
             # mask from grad threshold
             candidate_mask = (grads >= cur_threshold)
             candidate_mask = torch.logical_and(candidate_mask, offset_mask)
-            
-            # random pick
-            rand_mask = torch.rand_like(candidate_mask.float())>(0.5**(i+1))
-            rand_mask = rand_mask.cuda()
-            candidate_mask = torch.logical_and(candidate_mask, rand_mask)
             
             length_inc = self.get_anchor.shape[0]*self.n_offsets - init_length
             if length_inc == 0: # if increased anchor number is zero, skip to next turn
@@ -1943,6 +2011,10 @@ class GaussianModel:
             selected_xyz = all_xyz.view([-1, 3])[candidate_mask] # get selected gaussians's location
             selected_grid_coords = torch.round(selected_xyz / cur_size).int() # get selected guassian's voxel location
 
+            if selected_grid_coords.numel() == 0:
+                growth_stats["added_by_level"].append(0)
+                continue
+
             selected_grid_coords_unique, inverse_indices = torch.unique(selected_grid_coords, return_inverse=True, dim=0) # get selected anchor voxel set, which will be used for the generation of new ancher's feature
 
 
@@ -1952,8 +2024,8 @@ class GaussianModel:
                 chunk_size = 4096 * 5
                 max_iters = grid_coords.shape[0] // chunk_size + (1 if grid_coords.shape[0] % chunk_size != 0 else 0)
                 remove_duplicates_list = []
-                for i in range(max_iters):
-                    cur_remove_duplicates = (selected_grid_coords_unique.unsqueeze(1) == grid_coords[i*chunk_size:(i+1)*chunk_size, :]).all(-1).any(-1).view(-1)
+                for chunk_idx in range(max_iters):
+                    cur_remove_duplicates = (selected_grid_coords_unique.unsqueeze(1) == grid_coords[chunk_idx*chunk_size:(chunk_idx+1)*chunk_size, :]).all(-1).any(-1).view(-1)
                     remove_duplicates_list.append(cur_remove_duplicates)
                 
                 remove_duplicates = reduce(torch.logical_or, remove_duplicates_list)
@@ -1961,6 +2033,32 @@ class GaussianModel:
                 remove_duplicates = (selected_grid_coords_unique.unsqueeze(1) == grid_coords).all(-1).any(-1).view(-1)
 
             remove_duplicates = ~remove_duplicates
+            growth_stats["candidates"] += int(remove_duplicates.sum().item())
+
+            available_global = min(
+                max(0, int(max_anchors) - self.get_anchor.shape[0]),
+                max(0, int(max_new_anchors) - total_added),
+            )
+            level_cap = level_caps[i] if i < len(level_caps) else level_caps[-1]
+            keep_count = min(int(remove_duplicates.sum().item()), int(level_cap), available_global)
+            if keep_count <= 0:
+                growth_stats["added_by_level"].append(0)
+                growth_stats["cap_hit"] = True
+                break
+
+            source_mask = candidate_mask[:grads.shape[0]]
+            source_scores = grads[source_mask]
+            voxel_scores = scatter_max(source_scores, inverse_indices, dim=0)[0].view(-1)
+            new_voxel_indices = torch.nonzero(remove_duplicates, as_tuple=False).squeeze(1)
+            _, top_indices = torch.topk(voxel_scores[new_voxel_indices], k=keep_count, largest=True, sorted=False)
+            selected_unique_mask = torch.zeros_like(remove_duplicates)
+            selected_unique_mask[new_voxel_indices[top_indices]] = True
+
+            # Keep all original candidate offsets for scatter-based feature
+            # inheritance.  Only ``remove_duplicates`` selects the Top-K
+            # target voxels; replacing candidate_mask here would make its
+            # length disagree with inverse_indices.
+            remove_duplicates = selected_unique_mask
             candidate_anchor = selected_grid_coords_unique[remove_duplicates]*cur_size
 
             
@@ -2026,20 +2124,22 @@ class GaussianModel:
                     "scaling": new_scaling,
                     "rotation": new_rotation,
                     "anchor_feat": new_feat,
-                    "base_log_reflectance": new_base_log_reflectance,
-                    "reflectance_offset_delta": new_reflectance_offset_delta,
                     "enhancement_sg_axis": new_enhancement_sg_axis,
                     "enhancement_sg_sharpness": new_enhancement_sg_sharpness,
                     "enhancement_sg_amplitude": new_enhancement_sg_amplitude,
-                    "illum_asg_axis": new_illum_asg_axis,
-                    "illum_asg_tangent": new_illum_asg_tangent,
-                    "illum_asg_sharpness": new_illum_asg_sharpness,
-                    "illum_asg_amplitude": new_illum_asg_amplitude,
-                    "illum_asg_bias": new_illum_asg_bias,
-                    "illum_asg_dist_weight": new_illum_asg_dist_weight,
                     "offset": new_offsets,
                     "opacity": new_opacities,
                 }
+                if self.reflectance_mode == "explicit":
+                    d["base_log_reflectance"] = new_base_log_reflectance
+                    d["reflectance_offset_delta"] = new_reflectance_offset_delta
+                if self.illumination_mode == "asg":
+                    d["illum_asg_axis"] = new_illum_asg_axis
+                    d["illum_asg_tangent"] = new_illum_asg_tangent
+                    d["illum_asg_sharpness"] = new_illum_asg_sharpness
+                    d["illum_asg_amplitude"] = new_illum_asg_amplitude
+                    d["illum_asg_bias"] = new_illum_asg_bias
+                    d["illum_asg_dist_weight"] = new_illum_asg_dist_weight
                 if self.use_residual:
                     d["scaling_residual"] = new_scaling_residual
                     d["offset_residual"] = new_offset_residual
@@ -2052,6 +2152,17 @@ class GaussianModel:
                 temp_opacity_accum = torch.cat([self.opacity_accum, torch.zeros([new_opacities.shape[0], 1], device='cuda').float()], dim=0)
                 del self.opacity_accum
                 self.opacity_accum = temp_opacity_accum
+                self.anchor_visible_count = torch.cat(
+                    [self.anchor_visible_count, torch.zeros([new_opacities.shape[0], 1], device="cuda")],
+                    dim=0,
+                )
+                self.anchor_birth_iteration = torch.cat(
+                    [
+                        self.anchor_birth_iteration,
+                        torch.full((new_opacities.shape[0],), int(current_iteration), dtype=torch.long, device="cuda"),
+                    ],
+                    dim=0,
+                )
 
                 torch.cuda.empty_cache()
                 
@@ -2060,28 +2171,43 @@ class GaussianModel:
                 self._scaling = optimizable_tensors["scaling"]
                 self._rotation = optimizable_tensors["rotation"]
                 self._anchor_feat = optimizable_tensors["anchor_feat"]
-                self._base_log_reflectance = optimizable_tensors["base_log_reflectance"]
-                self._reflectance_offset_delta = optimizable_tensors["reflectance_offset_delta"]
+                if "base_log_reflectance" in optimizable_tensors:
+                    self._base_log_reflectance = optimizable_tensors["base_log_reflectance"]
+                    self._reflectance_offset_delta = optimizable_tensors["reflectance_offset_delta"]
+                else:
+                    self._base_log_reflectance = nn.Parameter(torch.cat((self._base_log_reflectance, new_base_log_reflectance), dim=0).detach().requires_grad_(True))
+                    self._reflectance_offset_delta = nn.Parameter(torch.cat((self._reflectance_offset_delta, new_reflectance_offset_delta), dim=0).detach().requires_grad_(True))
                 self._enhancement_sg_axis = optimizable_tensors["enhancement_sg_axis"]
                 self._enhancement_sg_sharpness = optimizable_tensors["enhancement_sg_sharpness"]
                 self._enhancement_sg_amplitude = optimizable_tensors["enhancement_sg_amplitude"]
-                self._illum_asg_axis = optimizable_tensors["illum_asg_axis"]
-                self._illum_asg_tangent = optimizable_tensors["illum_asg_tangent"]
-                self._illum_asg_sharpness = optimizable_tensors["illum_asg_sharpness"]
-                self._illum_asg_amplitude = optimizable_tensors["illum_asg_amplitude"]
-                self._illum_asg_bias = optimizable_tensors["illum_asg_bias"]
-                self._illum_asg_dist_weight = optimizable_tensors["illum_asg_dist_weight"]
+                if "illum_asg_axis" in optimizable_tensors:
+                    self._illum_asg_axis = optimizable_tensors["illum_asg_axis"]
+                    self._illum_asg_tangent = optimizable_tensors["illum_asg_tangent"]
+                    self._illum_asg_sharpness = optimizable_tensors["illum_asg_sharpness"]
+                    self._illum_asg_amplitude = optimizable_tensors["illum_asg_amplitude"]
+                    self._illum_asg_bias = optimizable_tensors["illum_asg_bias"]
+                    self._illum_asg_dist_weight = optimizable_tensors["illum_asg_dist_weight"]
+                else:
+                    self._illum_asg_axis = nn.Parameter(torch.cat((self._illum_asg_axis, new_illum_asg_axis), dim=0).detach().requires_grad_(True))
+                    self._illum_asg_tangent = nn.Parameter(torch.cat((self._illum_asg_tangent, new_illum_asg_tangent), dim=0).detach().requires_grad_(True))
+                    self._illum_asg_sharpness = nn.Parameter(torch.cat((self._illum_asg_sharpness, new_illum_asg_sharpness), dim=0).detach().requires_grad_(True))
+                    self._illum_asg_amplitude = nn.Parameter(torch.cat((self._illum_asg_amplitude, new_illum_asg_amplitude), dim=0).detach().requires_grad_(True))
+                    self._illum_asg_bias = nn.Parameter(torch.cat((self._illum_asg_bias, new_illum_asg_bias), dim=0).detach().requires_grad_(True))
+                    self._illum_asg_dist_weight = nn.Parameter(torch.cat((self._illum_asg_dist_weight, new_illum_asg_dist_weight), dim=0).detach().requires_grad_(True))
                 self._offset = optimizable_tensors["offset"]
                 self._opacity = optimizable_tensors["opacity"]
                 if self.use_residual:
                     self._scaling_residual = optimizable_tensors["scaling_residual"]
                     self._offset_residual = optimizable_tensors["offset_residual"]
                     self._anchor_feat_residual = optimizable_tensors["anchor_feat_residual"]
+                total_added += candidate_anchor.shape[0]
+                growth_stats["added_by_level"].append(int(candidate_anchor.shape[0]))
                 
 
+        return growth_stats
 
-    def adjust_anchor(self, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005, mode="train", phi=0.5):
-        # # adding anchors
+    def adjust_anchor(self, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005, mode="train", phi=0.5, max_anchors=60_000, max_new_anchors=512, level_caps=(256, 160, 96), current_iteration=0, prune_grace_iters=500, allow_prune=True):
+        anchors_before = self.get_anchor.shape[0]
         if mode =="warmup":
             old_anchor_num = self.anchor_demon.shape[0]
         grads = self.offset_gradient_accum / self.offset_denom # [N*k, 1]
@@ -2089,7 +2215,15 @@ class GaussianModel:
         grads_norm = torch.norm(grads, dim=-1)
         offset_mask = (self.offset_denom > check_interval*success_threshold * phi).squeeze(dim=1) # choose the neural gaussians with high seen ratio as growing anchor candidates
         
-        self.anchor_growing(grads_norm, grad_threshold, offset_mask)
+        growth_stats = self.anchor_growing(
+            grads_norm,
+            grad_threshold,
+            offset_mask,
+            max_anchors=max_anchors,
+            max_new_anchors=max_new_anchors,
+            level_caps=level_caps,
+            current_iteration=current_iteration,
+        )
         
         # update offset_denom
         self.offset_denom[offset_mask] = 0
@@ -2103,11 +2237,34 @@ class GaussianModel:
                                            dtype=torch.int32, 
                                            device=self.offset_gradient_accum.device)
         self.offset_gradient_accum = torch.cat([self.offset_gradient_accum, padding_offset_gradient_accum], dim=0)
+
+        # Warmup may add a small, bounded set of anchors to improve coverage,
+        # but it must never discard original geometry before the main stage.
+        if not allow_prune:
+            self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
+            growth_stats.update(
+                {
+                    "anchors_before": anchors_before,
+                    "pruned": 0,
+                    "anchors_after": self.get_anchor.shape[0],
+                }
+            )
+            return growth_stats
         
-        # # prune anchors
-        prune_mask = (self.opacity_accum < min_opacity*self.anchor_demon).squeeze(dim=1)  # choose the anchors with low opacity as prune candidates
+        # Prune based on mean per-offset neural opacity instead of its raw
+        # accumulated sum, and remove anchors that never become visible after
+        # a grace period.  The latter catches out-of-frustum floaters.
+        mean_opacity = self.opacity_accum / (self.anchor_demon.clamp_min(1.0) * self.n_offsets)
+        prune_mask = (mean_opacity < min_opacity).squeeze(dim=1)
         anchors_mask = (self.anchor_demon > check_interval*success_threshold).squeeze(dim=1) # [N, 1] # choose the 
         prune_mask = torch.logical_and(prune_mask, anchors_mask) # [N] 
+
+        anchor_age = current_iteration - self.anchor_birth_iteration
+        never_visible_mask = torch.logical_and(
+            anchor_age >= prune_grace_iters,
+            self.anchor_visible_count.squeeze(dim=1) == 0,
+        )
+        prune_mask = torch.logical_or(prune_mask, never_visible_mask)
 
         if mode == "warmup":
             unvisibility_mask = (self.anchor_demon == 0).squeeze(dim=1) 
@@ -2141,12 +2298,23 @@ class GaussianModel:
         temp_anchor_demon = self.anchor_demon[~prune_mask]
         del self.anchor_demon
         self.anchor_demon = temp_anchor_demon
+        self.anchor_visible_count = self.anchor_visible_count[~prune_mask]
+        self.anchor_birth_iteration = self.anchor_birth_iteration[~prune_mask]
 
-        if prune_mask.shape[0]>0:
+        pruned_count = int(prune_mask.sum().item())
+        if pruned_count > 0:
             self.prune_anchor(prune_mask)
         
         
         self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
+        growth_stats.update(
+            {
+                "anchors_before": anchors_before,
+                "pruned": pruned_count,
+                "anchors_after": self.get_anchor.shape[0],
+            }
+        )
+        return growth_stats
 
     def save_mlp_checkpoints(self, path, mode = 'split'):#split or unite
         mkdir_p(os.path.dirname(path))
@@ -2171,12 +2339,12 @@ class GaussianModel:
                 sg_illumination_mlp = torch.jit.trace(self.mlp_sg_illumination, (torch.rand(1, self.feat_dim//2+3+self.illumination_dist_dim).cuda()))
                 sg_illumination_mlp.save(os.path.join(path, 'sg_illumination_mlp.pt'))
                 self.mlp_sg_illumination.train()
-            if self.illumination_mode == "legacy":
+            if self.reflectance_mode == "mlp":
                 self.mlp_reflectance.eval()
                 reflectance_mlp = torch.jit.trace(self.mlp_reflectance, (torch.rand(1, self.feat_dim + self.reflectance_dist_dim).cuda()))
                 reflectance_mlp.save(os.path.join(path, 'reflectance_mlp.pt'))
                 self.mlp_reflectance.train()
-
+            if self.illumination_mode in {"mlp", "legacy"}:
                 self.mlp_illumination.eval()
                 illumination_mlp = torch.jit.trace(self.mlp_illumination, (torch.rand(1, self.feat_dim//2+3+self.illumination_dist_dim).cuda()))
                 illumination_mlp.save(os.path.join(path, 'illumination_mlp.pt'))
@@ -2247,6 +2415,7 @@ class GaussianModel:
                     'feature_bank_mlp': self.mlp_feature_bank.state_dict(),
                     'appearance': self.embedding_appearance.state_dict(),
                     'illumination_mode': self.illumination_mode,
+                    'reflectance_mode': self.reflectance_mode,
                     }
                 if self.illumination_mode == "sg":
                     checkpoint['sg_illumination_mlp'] = self.mlp_sg_illumination.state_dict()
@@ -2258,8 +2427,9 @@ class GaussianModel:
                         checkpoint['residual_net'] = self.residual_net.state_dict()
                     checkpoint['cov_residual_mlp'] = self.mlp_cov_residual.state_dict()
                     checkpoint['opacity_residual_mlp'] = self.mlp_opacity_residual.state_dict()
-                if self.illumination_mode == "legacy":
+                if self.reflectance_mode == "mlp":
                     checkpoint['reflectance_mlp'] = self.mlp_reflectance.state_dict()
+                if self.illumination_mode in {"mlp", "legacy"}:
                     checkpoint['illumination_mlp'] = self.mlp_illumination.state_dict()
                 torch.save(checkpoint, os.path.join(path, 'checkpoints.pth'))
             elif self.appearance_residual_dim > 0:
@@ -2274,6 +2444,7 @@ class GaussianModel:
                     },
                     'appearance': self.embedding_appearance.state_dict(),
                     'illumination_mode': self.illumination_mode,
+                    'reflectance_mode': self.reflectance_mode,
                     }
                 if self.illumination_mode == "sg":
                     checkpoint['sg_illumination_mlp'] = self.mlp_sg_illumination.state_dict()
@@ -2285,8 +2456,9 @@ class GaussianModel:
                         checkpoint['residual_net'] = self.residual_net.state_dict()
                     checkpoint['cov_residual_mlp'] = self.mlp_cov_residual.state_dict()
                     checkpoint['opacity_residual_mlp'] = self.mlp_opacity_residual.state_dict()
-                if self.illumination_mode == "legacy":
+                if self.reflectance_mode == "mlp":
                     checkpoint['reflectance_mlp'] = self.mlp_reflectance.state_dict()
+                if self.illumination_mode in {"mlp", "legacy"}:
                     checkpoint['illumination_mlp'] = self.mlp_illumination.state_dict()
                 torch.save(checkpoint, os.path.join(path, 'checkpoints.pth'))
             else:
@@ -2300,6 +2472,7 @@ class GaussianModel:
                         'bias': self._enhancement_context_bias.detach(),
                     },
                     'illumination_mode': self.illumination_mode,
+                    'reflectance_mode': self.reflectance_mode,
                     }
                 if self.illumination_mode == "sg":
                     checkpoint['sg_illumination_mlp'] = self.mlp_sg_illumination.state_dict()
@@ -2311,8 +2484,9 @@ class GaussianModel:
                         checkpoint['residual_net'] = self.residual_net.state_dict()
                     checkpoint['cov_residual_mlp'] = self.mlp_cov_residual.state_dict()
                     checkpoint['opacity_residual_mlp'] = self.mlp_opacity_residual.state_dict()
-                if self.illumination_mode == "legacy":
+                if self.reflectance_mode == "mlp":
                     checkpoint['reflectance_mlp'] = self.mlp_reflectance.state_dict()
+                if self.illumination_mode in {"mlp", "legacy"}:
                     checkpoint['illumination_mlp'] = self.mlp_illumination.state_dict()
                 torch.save(checkpoint, os.path.join(path, 'checkpoints.pth'))
         else:
@@ -2330,22 +2504,23 @@ class GaussianModel:
             enhancement_context_path = os.path.join(path, 'enhancement_context.pth')
             if self.illumination_mode == "asg" and self.asg_illumination_available:
                 self.legacy_compatibility_mode = False
-            elif self.use_sg_illumination and os.path.exists(sg_path):
+            elif self.illumination_mode == "sg" and self.use_sg_illumination and os.path.exists(sg_path):
                 self.mlp_sg_illumination = torch.jit.load(sg_path).cuda()
                 self.sg_illumination_available = True
-                self.illumination_mode = "sg"
                 self.legacy_compatibility_mode = False
+            elif self.illumination_mode in {"mlp", "legacy"} and os.path.exists(legacy_illumination_path):
+                self.mlp_illumination = torch.jit.load(legacy_illumination_path).cuda()
+                self.legacy_compatibility_mode = self.illumination_mode == "legacy"
             else:
                 self.sg_illumination_available = False
                 self.illumination_mode = "legacy"
+                self.reflectance_mode = "mlp"
                 self.legacy_compatibility_mode = True
                 print("SG illumination checkpoint not found; entering legacy compatibility mode.")
-            if self.legacy_compatibility_mode and os.path.exists(legacy_reflectance_path):
+            if self.reflectance_mode == "mlp" and os.path.exists(legacy_reflectance_path):
                 self.mlp_reflectance = torch.jit.load(legacy_reflectance_path).cuda()
             if os.path.exists(reflectance_decoder_path):
                 self.mlp_reflectance_decoder = torch.jit.load(reflectance_decoder_path).cuda()
-            if self.legacy_compatibility_mode and os.path.exists(legacy_illumination_path):
-                self.mlp_illumination = torch.jit.load(legacy_illumination_path).cuda()
             if os.path.exists(enhancement_context_path):
                 enhancement_context = torch.load(enhancement_context_path)
                 self._enhancement_feat_weight = nn.Parameter(enhancement_context['enhancement_feat_weight'].cuda().requires_grad_(True))
@@ -2382,25 +2557,29 @@ class GaussianModel:
             self.mlp_opacity.load_state_dict(checkpoint['opacity_mlp'])
             self.mlp_cov.load_state_dict(checkpoint['cov_mlp'])
             checkpoint_mode = checkpoint.get('illumination_mode', self.illumination_mode)
+            self.reflectance_mode = checkpoint.get('reflectance_mode', self.reflectance_mode)
             if checkpoint_mode == "asg" and self.asg_illumination_available:
                 self.illumination_mode = "asg"
                 self.legacy_compatibility_mode = False
-            elif self.use_sg_illumination and 'sg_illumination_mlp' in checkpoint:
+            elif checkpoint_mode == "sg" and self.use_sg_illumination and 'sg_illumination_mlp' in checkpoint:
                 self.mlp_sg_illumination.load_state_dict(checkpoint['sg_illumination_mlp'])
                 self.sg_illumination_available = True
+                self.illumination_mode = checkpoint_mode
+                self.legacy_compatibility_mode = self.illumination_mode == "legacy"
+            elif checkpoint_mode in {"mlp", "legacy"} and 'illumination_mlp' in checkpoint:
+                self.mlp_illumination.load_state_dict(checkpoint['illumination_mlp'])
                 self.illumination_mode = checkpoint_mode
                 self.legacy_compatibility_mode = self.illumination_mode == "legacy"
             else:
                 self.sg_illumination_available = False
                 self.illumination_mode = "legacy"
+                self.reflectance_mode = "mlp"
                 self.legacy_compatibility_mode = True
                 print("SG illumination checkpoint not found; entering legacy compatibility mode.")
-            if self.legacy_compatibility_mode and 'reflectance_mlp' in checkpoint:
+            if self.reflectance_mode == "mlp" and 'reflectance_mlp' in checkpoint:
                 self.mlp_reflectance.load_state_dict(checkpoint['reflectance_mlp'])
             if 'reflectance_decoder' in checkpoint:
                 self.mlp_reflectance_decoder.load_state_dict(checkpoint['reflectance_decoder'])
-            if self.legacy_compatibility_mode and 'illumination_mlp' in checkpoint:
-                self.mlp_illumination.load_state_dict(checkpoint['illumination_mlp'])
             if 'enhancement_context' in checkpoint:
                 enhancement_context = checkpoint['enhancement_context']
                 self._enhancement_feat_weight = nn.Parameter(enhancement_context['feat_weight'].cuda().requires_grad_(True))

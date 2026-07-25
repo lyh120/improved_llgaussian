@@ -86,6 +86,7 @@ class ModelParams(ParamGroup):
         self.use_sg_illumination = True
         self.use_asg_illumination = True
         self.illumination_mode = "asg"
+        self.reflectance_mode = "explicit"
         self.sg_lobes = 4
         self.sg_lambda_min = 1.0
         self.sg_energy_reg = 1e-4
@@ -115,6 +116,9 @@ class ModelParams(ParamGroup):
         self.enhancement_degree_reg = 0.2
         self.enhancement_degree_global_reg = 0.05
         self.enhancement_smooth_reg = 4e-4
+        self.illumination_smooth_reg = 1e-4
+        self.warmup_illumination_smooth_reg = 2e-5
+        self.illumination_smooth_kernel_size = 5
         self.enhancement_diff_start_iter = 2500
         self.enhancement_color_reg = 0.06
         self.enhancement_color_std_reg = 0.02
@@ -227,6 +231,23 @@ class OptimizationParams(ParamGroup):
         self.update_from = 1500
         self.update_interval = 100
         self.update_until = 15_000
+        # Warmup starts from the complete input point cloud.  Its separate,
+        # small densification budget improves coverage without compounding the
+        # main-stage anchor growth.
+        self.warmup_start_stat = 200
+        self.warmup_update_from = 1_200
+        self.warmup_update_until = 1_900
+        self.warmup_update_interval = 200
+        self.warmup_max_new_anchors = 128
+        self.warmup_level_caps = "64,40,24"
+        self.warmup_densify_grad_threshold = 0.00025
+        self.warmup_success_threshold = 0.8
+        # Keep anchor growth bounded and reproducible.  These values are
+        # intentionally conservative for the short 8k training schedule.
+        self.max_anchors = 60_000
+        self.max_new_anchors_per_update = 512
+        self.densify_level_caps = "256,160,96"
+        self.anchor_prune_grace_iters = 500
         self.enhancement_from = 10_000
         self.residual_start_iter = 3_000
         self.residual_ramp_iters = 2_500
@@ -252,6 +273,7 @@ def _backfill_model_compatibility(merged_dict):
         "use_sg_illumination": True,
         "use_asg_illumination": True,
         "illumination_mode": "asg",
+        "reflectance_mode": "explicit",
         "use_dual_transient": False,
         "sg_lobes": 4,
         "sg_lambda_min": 1.0,
@@ -282,6 +304,9 @@ def _backfill_model_compatibility(merged_dict):
         "enhancement_degree_reg": 0.2,
         "enhancement_degree_global_reg": 0.05,
         "enhancement_smooth_reg": 4e-4,
+        "illumination_smooth_reg": 1e-4,
+        "warmup_illumination_smooth_reg": 2e-5,
+        "illumination_smooth_kernel_size": 5,
         "enhancement_diff_start_iter": 2500,
         "enhancement_color_reg": 0.06,
         "enhancement_color_std_reg": 0.02,
@@ -309,6 +334,18 @@ def _backfill_model_compatibility(merged_dict):
         "b0_spatial_smooth_reg": 0.0,
         "residual_start_iter": 3_000,
         "residual_ramp_iters": 2_500,
+        "max_anchors": 60_000,
+        "max_new_anchors_per_update": 512,
+        "densify_level_caps": "256,160,96",
+        "anchor_prune_grace_iters": 500,
+        "warmup_start_stat": 200,
+        "warmup_update_from": 1_200,
+        "warmup_update_until": 1_900,
+        "warmup_update_interval": 200,
+        "warmup_max_new_anchors": 128,
+        "warmup_level_caps": "64,40,24",
+        "warmup_densify_grad_threshold": 0.00025,
+        "warmup_success_threshold": 0.8,
     }
     for key, value in defaults.items():
         merged_dict.setdefault(key, value)

@@ -1,0 +1,13 @@
+# Generated from user-provided experiment outputs. Keep source code and manifest tracked.
+__pycache__/
+data/*.csv
+data/*.json
+figures/*.png
+report/*.md
+report/*.tex
+tables/*.csv
+tables/*.tex
+!data/.gitkeep
+!figures/.gitkeep
+!report/.gitkeep
+!tables/.gitkeep

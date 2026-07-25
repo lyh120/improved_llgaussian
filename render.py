@@ -292,6 +292,7 @@ def render_set_optimize(model_path, name, iteration, views, gaussians, pipeline,
     render_reflectance_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_reflectances")
     render_illumination_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_illuminations")
     render_enhanced_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_enhanceds")
+    render_coverage_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_coverages")
     render_depth_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_depths")
     render_residual_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_residuals")
     render_noise_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_noises")
@@ -302,6 +303,7 @@ def render_set_optimize(model_path, name, iteration, views, gaussians, pipeline,
     makedirs(render_reflectance_path, exist_ok=True)
     makedirs(render_illumination_path, exist_ok=True)
     makedirs(render_enhanced_path, exist_ok=True)
+    makedirs(render_coverage_path, exist_ok=True)
     makedirs(render_depth_path, exist_ok=True)
     makedirs(render_residual_path, exist_ok=True)
     makedirs(render_noise_path, exist_ok=True)
@@ -378,14 +380,15 @@ def render_set_optimize(model_path, name, iteration, views, gaussians, pipeline,
             # print("optimal_pose-camera_pose: ", optimal_pose-camera_pose)
             #rendering_opt = render(view, gaussians, pipeline, background, camera_pose=optimal_pose)["render"]
             voxel_visible_mask = prefilter_voxel(view, gaussians, pipeline, background, kernel_size=kernel_size, camera_pose=optimal_pose)
-            render_pkg_opt = render(view, gaussians, pipeline, background, kernel_size=kernel_size, visible_mask=voxel_visible_mask, camera_pose=optimal_pose)
+            render_pkg_opt = render(view, gaussians, pipeline, background, kernel_size=kernel_size, visible_mask=voxel_visible_mask, camera_pose=optimal_pose, return_coverage=True)
 
         
             
             rendering = torch.clamp(render_pkg_opt["render"], 0.0, 1.0)
             rendering_reflectance = torch.clamp(render_pkg_opt["render_reflectance"], 0.0, 1.0)
             rendering_illumination = torch.clamp(render_pkg_opt["render_illumination"] , 0.0, 1.0)
-            rendering_enhanced = torch.clamp(render_pkg["render_illumination_enhanced"] * render_pkg["render_reflectance"], 0.0, 1.0)
+            rendering_enhanced = torch.clamp(render_pkg_opt["render_enhanced"], 0.0, 1.0)
+            coverage = torch.clamp(render_pkg_opt["render_coverage"], 0.0, 1.0)
             rendering_depth = 1 - minmax_normalize(render_pkg["render_depth"])
             if 'render_residual' in render_pkg:
                 rendering_residual = torch.clamp(render_pkg["render_residual"], 0.0, 1.0)
@@ -410,6 +413,7 @@ def render_set_optimize(model_path, name, iteration, views, gaussians, pipeline,
             torchvision.utils.save_image(rendering_reflectance, os.path.join(render_reflectance_path, view.image_name + ".png"))
             torchvision.utils.save_image(rendering_illumination, os.path.join(render_illumination_path, view.image_name + ".png"))
             torchvision.utils.save_image(rendering_enhanced, os.path.join(render_enhanced_path, view.image_name + ".png"))
+            torchvision.utils.save_image(coverage, os.path.join(render_coverage_path, view.image_name + ".png"))
 
             torchvision.utils.save_image(rendering_depth, os.path.join(render_depth_path, view.image_name + ".png"))
             torchvision.utils.save_image(errormap, os.path.join(error_path, view.image_name + ".png"))
@@ -446,6 +450,7 @@ def render_set(
     render_illumination_path_enhanced = os.path.join(model_path, name, "ours_{}".format(iteration), "render_illuminations(enhanced)")
     render_illumination_path_enhance = os.path.join(model_path, name, "ours_{}".format(iteration), "render_illuminations_enhance")
     render_enhanced_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_enhanceds")
+    render_coverage_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_coverages")
     render_depth_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_depths")
     render_residual_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_residuals")
     render_residual_path_fast = os.path.join(model_path, name, "ours_{}".format(iteration), "render_residuals(enhanced)")
@@ -460,6 +465,7 @@ def render_set(
     makedirs(render_illumination_path_enhanced, exist_ok=True)
     makedirs(render_illumination_path_enhance, exist_ok=True)
     makedirs(render_enhanced_path, exist_ok=True)
+    makedirs(render_coverage_path, exist_ok=True)
     makedirs(render_depth_path, exist_ok=True)
     makedirs(render_residual_path, exist_ok=True)
     makedirs(render_residual_path_fast, exist_ok=True)
@@ -476,6 +482,7 @@ def render_set(
     illumination_stats_dict = {}
     lowlight_metrics = {}
     enhanced_metrics = {}
+    coverage_metrics = {}
     time_consume = 0
     profile_views = []
     lpips_fn = None
@@ -512,6 +519,7 @@ def render_set(
             kernel_size=kernel_size,
             camera_pose=pose,
             profile_timings=render_profile,
+            return_coverage=True,
         )
         if profile_render_timing:
             profile_render_end = _cuda_profile_now()
@@ -534,7 +542,12 @@ def render_set(
         rendering_illumination = torch.clamp(render_pkg["render_illumination"] , 0.0, 1.0)
         rendering_illumination_enhanced = torch.clamp(render_pkg["render_illumination"] * 30 , 0.0, 1.0)
         rendering_illumination_enhance = torch.clamp(render_pkg["render_illumination_enhanced"] , 0.0, 1.0)
-        rendering_enhanced = torch.clamp(render_pkg["render_illumination_enhanced"] * render_pkg["render_reflectance"], 0.0, 1.0)
+        rendering_enhanced = torch.clamp(render_pkg["render_enhanced"], 0.0, 1.0)
+        coverage = torch.clamp(render_pkg["render_coverage"], 0.0, 1.0)
+        coverage_metrics[view.image_name + ".png"] = {
+            "low_coverage_ratio": float((coverage < 0.95).float().mean().detach().cpu()),
+            "mean_coverage": float(coverage.mean().detach().cpu()),
+        }
         rendering_depth = 1 - minmax_normalize(render_pkg["render_depth"])
         if "render_residual" in render_pkg:
              rendering_residul_image = torch.clamp(render_pkg["render_residual"] * 30, 0.0, 1.0)
@@ -559,6 +572,7 @@ def render_set(
         torchvision.utils.save_image(rendering_illumination_enhance , os.path.join(render_illumination_path_enhance, view.image_name + ".png"))
         torchvision.utils.save_image(rendering_illumination_enhanced, os.path.join(render_illumination_path_enhanced, view.image_name + ".png"))
         torchvision.utils.save_image(rendering_enhanced, os.path.join(render_enhanced_path, view.image_name + ".png"))
+        torchvision.utils.save_image(coverage, os.path.join(render_coverage_path, view.image_name + ".png"))
 
         torchvision.utils.save_image(rendering_depth, os.path.join(render_depth_path, view.image_name + ".png"))
         if gt is not None:
@@ -599,6 +613,13 @@ def render_set(
             json.dump(illumination_stats_dict, fp, indent=True)
         with open(os.path.join(model_path, name, "ours_{}".format(iteration), "illumination_stats.json"), 'w') as fp:
             json.dump(illumination_stats_dict, fp, indent=True)
+    if coverage_metrics:
+        coverage_summary = {
+            key: float(np.mean([item[key] for item in coverage_metrics.values()]))
+            for key in ("low_coverage_ratio", "mean_coverage")
+        }
+        with open(os.path.join(model_path, name, "ours_{}".format(iteration), "coverage_stats.json"), 'w') as fp:
+            json.dump({"summary": coverage_summary, "per_view": coverage_metrics}, fp, indent=True)
     if evaluate_metrics:
         _dump_metric_report(
             os.path.join(model_path, name, "ours_{}".format(iteration), "metrics_lowlight.json"),
@@ -638,9 +659,14 @@ def render_sets(
     profile_warmup_views: int,
 ):
     with torch.no_grad():
+        if include_residual_render:
+            print("[deprecated] --include_residual_render is ignored; rendering always uses the residual-free primary path.")
+        dataset.use_residual = False
+        dataset.use_dual_transient = False
         use_sg_illumination = getattr(dataset, "use_sg_illumination", getattr(dataset, "use_sg", True))
         use_asg_illumination = getattr(dataset, "use_asg_illumination", True)
         illumination_mode = getattr(dataset, "illumination_mode", "asg")
+        reflectance_mode = getattr(dataset, "reflectance_mode", "explicit")
         sg_lobes = getattr(dataset, "sg_lobes", getattr(dataset, "num_sg", 4))
         sg_lambda_min = getattr(dataset, "sg_lambda_min", 1.0)
         asg_lobes = getattr(dataset, "asg_lobes", 1)
@@ -648,16 +674,18 @@ def render_sets(
 
         gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
                               dataset.appearance_residual_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_reflectance_dist, dataset.add_illumination_dist, dataset.add_residual_dist, dataset.use_residual, dataset.use_dual_transient, dataset.use_3D_filter,
-                              use_sg_illumination=use_sg_illumination, use_asg_illumination=use_asg_illumination, illumination_mode=illumination_mode, sg_lobes=sg_lobes, sg_lambda_min=sg_lambda_min, asg_lobes=asg_lobes, asg_lambda_min=asg_lambda_min)
+                              use_sg_illumination=use_sg_illumination, use_asg_illumination=use_asg_illumination, illumination_mode=illumination_mode, reflectance_mode=reflectance_mode, sg_lobes=sg_lobes, sg_lambda_min=sg_lambda_min, asg_lobes=asg_lobes, asg_lambda_min=asg_lambda_min)
         scene = Scene(dataset, gaussians, depth_piror_model=None, load_iteration=iteration, shuffle=False)
         
         gaussians.eval()
-        if not include_residual_render:
-            gaussians.use_residual = False
+        gaussians.use_residual = False
+        reflectance_label = "MLP reflectance" if gaussians.reflectance_mode == "mlp" else "B0 reflectance"
         if gaussians.illumination_mode == "asg" and use_asg_illumination and gaussians.asg_illumination_available:
-            print("Rendering with ASG illumination and B0 reflectance.")
+            print(f"Rendering with ASG illumination and {reflectance_label}.")
         elif gaussians.illumination_mode == "sg" and use_sg_illumination and gaussians.sg_illumination_available:
-            print("Rendering with SG illumination and B0 reflectance.")
+            print(f"Rendering with SG illumination and {reflectance_label}.")
+        elif gaussians.illumination_mode == "mlp":
+            print(f"Rendering with MLP illumination and {reflectance_label}.")
         else:
             print("Rendering in legacy compatibility mode.")
 
@@ -747,6 +775,10 @@ if __name__ == "__main__":
     parser.add_argument("--profile_warmup_views", default=1, type=int)
 
     args = get_combined_args(parser)
+    if args.use_residual:
+        print("[deprecated] checkpoint residual fields are ignored; rendering uses the residual-free primary path.")
+    args.use_residual = False
+    args.use_dual_transient = False
     if args.dataset_path:
         args.source_path = args.dataset_path
     print("Rendering " + args.model_path)

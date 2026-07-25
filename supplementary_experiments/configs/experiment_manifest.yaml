@@ -1,0 +1,58 @@
+{
+  "version": 1,
+  "outputs_root": "outputs",
+  "bootstrap_samples": 2000,
+  "qualitative_views": {},
+  "experiments": [
+    {
+      "id": "buu_main_8k",
+      "scene": "buu",
+      "display_name": "Ours (ASG + CIDNet)",
+      "role": "main",
+      "enabled": true,
+      "output_dir": "buu_ablation_no_residual_8k",
+      "iteration": 8000,
+      "notes": "Primary no-residual run supplied by the author."
+    },
+    {
+      "id": "sofa_main_8k",
+      "scene": "sofa",
+      "display_name": "Ours (ASG + CIDNet)",
+      "role": "main",
+      "enabled": true,
+      "output_dir": "sofa_ablation_no_residual_8k",
+      "iteration": 8000,
+      "notes": "Primary no-residual run supplied by the author."
+    },
+    {
+      "id": "bike_main_8k",
+      "scene": "bike",
+      "display_name": "Ours (ASG + CIDNet)",
+      "role": "main",
+      "enabled": true,
+      "output_dir": "bike_ablation_no_residual_8k",
+      "iteration": 8000,
+      "notes": "Primary no-residual run supplied by the author."
+    },
+    {
+      "id": "chair_main_8k",
+      "scene": "chair",
+      "display_name": "Ours (ASG + CIDNet)",
+      "role": "main",
+      "enabled": true,
+      "output_dir": "chair_cidnet_asg_enh_8k_batch4_v4_borderclean",
+      "iteration": 8000,
+      "notes": "Primary border-clean run supplied by the author."
+    },
+    {
+      "id": "shrub_main_12k",
+      "scene": "shrub",
+      "display_name": "Ours (ASG + CIDNet)",
+      "role": "main",
+      "enabled": true,
+      "output_dir": "shrub_cidnet_asg_12k",
+      "iteration": 12000,
+      "notes": "Primary long-schedule shrub run supplied by the author."
+    }
+  ]
+}

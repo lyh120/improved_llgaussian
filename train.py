@@ -447,10 +447,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
     gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
                               dataset.appearance_residual_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_reflectance_dist, dataset.add_illumination_dist, dataset.add_residual_dist, dataset.use_residual, dataset.use_dual_transient, dataset.use_3D_filter,
-                              use_sg_illumination=dataset.use_sg_illumination, use_asg_illumination=dataset.use_asg_illumination, illumination_mode=dataset.illumination_mode, sg_lobes=dataset.sg_lobes, sg_lambda_min=dataset.sg_lambda_min, asg_lobes=dataset.asg_lobes, asg_lambda_min=dataset.asg_lambda_min)
+                              use_sg_illumination=dataset.use_sg_illumination, use_asg_illumination=dataset.use_asg_illumination, illumination_mode=dataset.illumination_mode, reflectance_mode=dataset.reflectance_mode, sg_lobes=dataset.sg_lobes, sg_lambda_min=dataset.sg_lambda_min, asg_lobes=dataset.asg_lobes, asg_lambda_min=dataset.asg_lambda_min)
     depth_piror_model = depth_piror_Model()
     if mode == "warmuped":
-        scene = Scene(dataset, gaussians, depth_piror_model, ply_path=ply_path, shuffle=False, load_iteration=-1 , only_ply=True)
+        scene = Scene(dataset, gaussians, depth_piror_model, ply_path=ply_path, shuffle=False, load_iteration=-1, only_ply=False)
         gaussians.train()
     elif mode == "train" or mode == "warmup":
         scene = Scene(dataset, gaussians, depth_piror_model, ply_path=ply_path, shuffle=False)
@@ -522,6 +522,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     mean = (means / len(cams)).mean()
     enhance_ratio = max(1, int(0.45 / mean))
     first_iter += 1
+    # Statistics are reinitialized after loading a warmup checkpoint, so the
+    # prune grace period starts at the current training stage rather than at
+    # global iteration zero.
+    gaussians.anchor_birth_iteration.fill_(first_iter)
 
     cidnet_prior_root = os.path.join(dataset.source_path, "cidnet_prior")
     cidnet_manifest_path = None
@@ -552,6 +556,24 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             refined_image_dict = build_or_load_stablesr_prior(dataset, cams, enhance_ratio, logger)
         else:
             raise ValueError(f"Unsupported enhancement_prior: {dataset.enhancement_prior}")
+
+    def log_densification(stage, iteration, densification_stats):
+        """Emit one auditable anchor-growth record to stdout, logs, and WandB."""
+        logger.info("[%s densify %d] %s", stage, iteration, densification_stats)
+        print(f"[{stage} densify {iteration}] {densification_stats}")
+        if wandb is not None:
+            densification_log = {
+                f"{stage}_densify/{key}": value
+                for key, value in densification_stats.items()
+                if key != "added_by_level"
+            }
+            densification_log.update(
+                {
+                    f"{stage}_densify/added_level_{level}": value
+                    for level, value in enumerate(densification_stats["added_by_level"])
+                }
+            )
+            wandb.log(densification_log, step=iteration)
           
     timing_stats = {}
     total_start_time = time.time()
@@ -618,8 +640,19 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         
         t1 = time.time()
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe,background, dataset.kernel_size, camera_pose=pose)
-        retain_grad = (iteration < opt.update_until and iteration >= 0)
-        render_pkg = render(viewpoint_cam, gaussians, pipe, background, kernel_size=dataset.kernel_size, visible_mask=voxel_visible_mask, retain_grad=retain_grad, camera_pose=pose)
+        densify_until = opt.warmup_update_until if mode == "warmup" else opt.update_until
+        retain_grad = (iteration < densify_until and iteration >= 0)
+        render_pkg = render(
+            viewpoint_cam,
+            gaussians,
+            pipe,
+            background,
+            kernel_size=dataset.kernel_size,
+            visible_mask=voxel_visible_mask,
+            retain_grad=retain_grad,
+            camera_pose=pose,
+            return_coverage=(iteration % 100 == 0),
+        )
         timing_stats['render_time'] = timing_stats.get('render_time', 0) + (time.time() - t1)
 
         t1 = time.time()
@@ -629,7 +662,13 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
         gt_image = viewpoint_cam.original_image.cuda()
         depth_piror_norm = depth_piror_dict[viewpoint_cam.uid]
-        base_image = torch.clamp(reflectance_image * illumination_image, 0.0, 1.0)
+        base_image = torch.clamp(render_pkg["render"], 0.0, 1.0)
+        coverage_image = render_pkg.get("render_coverage")
+        coverage_low_ratio = (
+            (coverage_image < 0.95).float().mean()
+            if coverage_image is not None
+            else torch.tensor(0.0, device=gt_image.device)
+        )
 
         residual_active = dataset.use_residual and mode != "warmup" and iteration >= opt.residual_start_iter
         residual_mix_weight = 0.0
@@ -687,7 +726,16 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
         Ll1_value = l1_plus_loss(image_tmp, gt_image, phi=0.5/255)
         Ll1 = torch.abs(Ll1_value).mean()
-        L_smooth =  L_Smooth(illumination_image, gt_image, kernel_size=9) * 5e-4
+        illumination_smooth_reg = (
+            dataset.warmup_illumination_smooth_reg
+            if mode == "warmup"
+            else dataset.illumination_smooth_reg
+        )
+        L_smooth = L_Smooth(
+            illumination_image,
+            gt_image,
+            kernel_size=dataset.illumination_smooth_kernel_size,
+        ) * illumination_smooth_reg
         L_illu = L_Illu(gt_image, illumination_image) 
         L_reflectance_smooth = L_Reflectance_Smooth(reflectance_image, illumination_image) * dataset.reflectance_smooth_reg
         L_depth_similarity = (L_Depth_similarity(1 - minmax_normalize(depth_image).squeeze(0), depth_piror_norm.squeeze(0), 128, 0.5) ) * 0.15
@@ -730,6 +778,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         L_enhanced_color = torch.tensor(0.0, device=gt_image.device)
         L_enhanced_color_std = torch.tensor(0.0, device=gt_image.device)
         L_enhanced_green_bias = torch.tensor(0.0, device=gt_image.device)
+        L_smooth_enhancement = torch.tensor(0.0, device=gt_image.device)
 
         if torch.isnan(scaling_reg) or torch.isinf(scaling_reg):
             print("Warning: scaling_reg is nan or inf")
@@ -737,17 +786,18 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
         if mode == "warmup":
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + L_illu + 0.01 * scaling_reg
-            if iteration >= opt.update_from:
-                loss += L_smooth * 0.1 +  L_depth_similarity 
+            if iteration >= opt.warmup_update_from:
+                loss += L_smooth + L_depth_similarity
             loss += dataset.reflectance_consistency_reg * (L_reflectance_consistency + L_reflectance_smooth)
             loss += dataset.reflectance_edge_reg * L_reflectance_edge
             loss += dataset.reflectance_edge_uplift_reg * L_reflectance_edge_uplift
             loss += dataset.reflectance_contrast_reg * L_reflectance_contrast
             loss += dataset.reflectance_highfreq_reg * L_reflectance_highfreq
             loss += dataset.highlight_reflectance_reg * L_reflectance_highlight
-            loss += dataset.reflectance_detail_reg * L_reflectance_detail
-            loss += dataset.reflectance_decoder_reg * L_reflectance_decoder
-            loss += dataset.b0_spatial_smooth_reg * L_b0_spatial_smooth
+            if dataset.reflectance_mode == "explicit":
+                loss += dataset.reflectance_detail_reg * L_reflectance_detail
+                loss += dataset.reflectance_decoder_reg * L_reflectance_decoder
+                loss += dataset.b0_spatial_smooth_reg * L_b0_spatial_smooth
         else:
             loss = (1.0 - opt.lambda_dssim ) * Ll1 + opt.lambda_dssim *  ssim_loss + L_illu + 0.01 * scaling_reg  
             
@@ -757,7 +807,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     loss += dataset.asg_energy_reg * L_asg_energy
                     loss += dataset.asg_sharpness_reg * L_asg_sharpness
                     loss += dataset.asg_anisotropy_reg * L_asg_anisotropy
-                else:
+                elif dataset.illumination_mode == "sg":
                     loss += dataset.sg_energy_reg * L_sg_energy
                     loss += dataset.sg_smooth_reg * L_sg_sharpness
                 loss += dataset.reflectance_consistency_reg * (L_reflectance_consistency + L_reflectance_smooth)
@@ -766,9 +816,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 loss += dataset.reflectance_contrast_reg * L_reflectance_contrast
                 loss += dataset.reflectance_highfreq_reg * L_reflectance_highfreq
                 loss += dataset.highlight_reflectance_reg * L_reflectance_highlight
-                loss += dataset.reflectance_detail_reg * L_reflectance_detail
-                loss += dataset.reflectance_decoder_reg * L_reflectance_decoder
-                loss += dataset.b0_spatial_smooth_reg * L_b0_spatial_smooth
+                if dataset.reflectance_mode == "explicit":
+                    loss += dataset.reflectance_detail_reg * L_reflectance_detail
+                    loss += dataset.reflectance_decoder_reg * L_reflectance_decoder
+                    loss += dataset.b0_spatial_smooth_reg * L_b0_spatial_smooth
 
             L_diff = 0
             if iteration >= opt.update_from:
@@ -783,11 +834,15 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     ).mean() * dataset.enhancement_degree_global_reg
                 )
                 L_smooth_enhancement = (
-                    L_Smooth(illumination_enhanced_image / enhance_ratio, gt_image, kernel_size=9)
+                    L_Smooth(
+                        illumination_enhanced_image / enhance_ratio,
+                        gt_image,
+                        kernel_size=dataset.illumination_smooth_kernel_size,
+                    )
                     * dataset.enhancement_smooth_reg
                 )
                 refined_target = get_refined_image(refined_image_dict, viewpoint_cam).cuda()
-                image_enhanced_pred = torch.clamp(illumination_enhanced_image * reflectance_image, 0.0, 1.0)
+                image_enhanced_pred = torch.clamp(render_pkg["render_enhanced"], 0.0, 1.0)
                 pred_mean = image_enhanced_pred.mean(dim=(1, 2))
                 target_mean = refined_target.mean(dim=(1, 2))
                 pred_std = image_enhanced_pred.view(3, -1).std(dim=1, unbiased=False)
@@ -867,7 +922,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
             if mode=="warmup" or not dataset.use_residual:
                 wandb.log({'loss':loss, 'iteration':iteration,
+                           'anchor_count': int(gaussians.get_anchor.shape[0]),
                            'illumination_mean': illumination_image.mean(),
+                           'illumination_smooth': L_smooth,
+                           'enhancement_smooth': L_smooth_enhancement,
                            'sg_energy': L_sg_energy,
                            'sg_lambda_mean': L_sg_sharpness,
                            'asg_energy': L_asg_energy,
@@ -881,12 +939,16 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                            'reflectance_highlight_mean': L_reflectance_highlight,
                            'reflectance_detail_mean': L_reflectance_detail,
                            'reflectance_decoder_mean': L_reflectance_decoder,
+                           'coverage_low_ratio': coverage_low_ratio,
                            'residual_mix_weight': residual_mix_weight,
                            'residual_chroma_boost': L_residual_chroma_boost})
             else:
                 residual_chroma_mean = torch.abs(residual_image_for_loss - residual_image_for_loss.mean(dim=0, keepdim=True)).mean()
                 residual_log = {'loss':loss, 'iteration':iteration,
+                                'anchor_count': int(gaussians.get_anchor.shape[0]),
                                 'illumination_mean': illumination_image.mean(),
+                                'illumination_smooth': L_smooth,
+                                'enhancement_smooth': L_smooth_enhancement,
                                 'sg_energy': L_sg_energy,
                                 'sg_lambda_mean': L_sg_sharpness,
                                 'asg_energy': L_asg_energy,
@@ -926,7 +988,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             if (iteration - 1) % 600 == 0:
                 gt_image = torch.clamp(gt_image * enhance_ratio, 0.0, 1.0)
                 image = torch.clamp(image_tmp * enhance_ratio, 0.0, 1.0)
-                enhanced_image = torch.clamp(reflectance_image * illumination_image * enhance_ratio, 0.0, 1.0)
+                enhanced_image = torch.clamp(render_pkg["render_enhanced"] * enhance_ratio, 0.0, 1.0)
                 illumination_image = torch.clamp(illumination_image * enhance_ratio, 0.0, 1.0)
                 if not dataset.use_residual or mode=="warmup":
                     noise_image = torch.zeros_like(image)
@@ -989,7 +1051,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         'depth_piror_image':wandb.Image(torchvision.transforms.ToPILImage()(depth_piror_norm)),
                         'clear_image':wandb.Image(enhanced_image_pil),
                         'illumination_enhanced':wandb.Image(torchvision.transforms.ToPILImage()(illumination_enhanced_image)),
-                        'image_enhanced':wandb.Image(torchvision.transforms.ToPILImage()(illumination_enhanced_image * reflectance_image)),
+                        'image_enhanced':wandb.Image(torchvision.transforms.ToPILImage()(render_pkg["render_enhanced"])),
                         'refined_image':wandb.Image(torchvision.transforms.ToPILImage()(get_refined_image(refined_image_dict, viewpoint_cam, gt_image).cuda())),
                 }
                 if dataset.use_dual_transient:
@@ -1052,13 +1114,26 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
+            anchor_count = int(gaussians.get_anchor.shape[0])
 
             if iteration % 10 == 0:
                 if mode=="warmup" or not dataset.use_residual:
-                    progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{4}f}","L1": f"{Ll1:.{4}f}", "L_smooth": f"{L_smooth:.{5}f}","L_depth_similarity": f"{L_depth_similarity:.{5}f}", "L_sg": f"{L_sg_energy:.{5}f}"})
+                    progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{4}f}","L1": f"{Ll1:.{4}f}", "L_smooth": f"{L_smooth:.{5}f}","L_depth_similarity": f"{L_depth_similarity:.{5}f}", "L_sg": f"{L_sg_energy:.{5}f}", "Anchors": anchor_count})
                 else:
-                    progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{4}f}","L1": f"{Ll1:.{4}f}", "L_illu": f"{L_illu:.{5}f}", "L_smooth": f"{L_smooth:.{5}f}","L_depth_similarity": f"{L_depth_similarity:.{5}f}", "L_residual_reg": f"{L_residual_reg:.{5}f}", "L_sg": f"{L_sg_energy:.{5}f}"})
+                    progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{4}f}","L1": f"{Ll1:.{4}f}", "L_illu": f"{L_illu:.{5}f}", "L_smooth": f"{L_smooth:.{5}f}","L_depth_similarity": f"{L_depth_similarity:.{5}f}", "L_residual_reg": f"{L_residual_reg:.{5}f}", "L_sg": f"{L_sg_energy:.{5}f}", "Anchors": anchor_count})
                 progress_bar.update(10)
+
+            if iteration % 100 == 0:
+                coverage_value = float(coverage_low_ratio.detach().cpu())
+                logger.info(
+                    "[anchor] iter=%d anchors=%d coverage_low_ratio=%.6f",
+                    iteration,
+                    anchor_count,
+                    coverage_value,
+                )
+                if tb_writer:
+                    tb_writer.add_scalar(f'{dataset_name}/anchors', anchor_count, iteration)
+                    tb_writer.add_scalar(f'{dataset_name}/coverage_low_ratio', coverage_value, iteration)
             
 
             if iteration == opt.iterations:
@@ -1075,25 +1150,55 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             # densification
             t1 = time.time()
             if mode == "warmup":
-                if iteration < opt.update_until and iteration > opt.start_stat:
-                    # add statis
-                    gaussians.training_statis(viewspace_point_tensor, opacity, visibility_filter, offset_selection_mask, voxel_visible_mask)
-                    # densification
-                    if iteration > opt.update_from and iteration % opt.update_interval == 0:
-                        gaussians.adjust_anchor(check_interval=opt.update_interval, success_threshold=opt.success_threshold, grad_threshold=opt.densify_grad_threshold, min_opacity=opt.min_opacity, mode=mode)
+                # Preserve the complete initial point cloud, then make three
+                # small coverage-oriented updates (1400/1600/1800 by default).
+                # Pruning is deliberately disabled until the main stage.
+                if iteration < opt.warmup_update_until and iteration > opt.warmup_start_stat:
+                    gaussians.training_statis(
+                        viewspace_point_tensor,
+                        opacity,
+                        visibility_filter,
+                        offset_selection_mask,
+                        voxel_visible_mask,
+                    )
+                    if (
+                        iteration > opt.warmup_update_from
+                        and iteration % opt.warmup_update_interval == 0
+                    ):
+                        densification_stats = gaussians.adjust_anchor(
+                            check_interval=opt.warmup_update_interval,
+                            success_threshold=opt.warmup_success_threshold,
+                            grad_threshold=opt.warmup_densify_grad_threshold,
+                            min_opacity=opt.min_opacity,
+                            mode=mode,
+                            max_anchors=opt.max_anchors,
+                            max_new_anchors=opt.warmup_max_new_anchors,
+                            level_caps=opt.warmup_level_caps,
+                            current_iteration=iteration,
+                            prune_grace_iters=opt.anchor_prune_grace_iters,
+                            allow_prune=False,
+                        )
+                        log_densification("warmup", iteration, densification_stats)
                         gaussians.compute_3D_filter(cameras=trainCameras)
-                elif iteration == opt.update_until:
-                    del gaussians.opacity_accum
-                    del gaussians.offset_gradient_accum
-                    del gaussians.offset_denom
-                    torch.cuda.empty_cache()
             else:
                 if iteration < opt.update_until and iteration > opt.start_stat:
                     # add statis
                     gaussians.training_statis(viewspace_point_tensor, opacity, visibility_filter, offset_selection_mask, voxel_visible_mask)
                     # densification
                     if iteration > opt.update_from and iteration % opt.update_interval == 0:
-                        gaussians.adjust_anchor(check_interval=opt.update_interval, success_threshold=opt.success_threshold, grad_threshold=opt.densify_grad_threshold, min_opacity=opt.min_opacity, mode=mode)
+                        densification_stats = gaussians.adjust_anchor(
+                            check_interval=opt.update_interval,
+                            success_threshold=opt.success_threshold,
+                            grad_threshold=opt.densify_grad_threshold,
+                            min_opacity=opt.min_opacity,
+                            mode=mode,
+                            max_anchors=opt.max_anchors,
+                            max_new_anchors=opt.max_new_anchors_per_update,
+                            level_caps=opt.densify_level_caps,
+                            current_iteration=iteration,
+                            prune_grace_iters=opt.anchor_prune_grace_iters,
+                        )
+                        log_densification("main", iteration, densification_stats)
                         gaussians.compute_3D_filter(cameras=trainCameras)
                 elif iteration == opt.update_until:
                     del gaussians.opacity_accum
@@ -1296,7 +1401,7 @@ def render_set_optimize(model_path, name, iteration, views, gaussians, pipeline,
             rendering = torch.clamp(render_pkg_opt["render"], 0.0, 1.0)
             rendering_reflectance = torch.clamp(render_pkg_opt["render_reflectance"], 0.0, 1.0)
             rendering_illumination = torch.clamp(render_pkg_opt["render_illumination"] , 0.0, 1.0)
-            rendering_enhanced = torch.clamp(render_pkg["render_illumination_enhanced"] * render_pkg["render_reflectance"], 0.0, 1.0)
+            rendering_enhanced = torch.clamp(render_pkg["render_enhanced"], 0.0, 1.0)
             rendering_depth = 1 - minmax_normalize(render_pkg["render_depth"])
             if 'render_residual' in render_pkg:
                 rendering_residual = torch.clamp(render_pkg["render_residual"], 0.0, 1.0)
@@ -1380,7 +1485,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
         rendering_reflectance = torch.clamp(render_pkg["render_reflectance"], 0.0, 1.0)
         rendering_illumination = torch.clamp(render_pkg["render_illumination"] , 0.0, 1.0)
-        rendering_enhanced = torch.clamp(render_pkg["render_illumination_enhanced"] * render_pkg["render_reflectance"], 0.0, 1.0)
+        rendering_enhanced = torch.clamp(render_pkg["render_enhanced"], 0.0, 1.0)
         rendering_depth = 1 - minmax_normalize(render_pkg["render_depth"])
         if 'render_residual' in render_pkg:
             rendering_residual = torch.clamp(render_pkg["render_residual"], 0.0, 1.0)
@@ -1421,7 +1526,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train=False, skip_test=False, wandb=None, tb_writer=None, dataset_name=None, logger=None):
     gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
                               dataset.appearance_residual_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_reflectance_dist, dataset.add_illumination_dist, dataset.add_residual_dist, dataset.use_residual, dataset.use_dual_transient, dataset.use_3D_filter,
-                              use_sg_illumination=dataset.use_sg_illumination, use_asg_illumination=dataset.use_asg_illumination, illumination_mode=dataset.illumination_mode, sg_lobes=dataset.sg_lobes, sg_lambda_min=dataset.sg_lambda_min, asg_lobes=dataset.asg_lobes, asg_lambda_min=dataset.asg_lambda_min)
+                              use_sg_illumination=dataset.use_sg_illumination, use_asg_illumination=dataset.use_asg_illumination, illumination_mode=dataset.illumination_mode, reflectance_mode=dataset.reflectance_mode, sg_lobes=dataset.sg_lobes, sg_lambda_min=dataset.sg_lambda_min, asg_lobes=dataset.asg_lobes, asg_lambda_min=dataset.asg_lambda_min)
     scene = Scene(dataset, gaussians, depth_piror_model=None, load_iteration=iteration, shuffle=False)
     gaussians.eval()
 
@@ -1570,6 +1675,10 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
+    if args.use_residual:
+        print("[deprecated] --use_residual is ignored; new training always uses the residual-free primary renderer.")
+    args.use_residual = False
+    args.use_dual_transient = False
 
     
     # enable logging
@@ -1594,8 +1703,10 @@ if __name__ == "__main__":
     except:
         logger.info(f'save code failed~')
         
-    dataset = args.source_path.split('/')[-1]
-    exp_name = args.model_path.split('/')[-2]
+    dataset = os.path.basename(os.path.normpath(args.source_path))
+    # Use the experiment directory itself for WandB rather than its parent
+    # (which is commonly the uninformative literal "outputs").
+    exp_name = os.path.basename(os.path.normpath(args.model_path))
     
     if args.use_wandb:
         wandb.login()
@@ -1628,15 +1739,13 @@ if __name__ == "__main__":
         args_warmup = copy.deepcopy(args)
         args_warmup.iterations = 2000
         args_warmup.save_iterations.append(args_warmup.iterations)
+        # Initial geometry must be complete.  Any scene-specific prune_ratio
+        # is intentionally deferred; the main stage reloads this full warmup PLY.
+        args_warmup.prune_ratio = 1.0
         print(args.warmup)
-        args_warmup.start_stat = 500
-        args_warmup.update_from = 1500
         args_warmup.offset_lr_init = 0.0001
         args_warmup.opacity_lr = 0.1
         args_warmup.mlp_color_lr_init = 0.1
-        args_warmup.densify_grad_threshold = 0.0002 
-        args_warmup.min_opacity = 0.1
-        args_warmup.success_threshold = 0.8
         training(lp.extract(args_warmup), op.extract(args_warmup), pp.extract(args_warmup), dataset,  args_warmup.test_iterations, args_warmup.save_iterations, args_warmup.checkpoint_iterations, args_warmup.start_checkpoint, args_warmup.debug_from, wandb, logger, mode="warmup")
         logger.info("\n Warmup finished! Reboot from last checkpoints")
         new_ply_path = os.path.join(args.model_path, f'point_cloud/iteration_{args_warmup.iterations}', 'point_cloud.ply')
