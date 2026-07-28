@@ -116,14 +116,22 @@ class ModelParams(ParamGroup):
         self.enhancement_degree_reg = 0.2
         self.enhancement_degree_global_reg = 0.05
         self.enhancement_smooth_reg = 4e-4
+        self.enhancement_gain_smooth_reg = 0.0
+        self.enhancement_edge_preserve_reg = 0.0
+        self.enhancement_guidance_final_weight = 0.3
+        self.enhancement_guidance_ramp_iters = 0
         self.illumination_smooth_reg = 1e-4
-        self.warmup_illumination_smooth_reg = 2e-5
+        self.warmup_illumination_smooth_reg = 5e-5
         self.illumination_smooth_kernel_size = 5
+        self.warmup_illumination_smooth_kernel_size = 9
         self.enhancement_diff_start_iter = 2500
         self.enhancement_color_reg = 0.06
         self.enhancement_color_std_reg = 0.02
         self.enhancement_green_bias_reg = 0.05
         self.enhancement_prior = "cidnet"
+        self.wandb_monitor_camera = "1"
+        self.wandb_monitor_split = "test"
+        self.wandb_monitor_interval = 600
         self.cidnet_conda_env = "CIDNet"
         self.cidnet_root = "./submodules/HVI-CIDNet"
         self.cidnet_weights = "./submodules/HVI-CIDNet/weights/LOLv2_real/w_perc.pth"
@@ -248,6 +256,9 @@ class OptimizationParams(ParamGroup):
         self.max_new_anchors_per_update = 512
         self.densify_level_caps = "256,160,96"
         self.anchor_prune_grace_iters = 500
+        self.prune_from_iter = 0
+        self.max_pruned_anchors_per_update = 0
+        self.enhancement_grad_clip = 0.0
         self.enhancement_from = 10_000
         self.residual_start_iter = 3_000
         self.residual_ramp_iters = 2_500
@@ -304,14 +315,22 @@ def _backfill_model_compatibility(merged_dict):
         "enhancement_degree_reg": 0.2,
         "enhancement_degree_global_reg": 0.05,
         "enhancement_smooth_reg": 4e-4,
+        "enhancement_gain_smooth_reg": 0.0,
+        "enhancement_edge_preserve_reg": 0.0,
+        "enhancement_guidance_final_weight": 0.3,
+        "enhancement_guidance_ramp_iters": 0,
         "illumination_smooth_reg": 1e-4,
-        "warmup_illumination_smooth_reg": 2e-5,
+        "warmup_illumination_smooth_reg": 5e-5,
         "illumination_smooth_kernel_size": 5,
+        "warmup_illumination_smooth_kernel_size": 9,
         "enhancement_diff_start_iter": 2500,
         "enhancement_color_reg": 0.06,
         "enhancement_color_std_reg": 0.02,
         "enhancement_green_bias_reg": 0.05,
         "enhancement_prior": "cidnet",
+        "wandb_monitor_camera": "1",
+        "wandb_monitor_split": "test",
+        "wandb_monitor_interval": 600,
         "cidnet_conda_env": "CIDNet",
         "cidnet_root": "./submodules/HVI-CIDNet",
         "cidnet_weights": "./submodules/HVI-CIDNet/weights/LOLv2_real/w_perc.pth",
@@ -338,6 +357,9 @@ def _backfill_model_compatibility(merged_dict):
         "max_new_anchors_per_update": 512,
         "densify_level_caps": "256,160,96",
         "anchor_prune_grace_iters": 500,
+        "prune_from_iter": 0,
+        "max_pruned_anchors_per_update": 0,
+        "enhancement_grad_clip": 0.0,
         "warmup_start_stat": 200,
         "warmup_update_from": 1_200,
         "warmup_update_until": 1_900,

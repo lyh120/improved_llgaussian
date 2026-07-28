@@ -40,6 +40,14 @@ from gaussian_renderer import render, prefilter_voxel,render_fast
 import torchvision
 from tqdm import tqdm
 from utils.general_utils import safe_state
+from utils.artifact_utils import (
+    compute_artifact_diagnostics,
+    compute_detail_diagnostics,
+    summarize_artifact_diagnostics,
+    summarize_detail_diagnostics,
+)
+from utils.composition_utils import compose_decomposed_render
+
 from argparse import ArgumentParser
 from gaussian_renderer import GaussianModel
 from utils.visualize_utils import minmax_normalize, visualize_cmap
@@ -64,7 +72,6 @@ except ImportError:
     ModelParams = arguments_module.ModelParams
     PipelineParams = arguments_module.PipelineParams
     get_combined_args = arguments_module.get_combined_args
-
 
 def _cuda_profile_now() -> float:
     torch.cuda.synchronize()
@@ -352,7 +359,7 @@ def render_set_optimize(model_path, name, iteration, views, gaussians, pipeline,
                 # rendering = render(view, gaussians, pipeline, background, camera_pose=torch.cat([camera_tensor_q, camera_tensor_T]))["render"]
                 voxel_visible_mask = prefilter_voxel(view, gaussians, pipeline, background, kernel_size=kernel_size, camera_pose=torch.cat([camera_tensor_q, camera_tensor_T]))
                 render_pkg = render(view, gaussians, pipeline, background, kernel_size=kernel_size, visible_mask=voxel_visible_mask, camera_pose=torch.cat([camera_tensor_q, camera_tensor_T]))
-                rendering = render_pkg["render"]
+                rendering = compose_decomposed_render(render_pkg)
                 black_hole_threshold = 0.0
                 mask = (rendering > black_hole_threshold).float()
                 loss = torch.abs(l1_plus_loss(rendering, gt) * mask).mean()
@@ -384,10 +391,10 @@ def render_set_optimize(model_path, name, iteration, views, gaussians, pipeline,
 
         
             
-            rendering = torch.clamp(render_pkg_opt["render"], 0.0, 1.0)
+            rendering = compose_decomposed_render(render_pkg_opt)
             rendering_reflectance = torch.clamp(render_pkg_opt["render_reflectance"], 0.0, 1.0)
             rendering_illumination = torch.clamp(render_pkg_opt["render_illumination"] , 0.0, 1.0)
-            rendering_enhanced = torch.clamp(render_pkg_opt["render_enhanced"], 0.0, 1.0)
+            rendering_enhanced = compose_decomposed_render(render_pkg_opt, enhanced=True)
             coverage = torch.clamp(render_pkg_opt["render_coverage"], 0.0, 1.0)
             rendering_depth = 1 - minmax_normalize(render_pkg["render_depth"])
             if 'render_residual' in render_pkg:
@@ -483,6 +490,8 @@ def render_set(
     lowlight_metrics = {}
     enhanced_metrics = {}
     coverage_metrics = {}
+    artifact_diagnostics = {}
+    detail_diagnostics = {}
     time_consume = 0
     profile_views = []
     lpips_fn = None
@@ -536,13 +545,13 @@ def render_set(
                 if torch.is_tensor(value) and value.numel() == 1
             }
 
-        rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
-        rendering_enhance = torch.clamp(render_pkg["render"] * 30, 0.0, 1.0)
+        rendering = compose_decomposed_render(render_pkg)
+        rendering_enhance = torch.clamp(rendering * 30, 0.0, 1.0)
         rendering_reflectance = torch.clamp(render_pkg["render_reflectance"], 0.0, 1.0)
         rendering_illumination = torch.clamp(render_pkg["render_illumination"] , 0.0, 1.0)
         rendering_illumination_enhanced = torch.clamp(render_pkg["render_illumination"] * 30 , 0.0, 1.0)
         rendering_illumination_enhance = torch.clamp(render_pkg["render_illumination_enhanced"] , 0.0, 1.0)
-        rendering_enhanced = torch.clamp(render_pkg["render_enhanced"], 0.0, 1.0)
+        rendering_enhanced = compose_decomposed_render(render_pkg, enhanced=True)
         coverage = torch.clamp(render_pkg["render_coverage"], 0.0, 1.0)
         coverage_metrics[view.image_name + ".png"] = {
             "low_coverage_ratio": float((coverage < 0.95).float().mean().detach().cpu()),
@@ -594,6 +603,16 @@ def render_set(
             bright_gt = _load_image_tensor_from_pattern(os.path.join(bright_gt_root, view.image_name + ".*"), rendering_enhanced.device)
             if bright_gt is not None:
                 enhanced_metrics[view.image_name + ".png"] = _compute_metrics(rendering_enhanced, bright_gt, lpips_fn)
+                artifact_diagnostics[view.image_name + ".png"] = compute_artifact_diagnostics(
+                    rendering_enhanced,
+                    bright_gt,
+                    coverage,
+                )
+                detail_diagnostics[view.image_name + ".png"] = compute_detail_diagnostics(
+                    rendering_enhanced,
+                    bright_gt,
+                    coverage,
+                )
         if profile_render_timing:
             torch.cuda.synchronize()
             profile_metric_end = time.perf_counter()
@@ -620,6 +639,44 @@ def render_set(
         }
         with open(os.path.join(model_path, name, "ours_{}".format(iteration), "coverage_stats.json"), 'w') as fp:
             json.dump({"summary": coverage_summary, "per_view": coverage_metrics}, fp, indent=True)
+    if artifact_diagnostics:
+        artifact_report = {
+            "thresholds": {
+                "prediction_black": 0.05,
+                "gt_bright": 0.15,
+                "low_coverage": 0.95,
+            },
+            "summary": summarize_artifact_diagnostics(artifact_diagnostics),
+            "per_view": artifact_diagnostics,
+        }
+        artifact_path = os.path.join(
+            model_path,
+            name,
+            "ours_{}".format(iteration),
+            "artifact_diagnostics.json",
+        )
+        with open(artifact_path, "w") as fp:
+            json.dump(artifact_report, fp, indent=2)
+        print(f"[artifact] saved diagnostic report to {artifact_path}")
+    if detail_diagnostics:
+        detail_report = {
+            "thresholds": {
+                "edge_gradient": 0.02,
+                "retained_edge_ratio": 0.5,
+                "low_coverage": 0.95,
+            },
+            "summary": summarize_detail_diagnostics(detail_diagnostics),
+            "per_view": detail_diagnostics,
+        }
+        detail_path = os.path.join(
+            model_path,
+            name,
+            "ours_{}".format(iteration),
+            "detail_diagnostics.json",
+        )
+        with open(detail_path, "w") as fp:
+            json.dump(detail_report, fp, indent=2)
+        print(f"[detail] saved diagnostic report to {detail_path}")
     if evaluate_metrics:
         _dump_metric_report(
             os.path.join(model_path, name, "ours_{}".format(iteration), "metrics_lowlight.json"),

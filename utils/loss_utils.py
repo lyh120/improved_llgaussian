@@ -126,6 +126,7 @@ def L_Smooth(illumination_image, image, kernel_size=9):
 
     return torch.sqrt(grad_image).mean()
 
+
 # def L_Smooth(illumination_image, image):
 #     image = image.detach().unsqueeze(0)
 #     illumination_image = illumination_image.unsqueeze(0)

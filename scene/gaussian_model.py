@@ -1982,8 +1982,16 @@ class GaussianModel:
             level_caps = tuple(int(value) for value in level_caps.split(",") if value.strip())
         if not level_caps:
             level_caps = (max_new_anchors,)
-        growth_stats = {"candidates": 0, "added_by_level": [], "cap_hit": False}
+        growth_stats = {
+            "candidates": 0,
+            "added_by_level": [],
+            "cap_hit": False,
+            "selected_grad_min": 0.0,
+            "enhancement_params_inherited": 0,
+            "enhancement_params_random_initialized": 0,
+        }
         total_added = 0
+        selected_grad_min = None
         init_length = self.get_anchor.shape[0]*self.n_offsets
         for i in range(self.update_depth):
             # update threshold
@@ -2050,7 +2058,18 @@ class GaussianModel:
             source_scores = grads[source_mask]
             voxel_scores = scatter_max(source_scores, inverse_indices, dim=0)[0].view(-1)
             new_voxel_indices = torch.nonzero(remove_duplicates, as_tuple=False).squeeze(1)
-            _, top_indices = torch.topk(voxel_scores[new_voxel_indices], k=keep_count, largest=True, sorted=False)
+            selected_scores, top_indices = torch.topk(
+                voxel_scores[new_voxel_indices],
+                k=keep_count,
+                largest=True,
+                sorted=False,
+            )
+            current_selected_min = float(selected_scores.min().detach().cpu())
+            selected_grad_min = (
+                current_selected_min
+                if selected_grad_min is None
+                else min(selected_grad_min, current_selected_min)
+            )
             selected_unique_mask = torch.zeros_like(remove_duplicates)
             selected_unique_mask[new_voxel_indices[top_indices]] = True
 
@@ -2094,7 +2113,14 @@ class GaussianModel:
                 )
                 if candidate_mask.any():
                     def _inherit_offset_param(param):
-                        flat_param = param.view(self.get_anchor.shape[0] * self.n_offsets, -1)[candidate_mask]
+                        # Parameters restored from PLY are built through
+                        # transpose operations and may be non-contiguous.
+                        # reshape() safely handles both contiguous training
+                        # tensors and non-contiguous restored tensors.
+                        flat_param = param.reshape(
+                            self.get_anchor.shape[0] * self.n_offsets,
+                            -1,
+                        )[candidate_mask]
                         inherited = scatter_mean(
                             flat_param,
                             inverse_indices.unsqueeze(1).expand(-1, flat_param.size(1)),
@@ -2102,12 +2128,30 @@ class GaussianModel:
                         )[remove_duplicates]
                         return inherited
 
-                    new_illum_asg_axis = _inherit_offset_param(self._illum_asg_axis).view(candidate_anchor.shape[0], 1, self.asg_lobes, 3).repeat(1, self.n_offsets, 1, 1)
-                    new_illum_asg_tangent = _inherit_offset_param(self._illum_asg_tangent).view(candidate_anchor.shape[0], 1, self.asg_lobes, 3).repeat(1, self.n_offsets, 1, 1)
-                    new_illum_asg_sharpness = _inherit_offset_param(self._illum_asg_sharpness).view(candidate_anchor.shape[0], 1, self.asg_lobes, 2).repeat(1, self.n_offsets, 1, 1)
-                    new_illum_asg_amplitude = _inherit_offset_param(self._illum_asg_amplitude).view(candidate_anchor.shape[0], 1, self.asg_lobes, 1).repeat(1, self.n_offsets, 1, 1)
-                    new_illum_asg_bias = _inherit_offset_param(self._illum_asg_bias).view(candidate_anchor.shape[0], 1, 1).repeat(1, self.n_offsets, 1)
-                    new_illum_asg_dist_weight = _inherit_offset_param(self._illum_asg_dist_weight).view(candidate_anchor.shape[0], 1, 1).repeat(1, self.n_offsets, 1)
+                    new_enhancement_sg_axis = F.normalize(
+                        _inherit_offset_param(self._enhancement_sg_axis),
+                        dim=-1,
+                        eps=1e-6,
+                    ).reshape(candidate_anchor.shape[0], 1, 3).repeat(1, self.n_offsets, 1)
+                    new_enhancement_sg_sharpness = _inherit_offset_param(
+                        self._enhancement_sg_sharpness
+                    ).reshape(candidate_anchor.shape[0], 1, 1).repeat(1, self.n_offsets, 1)
+                    new_enhancement_sg_amplitude = _inherit_offset_param(
+                        self._enhancement_sg_amplitude
+                    ).reshape(candidate_anchor.shape[0], 1, 3).repeat(1, self.n_offsets, 1)
+                    growth_stats["enhancement_params_inherited"] += int(
+                        candidate_anchor.shape[0]
+                    )
+                    new_illum_asg_axis = _inherit_offset_param(self._illum_asg_axis).reshape(candidate_anchor.shape[0], 1, self.asg_lobes, 3).repeat(1, self.n_offsets, 1, 1)
+                    new_illum_asg_tangent = _inherit_offset_param(self._illum_asg_tangent).reshape(candidate_anchor.shape[0], 1, self.asg_lobes, 3).repeat(1, self.n_offsets, 1, 1)
+                    new_illum_asg_sharpness = _inherit_offset_param(self._illum_asg_sharpness).reshape(candidate_anchor.shape[0], 1, self.asg_lobes, 2).repeat(1, self.n_offsets, 1, 1)
+                    new_illum_asg_amplitude = _inherit_offset_param(self._illum_asg_amplitude).reshape(candidate_anchor.shape[0], 1, self.asg_lobes, 1).repeat(1, self.n_offsets, 1, 1)
+                    new_illum_asg_bias = _inherit_offset_param(self._illum_asg_bias).reshape(candidate_anchor.shape[0], 1, 1).repeat(1, self.n_offsets, 1)
+                    new_illum_asg_dist_weight = _inherit_offset_param(self._illum_asg_dist_weight).reshape(candidate_anchor.shape[0], 1, 1).repeat(1, self.n_offsets, 1)
+                else:
+                    growth_stats["enhancement_params_random_initialized"] += int(
+                        candidate_anchor.shape[0]
+                    )
 
                 new_offsets = torch.zeros_like(candidate_anchor).unsqueeze(dim=1).repeat([1,self.n_offsets,1]).float().cuda()
 
@@ -2204,9 +2248,11 @@ class GaussianModel:
                 growth_stats["added_by_level"].append(int(candidate_anchor.shape[0]))
                 
 
+        if selected_grad_min is not None:
+            growth_stats["selected_grad_min"] = selected_grad_min
         return growth_stats
 
-    def adjust_anchor(self, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005, mode="train", phi=0.5, max_anchors=60_000, max_new_anchors=512, level_caps=(256, 160, 96), current_iteration=0, prune_grace_iters=500, allow_prune=True):
+    def adjust_anchor(self, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005, mode="train", phi=0.5, max_anchors=60_000, max_new_anchors=512, level_caps=(256, 160, 96), current_iteration=0, prune_grace_iters=500, prune_from_iter=0, max_pruned_anchors=0, allow_prune=True):
         anchors_before = self.get_anchor.shape[0]
         if mode =="warmup":
             old_anchor_num = self.anchor_demon.shape[0]
@@ -2214,6 +2260,23 @@ class GaussianModel:
         grads[grads.isnan()] = 0.0
         grads_norm = torch.norm(grads, dim=-1)
         offset_mask = (self.offset_denom > check_interval*success_threshold * phi).squeeze(dim=1) # choose the neural gaussians with high seen ratio as growing anchor candidates
+        eligible_grads = grads_norm[offset_mask]
+        if eligible_grads.numel() > 0:
+            grad_quantiles = torch.quantile(
+                eligible_grads.float(),
+                torch.tensor([0.5, 0.9, 0.99], device=eligible_grads.device),
+            )
+            candidate_grad_stats = {
+                "candidate_grad_q50": float(grad_quantiles[0].detach().cpu()),
+                "candidate_grad_q90": float(grad_quantiles[1].detach().cpu()),
+                "candidate_grad_q99": float(grad_quantiles[2].detach().cpu()),
+            }
+        else:
+            candidate_grad_stats = {
+                "candidate_grad_q50": 0.0,
+                "candidate_grad_q90": 0.0,
+                "candidate_grad_q99": 0.0,
+            }
         
         growth_stats = self.anchor_growing(
             grads_norm,
@@ -2224,6 +2287,7 @@ class GaussianModel:
             level_caps=level_caps,
             current_iteration=current_iteration,
         )
+        growth_stats.update(candidate_grad_stats)
         
         # update offset_denom
         self.offset_denom[offset_mask] = 0
@@ -2247,24 +2311,100 @@ class GaussianModel:
                     "anchors_before": anchors_before,
                     "pruned": 0,
                     "anchors_after": self.get_anchor.shape[0],
+                    "pruned_low_opacity": 0,
+                    "pruned_never_visible": 0,
+                    "prune_skipped": "disabled",
+                    "effective_mean_opacity_threshold": float(min_opacity) / float(self.n_offsets),
+                }
+            )
+            return growth_stats
+
+        if current_iteration < prune_from_iter:
+            self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
+            growth_stats.update(
+                {
+                    "anchors_before": anchors_before,
+                    "pruned": 0,
+                    "anchors_after": self.get_anchor.shape[0],
+                    "pruned_low_opacity": 0,
+                    "pruned_never_visible": 0,
+                    "prune_skipped": "before_prune_from_iter",
+                    "effective_mean_opacity_threshold": float(min_opacity) / float(self.n_offsets),
                 }
             )
             return growth_stats
         
-        # Prune based on mean per-offset neural opacity instead of its raw
-        # accumulated sum, and remove anchors that never become visible after
-        # a grace period.  The latter catches out-of-frustum floaters.
-        mean_opacity = self.opacity_accum / (self.anchor_demon.clamp_min(1.0) * self.n_offsets)
-        prune_mask = (mean_opacity < min_opacity).squeeze(dim=1)
+        # Restore the original accumulated-opacity semantics.  Since
+        # opacity_accum sums all offsets, this is equivalent to comparing the
+        # mean per-offset opacity against min_opacity / n_offsets.
+        low_opacity_mask = (self.opacity_accum < min_opacity * self.anchor_demon).squeeze(dim=1)
         anchors_mask = (self.anchor_demon > check_interval*success_threshold).squeeze(dim=1) # [N, 1] # choose the 
-        prune_mask = torch.logical_and(prune_mask, anchors_mask) # [N] 
+        low_opacity_mask = torch.logical_and(low_opacity_mask, anchors_mask) # [N]
 
         anchor_age = current_iteration - self.anchor_birth_iteration
         never_visible_mask = torch.logical_and(
             anchor_age >= prune_grace_iters,
             self.anchor_visible_count.squeeze(dim=1) == 0,
         )
-        prune_mask = torch.logical_or(prune_mask, never_visible_mask)
+        # Attribute every removed anchor to one exclusive cause so that the
+        # two counters sum to the total prune count.
+        never_visible_only_mask = torch.logical_and(never_visible_mask, ~low_opacity_mask)
+        prune_mask = torch.logical_or(low_opacity_mask, never_visible_only_mask)
+        pruned_candidates_low_opacity = int(low_opacity_mask.sum().item())
+        pruned_candidates_never_visible = int(never_visible_only_mask.sum().item())
+
+        # Avoid a destructive backlog flush when pruning is enabled after a
+        # long densification-only phase. Remove only the worst candidates per
+        # update: never-visible anchors first, then the lowest mean-opacity
+        # anchors. A non-positive budget keeps legacy unlimited behavior.
+        prune_budget_hit = False
+        if max_pruned_anchors > 0 and int(prune_mask.sum().item()) > max_pruned_anchors:
+            prune_budget_hit = True
+            limited_prune_mask = torch.zeros_like(prune_mask)
+            remaining_budget = int(max_pruned_anchors)
+
+            never_visible_indices = torch.nonzero(
+                never_visible_only_mask,
+                as_tuple=False,
+            ).squeeze(1)
+            if never_visible_indices.numel() > 0:
+                never_visible_keep = min(
+                    remaining_budget,
+                    int(never_visible_indices.numel()),
+                )
+                never_visible_age = anchor_age[never_visible_indices]
+                _, oldest_order = torch.topk(
+                    never_visible_age,
+                    k=never_visible_keep,
+                    largest=True,
+                    sorted=False,
+                )
+                limited_prune_mask[
+                    never_visible_indices[oldest_order]
+                ] = True
+                remaining_budget -= never_visible_keep
+
+            if remaining_budget > 0:
+                low_opacity_indices = torch.nonzero(
+                    low_opacity_mask,
+                    as_tuple=False,
+                ).squeeze(1)
+                low_opacity_keep = min(
+                    remaining_budget,
+                    int(low_opacity_indices.numel()),
+                )
+                if low_opacity_keep > 0:
+                    mean_opacity = self.opacity_accum.squeeze(1) / self.anchor_demon.squeeze(1).clamp_min(1.0)
+                    _, lowest_order = torch.topk(
+                        mean_opacity[low_opacity_indices],
+                        k=low_opacity_keep,
+                        largest=False,
+                        sorted=False,
+                    )
+                    limited_prune_mask[
+                        low_opacity_indices[lowest_order]
+                    ] = True
+            prune_mask = limited_prune_mask
 
         if mode == "warmup":
             unvisibility_mask = (self.anchor_demon == 0).squeeze(dim=1) 
@@ -2302,6 +2442,12 @@ class GaussianModel:
         self.anchor_birth_iteration = self.anchor_birth_iteration[~prune_mask]
 
         pruned_count = int(prune_mask.sum().item())
+        pruned_low_opacity_count = int(
+            torch.logical_and(prune_mask, low_opacity_mask).sum().item()
+        )
+        pruned_never_visible_count = int(
+            torch.logical_and(prune_mask, never_visible_only_mask).sum().item()
+        )
         if pruned_count > 0:
             self.prune_anchor(prune_mask)
         
@@ -2312,6 +2458,13 @@ class GaussianModel:
                 "anchors_before": anchors_before,
                 "pruned": pruned_count,
                 "anchors_after": self.get_anchor.shape[0],
+                "pruned_low_opacity": pruned_low_opacity_count,
+                "pruned_never_visible": pruned_never_visible_count,
+                "prune_candidates_low_opacity": pruned_candidates_low_opacity,
+                "prune_candidates_never_visible": pruned_candidates_never_visible,
+                "prune_budget_hit": prune_budget_hit,
+                "prune_skipped": "",
+                "effective_mean_opacity_threshold": float(min_opacity) / float(self.n_offsets),
             }
         )
         return growth_stats

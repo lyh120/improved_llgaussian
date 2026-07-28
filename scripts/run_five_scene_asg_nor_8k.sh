@@ -88,18 +88,30 @@ run_scene() {
     [[ "$scene" == "buu" ]] && alpha_gamma="1.2"
 
     if [[ "$scene" == "bike" ]]; then
-        # Recover the old bike schedule's early, high-frequency detail search,
-        # but retain deterministic Top-K selection and hard caps.  At most
-        # 384 anchors are added per update and the whole model cannot exceed
-        # 60k anchors, so this cannot reproduce the former point explosion.
+        # Bike v4 detail: retain the validated 12k/90k geometry schedule while
+        # regularizing only exposure gain and explicitly preserving edges.
+        # Run with --run-tag v4_detail for experiment/WandB name bike_v4_detail.
         scene_args+=(
-            --update_from 800 --update_until 6000 --update_interval 50
-            --success_threshold 0.6 --densify_grad_threshold 0.0001 --min_opacity 0.002
-            --max_anchors 60000 --max_new_anchors_per_update 384 --densify_level_caps 192,120,72
-            --anchor_prune_grace_iters 500
-            --illumination_smooth_reg 1e-4 --warmup_illumination_smooth_reg 2e-5 --illumination_smooth_kernel_size 5
-            --enhancement_smooth_reg 1e-4 --enhancement_reflectance_reg 0.02
-            --enhancement_degree_reg 0.08 --enhancement_degree_global_reg 0.02
+            --iterations 12000 --save_iterations 8000 10000 12000
+            --test_iterations 8000 10000 12000
+            --position_lr_max_steps 12000 --offset_lr_max_steps 12000
+            --mlp_opacity_lr_max_steps 12000 --mlp_cov_lr_max_steps 12000
+            --mlp_color_lr_max_steps 12000
+            --update_from 800 --update_until 8500 --update_interval 50
+            --success_threshold 0.75 --densify_grad_threshold 0.00015 --min_opacity 0.002
+            --max_anchors 90000 --max_new_anchors_per_update 640 --densify_level_caps 320,200,120
+            --anchor_prune_grace_iters 1200 --prune_from_iter 4500
+            --warmup_start_stat 200 --warmup_update_from 600 --warmup_update_until 1900
+            --warmup_update_interval 100 --warmup_max_new_anchors 384
+            --warmup_level_caps 192,120,72 --warmup_densify_grad_threshold 0.00015
+            --warmup_success_threshold 0.7
+            --illumination_smooth_reg 1e-4 --warmup_illumination_smooth_reg 5e-5
+            --illumination_smooth_kernel_size 5 --warmup_illumination_smooth_kernel_size 9
+            --enhancement_diff_start_iter 3500
+            --enhancement_smooth_reg 0 --enhancement_gain_smooth_reg 5e-5
+            --enhancement_edge_preserve_reg 0.02 --enhancement_guidance_final_weight 0.15
+            --enhancement_reflectance_reg 0
+            --enhancement_degree_reg 0.12 --enhancement_degree_global_reg 0.02
             --enhancement_color_reg 0.03 --enhancement_color_std_reg 0.01 --enhancement_green_bias_reg 0.03
         )
     fi
@@ -109,7 +121,9 @@ run_scene() {
         return 1
     fi
     if [[ -e "$model_path" ]]; then
-        if [[ "$SKIP_EXISTING" == true && -f "${model_path}/point_cloud/iteration_8000/point_cloud.ply" ]]; then
+        local completion_iteration="8000"
+        [[ "$scene" == "bike" ]] && completion_iteration="12000"
+        if [[ "$SKIP_EXISTING" == true && -f "${model_path}/point_cloud/iteration_${completion_iteration}/point_cloud.ply" ]]; then
             echo "Skipping completed experiment: ${experiment_name}"
             return 0
         fi
