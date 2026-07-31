@@ -2252,7 +2252,7 @@ class GaussianModel:
             growth_stats["selected_grad_min"] = selected_grad_min
         return growth_stats
 
-    def adjust_anchor(self, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005, mode="train", phi=0.5, max_anchors=60_000, max_new_anchors=512, level_caps=(256, 160, 96), current_iteration=0, prune_grace_iters=500, prune_from_iter=0, max_pruned_anchors=0, allow_prune=True):
+    def adjust_anchor(self, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005, mode="train", phi=0.5, max_anchors=60_000, max_new_anchors=512, level_caps=(256, 160, 96), current_iteration=0, prune_grace_iters=500, prune_from_iter=0, max_pruned_anchors=0, prune_never_visible=False, allow_prune=True):
         anchors_before = self.get_anchor.shape[0]
         if mode =="warmup":
             old_anchor_num = self.anchor_demon.shape[0]
@@ -2342,10 +2342,13 @@ class GaussianModel:
         low_opacity_mask = torch.logical_and(low_opacity_mask, anchors_mask) # [N]
 
         anchor_age = current_iteration - self.anchor_birth_iteration
-        never_visible_mask = torch.logical_and(
-            anchor_age >= prune_grace_iters,
-            self.anchor_visible_count.squeeze(dim=1) == 0,
-        )
+        if prune_never_visible:
+            never_visible_mask = torch.logical_and(
+                anchor_age >= prune_grace_iters,
+                self.anchor_visible_count.squeeze(dim=1) == 0,
+            )
+        else:
+            never_visible_mask = torch.zeros_like(low_opacity_mask)
         # Attribute every removed anchor to one exclusive cause so that the
         # two counters sum to the total prune count.
         never_visible_only_mask = torch.logical_and(never_visible_mask, ~low_opacity_mask)

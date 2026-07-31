@@ -151,6 +151,9 @@ class ModelParams(ParamGroup):
         self.b0_spatial_smooth_reg = 0.0
         self.prune_ratio = 0.05
         self.beta = 1.0
+        # Indoor captures should not receive synthetic far-field points.
+        # Outdoor experiments can opt in explicitly.
+        self.num_sky_gaussians = 0
         
         
         super().__init__(parser, "Loading Parameters", sentinel)
@@ -258,6 +261,9 @@ class OptimizationParams(ParamGroup):
         self.anchor_prune_grace_iters = 500
         self.prune_from_iter = 0
         self.max_pruned_anchors_per_update = 0
+        # Never-visible pruning is unsafe before every sparse camera has had
+        # a chance to observe the geometry, so make it explicitly opt-in.
+        self.prune_never_visible = False
         self.enhancement_grad_clip = 0.0
         self.enhancement_from = 10_000
         self.residual_start_iter = 3_000
@@ -359,6 +365,7 @@ def _backfill_model_compatibility(merged_dict):
         "anchor_prune_grace_iters": 500,
         "prune_from_iter": 0,
         "max_pruned_anchors_per_update": 0,
+        "prune_never_visible": False,
         "enhancement_grad_clip": 0.0,
         "warmup_start_stat": 200,
         "warmup_update_from": 1_200,
@@ -368,6 +375,7 @@ def _backfill_model_compatibility(merged_dict):
         "warmup_level_caps": "64,40,24",
         "warmup_densify_grad_threshold": 0.00025,
         "warmup_success_threshold": 0.8,
+        "num_sky_gaussians": 0,
     }
     for key, value in defaults.items():
         merged_dict.setdefault(key, value)

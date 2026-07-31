@@ -12,7 +12,6 @@ import os
 from os import makedirs
 import sys
 import importlib.util
-import torch
 import glob
 
 import numpy as np
@@ -24,11 +23,25 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-cmd = 'nvidia-smi -q -d Memory |grep -A4 GPU|grep Used'
-result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).stdout.decode().split('\n')
-os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in result[:-1]]))
+def _configure_visible_gpu():
+    """Keep an externally selected GPU; otherwise choose the least-used one."""
+    if os.environ.get("CUDA_VISIBLE_DEVICES"):
+        return
+    try:
+        cmd = "nvidia-smi -q -d Memory |grep -A4 GPU|grep Used"
+        result = subprocess.run(
+            cmd, shell=True, stdout=subprocess.PIPE, check=False
+        ).stdout.decode().split("\n")
+        used_memory = [int(line.split()[2]) for line in result if line.split()]
+        if used_memory:
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(np.argmin(used_memory))
+    except (OSError, ValueError, IndexError):
+        pass
 
-os.system('echo $CUDA_VISIBLE_DEVICES')
+
+_configure_visible_gpu()
+
+import torch
 
 import imageio.v2 as imageio
 import cv2

@@ -19,11 +19,41 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-cmd = 'nvidia-smi -q -d Memory |grep -A4 GPU|grep Used'
-result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).stdout.decode().split('\n')
-os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in result[:-1]]))
+def _configure_visible_gpu():
+    """Honor an explicit GPU selection before importing PyTorch.
 
-os.system('echo $CUDA_VISIBLE_DEVICES')
+    ``CUDA_VISIBLE_DEVICES`` must be set before PyTorch initializes CUDA.
+    Falling back to the least-used GPU is retained only when neither the
+    command line nor the environment specifies a device.
+    """
+    requested_gpu = None
+    for index, argument in enumerate(sys.argv):
+        if argument == "--gpu" and index + 1 < len(sys.argv):
+            requested_gpu = sys.argv[index + 1]
+            break
+        if argument.startswith("--gpu="):
+            requested_gpu = argument.split("=", 1)[1]
+            break
+
+    if requested_gpu not in (None, "", "-1"):
+        os.environ["CUDA_VISIBLE_DEVICES"] = requested_gpu
+        return
+    if os.environ.get("CUDA_VISIBLE_DEVICES"):
+        return
+
+    try:
+        cmd = "nvidia-smi -q -d Memory |grep -A4 GPU|grep Used"
+        result = subprocess.run(
+            cmd, shell=True, stdout=subprocess.PIPE, check=False
+        ).stdout.decode().split("\n")
+        used_memory = [int(line.split()[2]) for line in result if line.split()]
+        if used_memory:
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(np.argmin(used_memory))
+    except (OSError, ValueError, IndexError):
+        pass
+
+
+_configure_visible_gpu()
 
 
 import torch
@@ -1534,6 +1564,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                             prune_grace_iters=opt.anchor_prune_grace_iters,
                             prune_from_iter=opt.prune_from_iter,
                             max_pruned_anchors=opt.max_pruned_anchors_per_update,
+                            prune_never_visible=opt.prune_never_visible,
                         )
                         log_densification("main", iteration, densification_stats)
                         gaussians.compute_3D_filter(cameras=trainCameras)
