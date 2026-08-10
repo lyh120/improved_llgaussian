@@ -1,0 +1,1 @@
+experiment_id,scene,method,role,PSNR,SSIM,LPIPS,render_core_fps,loop_wall_fps,anchor_count,peak_memory_gb,metric_source,timing_source,anchor_source

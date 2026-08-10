@@ -151,8 +151,13 @@ class Config:
         self.f = f
 
 def get_SRModel():
-	gin.parse_config_file('./configs/config.gin')
+	project_root = Path(__file__).resolve().parents[1]
+	gin.parse_config_file(str(project_root / 'configs' / 'config.gin'))
 	opt = Config()
+
+	def resolve_project_path(path_value):
+		path = Path(path_value)
+		return str(path if path.is_absolute() else project_root / path)
 
 	seed_everything(opt.seed)
 
@@ -165,15 +170,17 @@ def get_SRModel():
 		print('No color correction')
 	print('>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>')
 
-	config = OmegaConf.load(f"{opt.config}")
-	model = load_model_from_config(config, f"{opt.ckpt}")
+	config = OmegaConf.load(resolve_project_path(opt.config))
+	model = load_model_from_config(config, resolve_project_path(opt.ckpt))
 	device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 	model = model.to(device)
 
 	model.configs = config
 
-	vqgan_config = OmegaConf.load("./StableSR/configs/autoencoder/autoencoder_kl_64x64x4_resi.yaml")
-	vq_model = load_model_from_config(vqgan_config, opt.vqgan_ckpt)
+	vqgan_config = OmegaConf.load(
+		str(project_root / 'submodules' / 'StableSR' / 'configs' / 'autoencoder' / 'autoencoder_kl_64x64x4_resi.yaml')
+	)
+	vq_model = load_model_from_config(vqgan_config, resolve_project_path(opt.vqgan_ckpt))
 	vq_model = vq_model.to(device)
 	vq_model.decoder.fusion_w = opt.dec_w
 
