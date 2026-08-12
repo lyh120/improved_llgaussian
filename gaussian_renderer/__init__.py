@@ -18,6 +18,7 @@ from diff_gaussian_rasterization_residual import GaussianRasterizationSettings_R
 from diff_gaussian_rasterization_fast import GaussianRasterizationSettings_Fast, GaussianRasterizer_Fast
 from scene.gaussian_model import GaussianModel
 from utils.pose_utils import get_camera_from_tensor, quadmultiply
+from utils.scaling_utils import clamp_needle_scales
 from utils.sg_utils import evaluate_anisotropic_spherical_gaussians, evaluate_spherical_gaussians
 
 
@@ -135,7 +136,8 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     if pc.use_3D_filter:
         neural_opacity = pc.get_opacity_with_3D_filter(neural_opacity, visible_mask)
         grid_scaling = pc.get_scaling_with_3D_filter(grid_scaling, visible_mask)
-    mask = (neural_opacity>0.0)
+    opacity_threshold = pc.render_min_opacity if not is_training else 0.0
+    mask = neural_opacity > opacity_threshold
     mask = mask.view(-1)
 
     # select opacity 
@@ -203,15 +205,20 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
     
 
     # get offset's cov
+    cov_input = cat_local_view if pc.add_cov_dist else cat_local_view_wodist
+    if pc.geometry_frozen:
+        cov_input = cov_input.detach()
     if pc.add_cov_dist:
-        scale_rot = pc.get_cov_mlp(cat_local_view)
+        scale_rot = pc.get_cov_mlp(cov_input)
         if pc.use_residual:
-            scale_rot_residual = pc.get_cov_residual_mlp(cat_local_view_residual)
+            residual_cov_input = cat_local_view_residual.detach() if pc.geometry_frozen else cat_local_view_residual
+            scale_rot_residual = pc.get_cov_residual_mlp(residual_cov_input)
             scale_rot_residual = scale_rot_residual.reshape([anchor.shape[0]*pc.n_offsets_residual, 7]) # [mask]
     else:
-        scale_rot = pc.get_cov_mlp(cat_local_view_wodist)
+        scale_rot = pc.get_cov_mlp(cov_input)
         if pc.use_residual:
-            scale_rot_residual = pc.get_cov_residual_mlp(cat_local_view_wodist_residual)
+            residual_cov_input = cat_local_view_wodist_residual.detach() if pc.geometry_frozen else cat_local_view_wodist_residual
+            scale_rot_residual = pc.get_cov_residual_mlp(residual_cov_input)
             scale_rot_residual = scale_rot_residual.reshape([anchor.shape[0]*pc.n_offsets_residual, 7]) # [mask]
     scale_rot = scale_rot.reshape([anchor.shape[0]*pc.n_offsets, 7]) # [mask]
     
@@ -261,6 +268,13 @@ def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask
         color_artifact = None
     # post-process cov
     scaling = scaling_repeat[:,3:] * torch.sigmoid(scale_rot[:,:3]) # * (1+torch.sigmoid(repeat_dist))
+    if pc.clamp_needle_render and not is_training:
+        scaling = clamp_needle_scales(
+            scaling,
+            pc.needle_ratio_threshold,
+            pc.oblate_ratio_threshold,
+            pc.render_scale_max,
+        )
     rot = pc.rotation_activation(scale_rot[:,3:7])
 
     # post-process offsets to get centers for gaussians
@@ -301,7 +315,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     
     Background tensor (bg_color) must be on GPU!
     """
-    is_training = pc.get_illumination_mlp.training
+    # Geometry/covariance is always active in every illumination mode, whereas
+    # the legacy illumination MLP stays in train mode for ASG checkpoints.
+    # Use the covariance module as the authoritative train/eval state so
+    # inference-only safeguards are also applied in ASG mode.
+    is_training = pc.get_cov_mlp.training
     # is_enhancing = pc.render_enhancement
     profile_start = _profile_sync_time() if profile_timings is not None else None
     if is_training:
@@ -603,6 +621,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                     "viewspace_points": screenspace_points,
                     "visibility_filter" : radii > 0,
                     "radii": radii,
+                    "scaling": scaling,
+                    "opacity": opacity,
                     "sg_stats": sg_stats,
                     "illumination_stats": sg_stats,
                     }
@@ -735,6 +755,8 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 "viewspace_points": screenspace_points,
                 "visibility_filter" : radii > 0,
                 "radii": radii,
+                "scaling": scaling,
+                "opacity": opacity,
                 "sg_stats": sg_stats,
                 "illumination_stats": sg_stats,
                 }
@@ -782,7 +804,8 @@ def generate_neural_gaussians_fast(viewpoint_camera, pc : GaussianModel, visible
     if pc.use_3D_filter:
         neural_opacity = pc.get_opacity_with_3D_filter(neural_opacity, visible_mask)
         grid_scaling = pc.get_scaling_with_3D_filter(grid_scaling, visible_mask)
-    mask = (neural_opacity>0.0)
+    opacity_threshold = pc.render_min_opacity if not is_training else 0.0
+    mask = neural_opacity > opacity_threshold
     mask = mask.view(-1)
 
     # select opacity 
@@ -823,7 +846,8 @@ def generate_neural_gaussians_fast(viewpoint_camera, pc : GaussianModel, visible
     
 
 
-    scale_rot = pc.get_cov_mlp(cat_local_view_wodist)
+    cov_input = cat_local_view_wodist.detach() if pc.geometry_frozen else cat_local_view_wodist
+    scale_rot = pc.get_cov_mlp(cov_input)
     scale_rot = scale_rot.reshape([anchor.shape[0]*pc.n_offsets, 7]) # [mask]
     
     # offsets
@@ -842,6 +866,13 @@ def generate_neural_gaussians_fast(viewpoint_camera, pc : GaussianModel, visible
     
     # post-process cov
     scaling = scaling_repeat[:,3:] * torch.sigmoid(scale_rot[:,:3]) # * (1+torch.sigmoid(repeat_dist))
+    if pc.clamp_needle_render and not is_training:
+        scaling = clamp_needle_scales(
+            scaling,
+            pc.needle_ratio_threshold,
+            pc.oblate_ratio_threshold,
+            pc.render_scale_max,
+        )
     rot = pc.rotation_activation(scale_rot[:,3:7])
 
     # post-process offsets to get centers for gaussians

@@ -11,6 +11,7 @@
 
 import torch
 import torch.nn.functional as F
+import math
 from functools import reduce
 import numpy as np
 from torch_scatter import scatter_max, scatter_mean
@@ -94,6 +95,11 @@ class GaussianModel:
                  sg_lambda_min: float = 1.0,
                  asg_lobes: int = 1,
                  asg_lambda_min: float = 1.0,
+                 clamp_needle_render: bool = False,
+                 needle_ratio_threshold: float = 5.0,
+                 oblate_ratio_threshold: float = 20.0,
+                 render_scale_max: float = 0.0,
+                 render_min_opacity: float = 0.0,
                  ):
 
         self.feat_dim = feat_dim
@@ -124,6 +130,12 @@ class GaussianModel:
         self.sg_lambda_min = sg_lambda_min
         self.asg_lobes = asg_lobes
         self.asg_lambda_min = asg_lambda_min
+        self.clamp_needle_render = clamp_needle_render
+        self.needle_ratio_threshold = needle_ratio_threshold
+        self.oblate_ratio_threshold = oblate_ratio_threshold
+        self.render_scale_max = max(0.0, float(render_scale_max))
+        self.render_min_opacity = max(0.0, float(render_min_opacity))
+        self.geometry_frozen = False
         self.sg_illumination_available = use_sg_illumination
         self.asg_illumination_available = use_asg_illumination
         self.legacy_compatibility_mode = illumination_mode == "legacy"
@@ -446,6 +458,19 @@ class GaussianModel:
             self.mlp_feature_bank.train()
 
     def capture(self):
+        # ``self.denom`` belonged to an older densification implementation and
+        # is not created by the current anchor/offset statistics path.  Keep a
+        # shape-compatible value in the legacy checkpoint slot so checkpoint
+        # saving remains backward compatible.
+        checkpoint_denom = getattr(self, "denom", None)
+        if checkpoint_denom is None:
+            checkpoint_denom = getattr(self, "anchor_demon", None)
+        if checkpoint_denom is None or checkpoint_denom.numel() == 0:
+            checkpoint_denom = torch.zeros(
+                (self._anchor.shape[0], 1),
+                dtype=self._anchor.dtype,
+                device=self._anchor.device,
+            )
         if self.use_residual:
             return (
                 self._anchor,
@@ -472,7 +497,7 @@ class GaussianModel:
                 self._rotation,
                 self._opacity,
                 self.max_radii2D,
-                self.denom, 
+                checkpoint_denom,
                 self.optimizer.state_dict(),
                 self.spatial_lr_scale,
             )
@@ -499,7 +524,7 @@ class GaussianModel:
                 self._rotation,
                 self._opacity,
                 self.max_radii2D,
-                self.denom, 
+                checkpoint_denom,
                 self.optimizer.state_dict(),
                 self.spatial_lr_scale,
             )
@@ -1068,7 +1093,7 @@ class GaussianModel:
             b0[~valid] = global_mean_b0
         return b0
 
-    def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float, num_sky_gaussians=0, cameras=None, prune_ratio : float = 0.05,model_path=None, beta=1):
+    def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float, num_sky_gaussians=0, cameras=None, prune_ratio : float = 0.05,model_path=None, beta=1, skybox_scale_max_factor: float = 0.0):
         self.spatial_lr_scale = spatial_lr_scale
         points = pcd.points # 
         os.makedirs( os.path.join(model_path, 'dust3r'), exist_ok=True)
@@ -1167,12 +1192,14 @@ class GaussianModel:
 
         opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
         visualize_anchor(fused_point_cloud.detach().cpu().numpy(), os.path.join(model_path, 'anchor.png'))
+        skybox_count = 0
         if num_sky_gaussians:
             th_cameras = cameras
             skybox, self._sky_distance = get_sky_points(num_sky_gaussians, fused_point_cloud, th_cameras)
             skybox = skybox
             print(f"Adding skybox with {skybox.shape[0]} points")
             fused_point_cloud = torch.cat((fused_point_cloud, skybox), dim=0)
+            skybox_count = skybox.shape[0]
             opacities = torch.cat((opacities, inverse_sigmoid(torch.ones((skybox.shape[0], 1), dtype=torch.float, device="cuda"))), dim=0)
 
         offsets = torch.zeros((fused_point_cloud.shape[0], self.n_offsets, 3)).float().cuda() # use to caculate the position of 3d gaussians
@@ -1182,6 +1209,12 @@ class GaussianModel:
 
         dist2 = torch.clamp_min(distCUDA2(fused_point_cloud).float().cuda(), 0.0000001) # get the distance of the voxel center and prune the overlapping voxel
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 6) 
+        if skybox_count > 0 and skybox_scale_max_factor > 0:
+            max_sky_scale = max(float(self._sky_distance) * skybox_scale_max_factor, 1e-8)
+            scales[-skybox_count:] = torch.minimum(
+                scales[-skybox_count:],
+                torch.full_like(scales[-skybox_count:], math.log(max_sky_scale)),
+            )
         
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
@@ -1501,6 +1534,36 @@ class GaussianModel:
         for param_group in self.optimizer.param_groups:
             if param_group["name"] not in {"enhancement_sg_axis", "enhancement_sg_sharpness", "enhancement_sg_amplitude", "enhancement_context_feat", "enhancement_context_illum", "enhancement_context_bias", "illum_asg_axis", "illum_asg_tangent", "illum_asg_sharpness", "illum_asg_amplitude", "illum_asg_bias", "illum_asg_dist_weight", "base_log_reflectance", "reflectance_offset_delta", "mlp_reflectance_decoder"}:
                 param_group['lr'] = 0
+
+    def freeze_geometry(self):
+        """Freeze geometry and covariance after the geometry-first stage."""
+        if self.geometry_frozen:
+            return
+        for tensor in (self._anchor, self._offset, self._anchor_feat, self._scaling, self._rotation, self.P):
+            tensor.requires_grad_(False)
+        for parameter in self.mlp_cov.parameters():
+            parameter.requires_grad_(False)
+        for parameter in self.mlp_opacity.parameters():
+            parameter.requires_grad_(False)
+        geometry_groups = {
+            "anchor", "offset", "anchor_feat", "scaling", "rotation", "pose",
+            "mlp_cov", "mlp_opacity",
+        }
+        if self.use_residual:
+            for tensor in (self._anchor_feat_residual, self._offset_residual, self._scaling_residual):
+                tensor.requires_grad_(False)
+            for parameter in self.mlp_cov_residual.parameters():
+                parameter.requires_grad_(False)
+            for parameter in self.mlp_opacity_residual.parameters():
+                parameter.requires_grad_(False)
+            geometry_groups.update({
+                "anchor_feat_residual", "offset_residual", "scaling_residual",
+                "mlp_cov_residual", "mlp_opacity_residual",
+            })
+        for param_group in self.optimizer.param_groups:
+            if param_group["name"] in geometry_groups:
+                param_group["lr"] = 0.0
+        self.geometry_frozen = True
 
                 
 

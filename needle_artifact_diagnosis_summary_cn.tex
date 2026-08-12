@@ -1,0 +1,526 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{ctex}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{xcolor}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  citecolor=blue
+}
+
+\title{LL-Gaussian 针状伪影诊断、尝试记录与后续修复建议}
+\author{Codex 对话实验整理}
+\date{2026 年 8 月 12 日}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+本文整理本轮围绕 LL-Gaussian / Scaffold-GS 类低光照重建项目中
+needle-like / elongated Gaussian artifacts 的诊断过程、代码改动、实验现象与后续可行方案。
+核心结论是：最初 still3 场景中的放射状针线主要来自几何 Gaussian 的协方差/尺度退化，
+而非单纯 ASG 色彩伪影或 WandB 显示问题；后续 still2 场景暴露出更复杂的问题，即不仅有
+``一长两短'' 的 prolate needle，还有大量 ``两长一极短'' 的 oblate disk、超大屏幕半径、
+漂浮点、空洞以及增强先验污染。本文将已被实验数据支持的判断和仍需进一步验证的假设分开记录，
+供后续人工排查与重构参考。
+\end{abstract}
+
+\section{问题现象}
+
+用户最初提供的 still3 渲染图中出现大量细长放射线和三角状/针状痕迹，尤其在背景、桌面和平滑区域明显。
+这些伪影同时出现在训练视角的 \texttt{image\_enhanced} 与 \texttt{reflectance} 中。
+由于 reflectance 与 enhanced 图像共用同一组 Gaussian 的位置、opacity、scale 和 rotation，
+因此该现象不能只解释为 ASG 光照颜色异常、StableSR/CIDNet 色彩偏差，或 WandB 未 clamp 导致的显示问题。
+
+后续 still2 场景中，即使 prolate needle 指标已经明显降低，增强结果仍出现：
+\begin{itemize}[leftmargin=1.5em]
+  \item 暗背景中的细线、点串与漂浮物；
+  \item 大块模糊、空洞、桌面和背景被异常 Gaussian 覆盖；
+  \item 个别视角中超大半径 splat，形成局部雾状斑块；
+  \item CIDNet/增强分支打开后图像整体观感比低光重建指标更差。
+\end{itemize}
+
+这说明本问题至少包含两个层次：
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{协方差形状退化}：Gaussian 的三轴尺度比例异常，形成 needle 或极薄 disk。
+  \item \textbf{几何与外观联合优化失稳}：densification、增强先验、reflectance 锐化损失与 skybox/背景点共同放大错误 Gaussian。
+\end{enumerate}
+
+\section{项目中的高风险设计点}
+
+\subsection{体积正则无法约束形状退化}
+
+原训练中主要使用类似 \(\prod_i s_i\) 的体积约束。设排序后的三轴尺度为
+\[
+  s_1 \le s_2 \le s_3 .
+\]
+体积项只约束 \(s_1s_2s_3\)，无法阻止以下两类退化：
+\[
+  \text{prolate needle: } s_3 \gg s_2 \approx s_1,
+\]
+\[
+  \text{oblate disk: } s_3 \approx s_2 \gg s_1 .
+\]
+更糟的是，模型可以通过压缩一个或两个轴来降低体积损失，同时保留很长的主轴或很大的屏幕投影。
+因此体积正则不是形状正则。
+
+\subsection{协方差参数化允许独立轴收缩}
+
+渲染器中的有效尺度来自
+\[
+  \texttt{anchor\_scale} \times \sigma(\texttt{mlp\_cov}(\cdot)).
+\]
+三个轴由网络独立预测，缺少显式长宽比约束时很容易产生极端比例。
+如果 \texttt{mlp\_cov} 输入包含 view direction，那么协方差还会随视角变化；
+在相机数量有限的场景中，这会增加未充分覆盖方向上的外推风险。
+
+\subsection{3D filter 只在开关为真时生效}
+
+早期日志中虽然出现了 \texttt{compute\_3D\_filter()}，但渲染路径只有在
+\texttt{--use\_3D\_filter} 开启时才真正应用。未开启时，子像素/过小尺度 Gaussian 更容易形成 aliasing 与尖细投影。
+
+\subsection{动态 densification 与 prune 指标不足}
+
+anchor 从数千快速增长到数万甚至二十多万可见点时，若 prune 主要基于 opacity，
+则不会主动剔除：
+\begin{itemize}[leftmargin=1.5em]
+  \item 长宽比异常的 Gaussian；
+  \item 屏幕半径极端离群的 Gaussian；
+  \item 背景/空域中的漂浮点；
+  \item 只在少数视角中产生巨大投影的错误点。
+\end{itemize}
+这些点一旦进入 growing/prune 循环，可能被复制、保留并持续影响后续增强分支。
+
+\subsection{反射率锐化损失可能奖励伪结构}
+
+reflectance edge uplift、contrast、high-frequency 等损失本意是补足边缘，
+但如果只惩罚 ``GT 有边而 R 不够强''，不惩罚 ``GT 无边而 R 额外产生细线''，
+那么在几何已经退化时，这些损失可能放大针线和点状伪结构。
+
+\subsection{增强先验与几何 densification 重叠}
+
+StableSR/CIDNet 等增强先验若在 densification 仍活跃时介入，
+增强损失仍可经 rasterizer 回传到 geometry/covariance/opacity。
+这使增强目标有机会通过改变 Gaussian 形状来解释伪 GT，而不是只学习外观映射。
+在 still3 中，StableSR 起点与 densification 区间重叠，是放大因素；
+在 still2 中，CIDNet 分支打开后观感进一步恶化，也提示增强先验不能过早或过强参与几何阶段。
+
+\subsection{skybox 是背景放射线的潜在来源}
+
+skybox 点位通常距离较远，若尺度初始化过大、各向异性不受限，或参与普通 anchor growing，
+就可能在背景中形成大半径放射线和漂浮雾斑。一次失败实验还发现 skybox 生成曾只使用 test cameras，
+对 still2 这种视角覆盖有限的场景尤其危险。虽然该 bug 已修正为 train+test cameras，
+但当前 skybox 仍不宜作为首选修复手段，除非单独隔离其尺度、opacity、growing 和 prune 逻辑。
+
+\section{已做过的代码改动}
+
+本轮主要改动围绕诊断、正则、安全阀和训练阶段隔离。
+
+\subsection{尺度诊断}
+
+新增了 \texttt{utils/scaling\_utils.py}，对实际送入 rasterizer 的 \texttt{scaling} 统计：
+\[
+  r_{\text{needle}} = \frac{s_3}{s_2}, \qquad
+  r_{\text{oblate}} = \frac{s_2}{s_1}, \qquad
+  r_{\text{cond}} = \frac{s_3}{s_1}.
+\]
+同时记录：
+\begin{itemize}[leftmargin=1.5em]
+  \item \texttt{needle\_ratio\_p95/p99/max} 与 \texttt{gt5/gt10/gt20}；
+  \item \texttt{oblate\_ratio\_p95/p99/max} 与 \texttt{gt10/gt20/gt50}；
+  \item \texttt{condition\_ratio\_p95/p99/max}；
+  \item \texttt{scale\_max\_p99/max}、\texttt{scale\_mid\_p99}、\texttt{scale\_min\_p01}；
+  \item \texttt{radii\_p99/max} 与 \texttt{radii\_gt64/gt128/gt256}。
+\end{itemize}
+
+\subsection{prolate 与 oblate 正则}
+
+prolate needle loss：
+\[
+  \mathcal{L}_{\text{needle}}
+  =
+  \mathbb{E}
+  \left[
+    \max\left(
+      \log \frac{s_3}{s_2} - \log \tau_{\text{needle}},
+      0
+    \right)^2
+  \right].
+\]
+
+oblate disk loss：
+\[
+  \mathcal{L}_{\text{oblate}}
+  =
+  \mathbb{E}
+  \left[
+    \max\left(
+      \log \frac{s_2}{s_1} - \log \tau_{\text{oblate}},
+      0
+    \right)^2
+  \right].
+\]
+
+新增参数包括：
+\begin{itemize}[leftmargin=1.5em]
+  \item \texttt{--needle\_ratio\_threshold}；
+  \item \texttt{--needle\_reg}；
+  \item \texttt{--oblate\_ratio\_threshold}；
+  \item \texttt{--oblate\_reg}。
+\end{itemize}
+
+\subsection{推理安全阀}
+
+新增 \texttt{--clamp\_needle\_render}，可在推理时限制：
+\[
+  s_3 \le \tau_{\text{needle}} s_2,
+  \qquad
+  s_1 \ge \frac{s_2}{\tau_{\text{oblate}}},
+  \qquad
+  s_i \le s_{\max}.
+\]
+其中 \(s_{\max}\) 对应 \texttt{--render\_scale\_max}。
+该安全阀适合用于旧 checkpoint 诊断和导出，不应被当作长期替代训练正则的根本修复。
+
+\subsection{阶段隔离与恢复训练}
+
+新增 \texttt{--geometry\_freeze\_iter} 与 \texttt{--appearance\_start\_iter}，
+用于在某一迭代后冻结 anchor、offset、scaling、rotation、pose、covariance MLP 等几何相关参数，
+并延迟增强/外观损失介入。
+
+新增 \texttt{--resume\_iteration}，用于从指定迭代恢复完整模型路径，包括 PLY 与 MLP 权重。
+该方案比旧 \texttt{--start\_checkpoint} 更适合两阶段训练，因为后者保存内容并不覆盖所有模块权重。
+
+\subsection{额外修复}
+
+本轮还修复或定位了若干工程问题：
+\begin{itemize}[leftmargin=1.5em]
+  \item 冻结几何时不应调用 \texttt{mlp\_cov.eval()}，否则 renderer 依据 module training 状态返回不同字段，导致 \texttt{selection\_mask} 缺失。
+  \item \texttt{GaussianModel.capture()} 中旧字段 \texttt{denom} 不存在，已回退到 \texttt{anchor\_demon} 或零张量。
+  \item resume 后 logging 条件不一致导致未定义变量，已将图像日志条件统一。
+  \item 推理 clamp 最初存在 in-place 修改导致 autograd version error，已改为非 in-place scatter。
+  \item skybox 生成相机从仅 test cameras 修为 train+test cameras，但 skybox 整体策略仍需谨慎。
+\end{itemize}
+
+\section{关键实验记录}
+
+\subsection{still3：prolate needle 被明确确认}
+
+旧 8k checkpoint 的诊断结果如下。数值来自用户在远程主机导出的 \texttt{scaling\_stats.json}。
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrrrr}
+\toprule
+模式 & needle p99 & needle max & gt5 & gt10 & radii p99 & radii max \\
+\midrule
+baseline & 17.74 & 9661.51 & 6.96\% & 2.32\% & 51.16 & 929 \\
+filter only & 12.58 & 1531.61 & 4.24\% & 1.40\% & 51.11 & 929 \\
+filter + clamp5 fixed & 5.00 & 5.00 & 0.088\% & 0.00\% & 34.58 & 929 \\
+\bottomrule
+\end{tabular}
+\caption{still3 旧 checkpoint 的 prolate needle 诊断。}
+\end{table}
+
+解释：
+\begin{itemize}[leftmargin=1.5em]
+  \item \texttt{--use\_3D\_filter} 能缓解但不能根治；
+  \item 修正后的 clamp 能把 needle ratio 压到阈值附近，并明显降低 radii p99；
+  \item radii max 仍然很高，说明仍存在少量绝对尺度或位置离群点；
+  \item 该实验直接支持 ``尺度长宽比是 still3 针线主因''。
+\end{itemize}
+
+\subsection{still3：干净重训后几何明显稳定}
+
+加入 3D filter、降低 covariance/scale 学习率、延迟/冻结几何和 needle regularization 后，
+still3 的统计明显改善：
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrrrr}
+\toprule
+迭代 & needle p99 & needle max & gt5 & gt10 & radii p99 & radii max \\
+\midrule
+4000 & 3.87 & 20.13 & 0.421\% & 0.0127\% & 33.00 & 385 \\
+6000 & 4.13 & 24.83 & 0.523\% & 0.0230\% & 36.21 & 385 \\
+8000 & 4.12 & 24.83 & 0.509\% & 0.0302\% & 36.63 & 386 \\
+\bottomrule
+\end{tabular}
+\caption{still3 重训后 needle 指标。}
+\end{table}
+
+这轮说明 prolate needle 的修复方向是有效的：
+3D filter、几何学习率下调、needle loss、延迟增强和几何冻结组合后，
+训练视角中的放射状针线可显著缓解。
+
+\subsection{still2：prolate 指标正常但图像仍坏}
+
+still2 v2 实验中，prolate needle 指标看似已经不错：
+\[
+  \text{needle p99} \approx 3.24, \qquad
+  \text{needle max} \approx 11.17 .
+\]
+但增强图仍一塌糊涂。新增 oblate/condition 诊断后发现真正异常在这里：
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrrrr}
+\toprule
+迭代 & oblate p99 & oblate max & oblate gt20 & cond p99 & scale min p01 & radii max \\
+\midrule
+4000 & 14668 & 1339387 & 30.24\% & 14775 & \(8.14\times10^{-7}\) & 8779 \\
+5000 & 33528 & 1451810 & 33.94\% & 34024 & \(3.56\times10^{-7}\) & 5626 \\
+8000 & 33528 & 1451810 & 33.94\% & 34024 & \(3.56\times10^{-7}\) & 5626 \\
+\bottomrule
+\end{tabular}
+\caption{still2 v2 中被 prolate needle 指标漏掉的 oblate/condition 退化。}
+\end{table}
+
+结论：
+\begin{itemize}[leftmargin=1.5em]
+  \item still2 的主要退化不是 ``一长两短''，而是大量 ``两长一极短'' 的薄片 Gaussian；
+  \item 最短轴接近 \(10^{-7}\) 量级，condition number 达数万甚至百万；
+  \item 这类 disk 在某些视角中仍可产生巨大屏幕投影、漂浮斑和空洞边缘；
+  \item 只看 \(\frac{s_3}{s_2}\) 会误判为几何已经稳定。
+\end{itemize}
+
+\subsection{still2：旧 checkpoint clamp 只能部分缓解}
+
+对 still2 v2 checkpoint 做推理 clamp：
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lrrrrrr}
+\toprule
+模式 & needle p99 & oblate p99 & cond p99 & scale max p99 & radii p99 & radii max \\
+\midrule
+baseline & 3.24 & 33528 & 34024 & 0.595 & 57.33 & 5626 \\
+shape50 & 3.24 & 50 & 97.87 & 0.587 & 57.01 & 5626 \\
+shape20 & 3.24 & 20 & 44.51 & 0.587 & 57.01 & 5626 \\
+shape20 + max0.5 & 3.10 & 20 & 43.77 & 0.500 & 47.88 & 1935 \\
+\bottomrule
+\end{tabular}
+\caption{still2 v2 推理 clamp 对 oblate 和 radii 的影响。}
+\end{table}
+
+解释：
+\begin{itemize}[leftmargin=1.5em]
+  \item 只修 oblate 比例不能显著降低 radii max；
+  \item 加绝对 scale cap 后 radii 指标才明显下降；
+  \item 说明 still2 同时存在形状退化与绝对尺度/位置离群；
+  \item 推理 clamp 只是证明方向，不足以修复已经坏掉的 geometry 和外观分解。
+\end{itemize}
+
+\subsection{still2：skybox 与增强阶段的失败教训}
+
+一次 v3 实验尝试加入 bounded skybox、oblate loss、geometry freeze 和 render clamp，
+但结果更差。日志显示：
+\begin{itemize}[leftmargin=1.5em]
+  \item skybox 实际只生成约 225 个点，且当时只使用 test cameras；
+  \item anchor 数量增长到约 15391；
+  \item lowlight train/test PSNR 从 v2 的约 35/32 下降到约 26/26；
+  \item radii p99 仍高，最终 test pose optimize 还触发过 clamp 的 in-place autograd 错误。
+\end{itemize}
+该实验应视为失败样本，而不是可延续路线。
+它提示：在当前实现中，skybox 不应直接加入普通 growing/prune 流程；如果要用，
+应为 skybox 设计独立标签、各向同性尺度、单独 opacity/prune 和禁止 growing。
+
+\section{当前判断}
+
+\subsection{已被较强证据支持的结论}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item still3 的原始放射状针线主要来自 Gaussian scale/covariance 退化。
+  \item 3D filter 是必要缓解项，但不是充分条件。
+  \item 单纯 volume regularization 不足以约束 Gaussian 形状。
+  \item prolate needle loss 对 still3 有效。
+  \item still2 不能只看 prolate needle，必须同时看 oblate ratio、condition ratio、scale max 和 radii。
+  \item opacity threshold 对漂浮物帮助有限；用户测试中阈值从 0 到 0.05，可见点数量下降很小，说明大量伪点并非低 opacity 垃圾点。
+  \item 过早打开增强先验容易污染 geometry 或让错误 Gaussian 获得外观解释。
+  \item 当前 skybox 机制是高风险项，尤其在小视角数量、背景大面积弱纹理场景中。
+\end{enumerate}
+
+\subsection{仍待验证的假设}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item still2 的空洞和漂浮物可能与相机/深度尺度、SfM 初始化点云稀疏或误匹配有关，需要检查 COLMAP 点云和相机覆盖。
+  \item CIDNet prior 的亮度/颜色目标可能与 LL-Gaussian 分解目标不一致，导致 enhanced 分支把背景和暗区推向错误解。
+  \item reflectance 细节损失可能在 GT 弱纹理区域奖励额外细线，需要显式 extra-edge penalty 和 mask。
+  \item covariance view dependence 可能在训练视角之外放大，但 still2 在训练视角也坏，因此它不是唯一原因。
+  \item 当前 ASG anisotropy regularization 只约束光照 lobe，不约束几何 Gaussian；调大它不能直接解决几何 needle/disk。
+\end{enumerate}
+
+\section{建议的后续解决方案}
+
+\subsection{第一优先级：拆开几何与增强}
+
+后续不要再一上来跑完整 8k enhanced 训练。建议流程：
+\begin{enumerate}[leftmargin=1.5em]
+  \item 只训练低光重建几何，不开 StableSR/CIDNet，不开 residual，不开 skybox。
+  \item 只看 \texttt{renders}、\texttt{reflectance}、\texttt{illumination} 和尺度诊断。
+  \item 接受条件不是 enhanced 图好看，而是：
+  \[
+    \text{needle p99} < 5,\quad
+    \text{oblate p99} < 20\text{--}50,\quad
+    \text{radii max 无极端离群}.
+  \]
+  \item 几何稳定后保存 checkpoint，并冻结 geometry。
+  \item 第二阶段只训练外观/增强分支，且严格禁止增强损失回传到 geometry/covariance。
+\end{enumerate}
+
+\subsection{第二优先级：加入完整形状约束}
+
+训练 loss 不应只包含 volume 和 needle。建议最少包含：
+\[
+  \mathcal{L}_{\text{shape}}
+  =
+  \lambda_n \mathcal{L}_{\text{needle}}
+  +
+  \lambda_o \mathcal{L}_{\text{oblate}}
+  +
+  \lambda_c \mathcal{L}_{\text{condition}} .
+\]
+其中 condition loss 可定义为：
+\[
+  \mathcal{L}_{\text{condition}}
+  =
+  \mathbb{E}
+  \left[
+    \max\left(
+      \log \frac{s_3}{s_1} - \log \tau_c,
+      0
+    \right)^2
+  \right].
+\]
+如果只加 oblate，而不约束绝对 scale/radii，仍可能留下超大屏幕投影。
+
+\subsection{第三优先级：用 radii 参与 prune 或正则}
+
+当前最需要补的是 ``屏幕空间离群 Gaussian'' 的处理。建议：
+\begin{itemize}[leftmargin=1.5em]
+  \item 训练中记录每个 anchor/offset 的最大可见 radii；
+  \item 对长期 \texttt{radii > 128} 或 \texttt{radii > 256} 且重建贡献不稳定的点加入 prune；
+  \item 对 radii 使用软惩罚，例如
+  \[
+    \mathcal{L}_{r}
+    =
+    \mathbb{E}
+    \left[
+      \max\left(\frac{r}{r_0}-1,0\right)^2
+    \right],
+  \]
+  但需注意 differentiability 与 rasterizer 返回的 radii 是否可反传；
+  \item 若 radii 不可反传，则先作为 prune/diagnostic 条件，而不是 loss。
+\end{itemize}
+
+\subsection{第四优先级：重写 prune/growing 标准}
+
+建议在 opacity 之外加入以下条件：
+\begin{itemize}[leftmargin=1.5em]
+  \item prolate ratio 过大；
+  \item oblate ratio 过大；
+  \item condition ratio 过大；
+  \item scale max 过大；
+  \item 多视角可见但 photometric error 贡献异常；
+  \item 位于明显空域/背景深度之外；
+  \item 只在少数视角可见却产生巨大 radii。
+\end{itemize}
+这样可以避免错误 Gaussian 被继续复制。
+
+\subsection{第五优先级：降低 covariance 自由度}
+
+若仍持续退化，可考虑结构性收紧协方差：
+\begin{itemize}[leftmargin=1.5em]
+  \item 去掉 covariance MLP 输入中的 view direction，至少在前几千步禁用；
+  \item 给最短轴加 floor，例如 \(s_1 \ge \alpha \cdot \texttt{voxel\_size}\)；
+  \item 限制 \(\log s_i\) 的输出范围，而不是只靠 sigmoid；
+  \item 对同一 anchor 的邻近视角预测加入 log-scale consistency。
+\end{itemize}
+
+\subsection{第六优先级：谨慎恢复增强和 reflectance 锐化}
+
+在几何稳定前，应关闭或极弱化：
+\begin{itemize}[leftmargin=1.5em]
+  \item \texttt{reflectance\_edge\_uplift\_reg}；
+  \item \texttt{reflectance\_contrast\_reg}；
+  \item \texttt{reflectance\_highfreq\_reg}；
+  \item StableSR/CIDNet enhancement diff；
+  \item residual 分支。
+\end{itemize}
+恢复时建议加入 extra-edge penalty：
+\[
+  \mathcal{L}_{\text{extra-edge}}
+  =
+  \mathbb{E}
+  \left[
+    \max\left(
+      |\nabla R| - \gamma |\nabla I_{\text{gt}}|,
+      0
+    \right)
+  \right],
+\]
+防止 smooth 区域中凭空长出细线。
+
+\subsection{第七优先级：skybox 单独建模}
+
+若确实需要 skybox，建议不要把它当普通 anchor：
+\begin{itemize}[leftmargin=1.5em]
+  \item skybox 点带独立 mask/tag；
+  \item 初始化为各向同性小尺度；
+  \item 不参与普通 anchor growing；
+  \item 使用独立 opacity 上限和 prune；
+  \item 单独统计 skybox radii、scale、opacity；
+  \item 先用 \texttt{skybox\_num\_points=0} 与少量 skybox 做对照。
+\end{itemize}
+
+\section{建议验证顺序}
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item 对已有坏 checkpoint 分别导出 baseline、shape clamp、shape+max scale clamp 的 \texttt{renders}、\texttt{reflectance} 和 \texttt{scaling\_stats.json}。
+  \item 确认问题发生在 lowlight render 还是只发生在 enhanced render。如果 lowlight 已坏，先不要调 CIDNet。
+  \item 对 still2 做无 skybox、无 residual、无 enhancement 的短程几何实验，并记录 1k/2k/3k/4k 的 shape/radii。
+  \item 若 2k 前 oblate 或 radii 已爆炸，优先改 covariance 参数化、scale floor 和 prune/growing。
+  \item 若低光几何稳定但 enhanced 仍坏，再排查 CIDNet target、颜色损失和 enhancement 分支梯度隔离。
+  \item 最后再尝试恢复 reflectance 锐化损失，并配套 extra-edge penalty。
+\end{enumerate}
+
+\section{失败经验总结}
+
+本轮最大的教训是：``针状伪影'' 这个名字过窄。
+still3 中它确实表现为 prolate needle；但 still2 中主要危险信号已经变成 oblate disk、condition number 和 radii 离群。
+如果只盯着 \(\frac{s_3}{s_2}\)，会错过 \(\frac{s_2}{s_1}\) 爆炸的问题。
+
+第二个教训是：增强图很差不等于增强分支一定是根因。
+增强图共用 geometry，当 geometry 已经包含漂浮薄片和超大 splat 时，CIDNet/StableSR 只会把这些错误更显眼地渲染出来。
+因此排查顺序必须是先低光几何，再反射率，再增强。
+
+第三个教训是：推理 clamp 能证明尺度退化存在，但不能修好训练中已经形成的错误拓扑。
+真正需要的是训练期间的形状约束、growing/prune 策略和阶段隔离。
+
+\section{结论}
+
+对于 still3，当前证据支持以下判断：
+\[
+  \text{主要根因} =
+  \text{Gaussian covariance/scale degeneration}
+  \quad
+  \text{而不是 ASG 色彩伪影。}
+\]
+对应修复方向是 3D filter、needle loss、几何学习率下调、延迟增强、几何冻结和必要的推理 clamp。
+
+对于 still2，当前证据支持以下判断：
+\[
+  \text{主要问题} =
+  \text{oblate disk + condition/radii outliers + appearance prior amplification}.
+\]
+后续应优先重构 shape/radii 约束和 prune/growing，而不是继续盲目调 CIDNet 或 ASG。
+只有在低光 geometry 和 reflectance 本身干净后，增强分支才有继续调参的意义。
+
+\end{document}

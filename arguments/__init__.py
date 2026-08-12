@@ -83,6 +83,14 @@ class ModelParams(ParamGroup):
         self.use_residual = False
         self.use_dual_transient = False
         self.use_3D_filter = False
+        self.clamp_needle_render = False
+        self.needle_ratio_threshold = 5.0
+        self.oblate_ratio_threshold = 20.0
+        self.render_scale_max = 0.0
+        self.render_min_opacity = 0.0
+        self.resume_iteration = -1
+        self.skybox_num_points = 1000
+        self.skybox_scale_max_factor = 0.0
         self.use_sg_illumination = True
         self.use_asg_illumination = True
         self.illumination_mode = "asg"
@@ -101,6 +109,7 @@ class ModelParams(ParamGroup):
         self.reflectance_edge_uplift_reg = 3e-3
         self.reflectance_contrast_reg = 2e-3
         self.reflectance_highfreq_reg = 3e-3
+        self.reflectance_extra_edge_reg = 0.0
         self.highlight_reflectance_reg = 1e-3
         self.residual_chroma_reg = 5e-4
         self.noise_residual_reg = 1.0
@@ -221,6 +230,10 @@ class OptimizationParams(ParamGroup):
         self.b0_lr = 0.001
         self.reflectance_offset_lr = 0.008
         self.reflectance_decoder_lr = 0.002
+        self.needle_reg = 0.1
+        self.oblate_reg = 0.001
+        self.geometry_freeze_iter = -1
+        self.appearance_start_iter = 0
         
         # for anchor densification
         self.start_stat = 500
@@ -253,6 +266,14 @@ def _backfill_model_compatibility(merged_dict):
         "use_asg_illumination": True,
         "illumination_mode": "asg",
         "use_dual_transient": False,
+        "clamp_needle_render": False,
+        "needle_ratio_threshold": 5.0,
+        "oblate_ratio_threshold": 20.0,
+        "render_scale_max": 0.0,
+        "render_min_opacity": 0.0,
+        "resume_iteration": -1,
+        "skybox_num_points": 1000,
+        "skybox_scale_max_factor": 0.0,
         "sg_lobes": 4,
         "sg_lambda_min": 1.0,
         "sg_energy_reg": 1e-4,
@@ -268,6 +289,7 @@ def _backfill_model_compatibility(merged_dict):
         "reflectance_edge_uplift_reg": 3e-3,
         "reflectance_contrast_reg": 2e-3,
         "reflectance_highfreq_reg": 3e-3,
+        "reflectance_extra_edge_reg": 0.0,
         "highlight_reflectance_reg": 1e-3,
         "residual_chroma_reg": 5e-4,
         "noise_residual_reg": 1.0,
@@ -303,6 +325,10 @@ def _backfill_model_compatibility(merged_dict):
         "b0_lr": 0.001,
         "reflectance_offset_lr": 0.008,
         "reflectance_decoder_lr": 0.002,
+        "needle_reg": 0.1,
+        "oblate_reg": 0.001,
+        "geometry_freeze_iter": -1,
+        "appearance_start_iter": 0,
         "residual_hardmask_percentile": 0.8,
         "residual_higherror_percentile": 0.8,
         "residual_highlight_percentile": 0.9,

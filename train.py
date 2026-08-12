@@ -45,7 +45,7 @@ sys.path.append("./submodules/Depth-Anything-V2")
 # from lpipsPyTorch import lpips
 import lpips
 from random import randint
-from utils.loss_utils import l1_loss, ssim, l1_plus_loss, L_Smooth, L_Illu, L_Gray, L_Green_Bias, L_Depth_similarity, L_Reflectance_Smooth, L_Depth_Smooth, pearson_depth_loss, L_Reflectance_Consistency, L_Reflectance_Edge, L_Reflectance_Edge_Uplift, L_Reflectance_Highlight, L_Reflectance_LocalContrast, L_Reflectance_HighFreq, L_Residual_Chroma_Boost, L_Noise_Zero_Mean, L_Noise_Dark_Weighted, L_Noise_HighFreq, L_SG_Energy, L_SG_Sharpness, L_ASG_Energy, L_ASG_Sharpness, L_ASG_Anisotropy, L_B0_Spatial_Smooth, build_dual_transient_masks
+from utils.loss_utils import l1_loss, ssim, l1_plus_loss, L_Smooth, L_Illu, L_Gray, L_Green_Bias, L_Depth_similarity, L_Reflectance_Smooth, L_Depth_Smooth, pearson_depth_loss, L_Reflectance_Consistency, L_Reflectance_Edge, L_Reflectance_Edge_Uplift, L_Reflectance_Highlight, L_Reflectance_LocalContrast, L_Reflectance_HighFreq, L_Reflectance_Extra_Edge, L_Residual_Chroma_Boost, L_Noise_Zero_Mean, L_Noise_Dark_Weighted, L_Noise_HighFreq, L_SG_Energy, L_SG_Sharpness, L_ASG_Energy, L_ASG_Sharpness, L_ASG_Anisotropy, L_B0_Spatial_Smooth, build_dual_transient_masks
 from gaussian_renderer import prefilter_voxel, render, network_gui
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -57,6 +57,7 @@ from utils.visualize_utils import minmax_normalize, visualize_camera_trajectorie
 import numpy as np
 import cv2
 from utils.pose_utils import save_pose, load_pose
+from utils.scaling_utils import needle_loss, oblate_loss, scaling_diagnostics
 import matplotlib.cm as cm
 
 try:
@@ -447,9 +448,24 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
     gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
                               dataset.appearance_residual_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_reflectance_dist, dataset.add_illumination_dist, dataset.add_residual_dist, dataset.use_residual, dataset.use_dual_transient, dataset.use_3D_filter,
-                              use_sg_illumination=dataset.use_sg_illumination, use_asg_illumination=dataset.use_asg_illumination, illumination_mode=dataset.illumination_mode, sg_lobes=dataset.sg_lobes, sg_lambda_min=dataset.sg_lambda_min, asg_lobes=dataset.asg_lobes, asg_lambda_min=dataset.asg_lambda_min)
+                              use_sg_illumination=dataset.use_sg_illumination, use_asg_illumination=dataset.use_asg_illumination, illumination_mode=dataset.illumination_mode, sg_lobes=dataset.sg_lobes, sg_lambda_min=dataset.sg_lambda_min, asg_lobes=dataset.asg_lobes, asg_lambda_min=dataset.asg_lambda_min,
+                              clamp_needle_render=dataset.clamp_needle_render, needle_ratio_threshold=dataset.needle_ratio_threshold,
+                              oblate_ratio_threshold=dataset.oblate_ratio_threshold, render_scale_max=dataset.render_scale_max,
+                              render_min_opacity=getattr(dataset, "render_min_opacity", 0.0))
     depth_piror_model = depth_piror_Model()
-    if mode == "warmuped":
+    resume_iteration = int(getattr(dataset, "resume_iteration", -1))
+    if mode == "train" and resume_iteration > 0:
+        scene = Scene(
+            dataset,
+            gaussians,
+            depth_piror_model,
+            shuffle=False,
+            load_iteration=resume_iteration,
+        )
+        first_iter = scene.loaded_iter
+        gaussians.train()
+        logger.info(f"[INFO] Resuming full model from iteration {first_iter}")
+    elif mode == "warmuped":
         scene = Scene(dataset, gaussians, depth_piror_model, ply_path=ply_path, shuffle=False, load_iteration=-1 , only_ply=True)
         gaussians.train()
     elif mode == "train" or mode == "warmup":
@@ -575,6 +591,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
+        if mode != "warmup" and opt.geometry_freeze_iter >= 0 and iteration >= opt.geometry_freeze_iter:
+            if not gaussians.geometry_frozen:
+                logger.info(f"[ITER {iteration}] Freezing geometry and covariance parameters")
+            gaussians.freeze_geometry()
 
         if (
             mode != "warmup"
@@ -698,6 +718,16 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             ssim_loss = ssim(image_tmp, gt_image)
         ssim_loss = 1.0 - ssim_loss
         scaling_reg = scaling.prod(dim=1).mean()
+        L_needle = needle_loss(scaling, dataset.needle_ratio_threshold)
+        L_oblate = oblate_loss(scaling, dataset.oblate_ratio_threshold)
+        log_scale_stats = iteration % 100 == 0 or iteration in testing_iterations or iteration in saving_iterations
+        scale_stats = scaling_diagnostics(scaling, radii) if log_scale_stats else {}
+        if log_scale_stats:
+            scale_stats["geometry_frozen"] = float(gaussians.geometry_frozen)
+            scale_stats["appearance_active"] = float(iteration >= opt.appearance_start_iter)
+            scale_stats["enhancement_guidance_active"] = float(
+                mode != "warmup" and iteration >= dataset.enhancement_diff_start_iter
+            )
         illumination_stats = render_pkg.get("illumination_stats", render_pkg.get("sg_stats"))
         L_sg_energy = L_SG_Energy(illumination_stats)
         L_sg_sharpness = L_SG_Sharpness(illumination_stats)
@@ -709,6 +739,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         L_reflectance_edge_uplift = L_Reflectance_Edge_Uplift(reflectance_image, gt_image)
         L_reflectance_contrast = L_Reflectance_LocalContrast(reflectance_image, gt_image)
         L_reflectance_highfreq = L_Reflectance_HighFreq(reflectance_image, gt_image)
+        L_reflectance_extra_edge = L_Reflectance_Extra_Edge(reflectance_image, gt_image)
         L_reflectance_highlight = L_Reflectance_Highlight(reflectance_image)
         L_b0_spatial_smooth = L_B0_Spatial_Smooth(gaussians._base_log_reflectance, gaussians.get_anchor)
         L_reflectance_detail = torch.mean(torch.abs(torch.tanh(gaussians._reflectance_offset_delta)))
@@ -737,19 +768,25 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
         if mode == "warmup":
             loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + L_illu + 0.01 * scaling_reg
+            loss += opt.needle_reg * L_needle
+            loss += opt.oblate_reg * L_oblate
             if iteration >= opt.update_from:
                 loss += L_smooth * 0.1 +  L_depth_similarity 
             loss += dataset.reflectance_consistency_reg * (L_reflectance_consistency + L_reflectance_smooth)
-            loss += dataset.reflectance_edge_reg * L_reflectance_edge
-            loss += dataset.reflectance_edge_uplift_reg * L_reflectance_edge_uplift
-            loss += dataset.reflectance_contrast_reg * L_reflectance_contrast
-            loss += dataset.reflectance_highfreq_reg * L_reflectance_highfreq
-            loss += dataset.highlight_reflectance_reg * L_reflectance_highlight
-            loss += dataset.reflectance_detail_reg * L_reflectance_detail
-            loss += dataset.reflectance_decoder_reg * L_reflectance_decoder
+            if iteration >= opt.appearance_start_iter:
+                loss += dataset.reflectance_edge_reg * L_reflectance_edge
+                loss += dataset.reflectance_edge_uplift_reg * L_reflectance_edge_uplift
+                loss += dataset.reflectance_contrast_reg * L_reflectance_contrast
+                loss += dataset.reflectance_highfreq_reg * L_reflectance_highfreq
+                loss += dataset.reflectance_extra_edge_reg * L_reflectance_extra_edge
+                loss += dataset.highlight_reflectance_reg * L_reflectance_highlight
+                loss += dataset.reflectance_detail_reg * L_reflectance_detail
+                loss += dataset.reflectance_decoder_reg * L_reflectance_decoder
             loss += dataset.b0_spatial_smooth_reg * L_b0_spatial_smooth
         else:
             loss = (1.0 - opt.lambda_dssim ) * Ll1 + opt.lambda_dssim *  ssim_loss + L_illu + 0.01 * scaling_reg  
+            loss += opt.needle_reg * L_needle
+            loss += opt.oblate_reg * L_oblate
             
             if iteration >= opt.update_from:
                 loss +=  L_smooth + L_depth_similarity
@@ -761,17 +798,19 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     loss += dataset.sg_energy_reg * L_sg_energy
                     loss += dataset.sg_smooth_reg * L_sg_sharpness
                 loss += dataset.reflectance_consistency_reg * (L_reflectance_consistency + L_reflectance_smooth)
-                loss += dataset.reflectance_edge_reg * L_reflectance_edge
-                loss += dataset.reflectance_edge_uplift_reg * L_reflectance_edge_uplift
-                loss += dataset.reflectance_contrast_reg * L_reflectance_contrast
-                loss += dataset.reflectance_highfreq_reg * L_reflectance_highfreq
-                loss += dataset.highlight_reflectance_reg * L_reflectance_highlight
-                loss += dataset.reflectance_detail_reg * L_reflectance_detail
-                loss += dataset.reflectance_decoder_reg * L_reflectance_decoder
+                if iteration >= opt.appearance_start_iter:
+                    loss += dataset.reflectance_edge_reg * L_reflectance_edge
+                    loss += dataset.reflectance_edge_uplift_reg * L_reflectance_edge_uplift
+                    loss += dataset.reflectance_contrast_reg * L_reflectance_contrast
+                    loss += dataset.reflectance_highfreq_reg * L_reflectance_highfreq
+                    loss += dataset.reflectance_extra_edge_reg * L_reflectance_extra_edge
+                    loss += dataset.highlight_reflectance_reg * L_reflectance_highlight
+                    loss += dataset.reflectance_detail_reg * L_reflectance_detail
+                    loss += dataset.reflectance_decoder_reg * L_reflectance_decoder
                 loss += dataset.b0_spatial_smooth_reg * L_b0_spatial_smooth
 
             L_diff = 0
-            if iteration >= opt.update_from:
+            if iteration >= max(opt.update_from, opt.appearance_start_iter):
                 L_degree = (
                     torch.abs(
                         illumination_enhanced_image.mean(0)
@@ -878,6 +917,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                            'reflectance_edge_uplift_mean': L_reflectance_edge_uplift,
                            'reflectance_contrast_mean': L_reflectance_contrast,
                            'reflectance_highfreq_mean': L_reflectance_highfreq,
+                           'reflectance_extra_edge_mean': L_reflectance_extra_edge,
+                           'needle_loss': L_needle,
+                           'oblate_loss': L_oblate,
+                           **scale_stats,
                            'reflectance_highlight_mean': L_reflectance_highlight,
                            'reflectance_detail_mean': L_reflectance_detail,
                            'reflectance_decoder_mean': L_reflectance_decoder,
@@ -897,6 +940,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                                 'reflectance_edge_uplift_mean': L_reflectance_edge_uplift,
                                 'reflectance_contrast_mean': L_reflectance_contrast,
                                 'reflectance_highfreq_mean': L_reflectance_highfreq,
+                                'reflectance_extra_edge_mean': L_reflectance_extra_edge,
+                                'needle_loss': L_needle,
+                                'oblate_loss': L_oblate,
+                                **scale_stats,
                                 'reflectance_highlight_mean': L_reflectance_highlight,
                                 'reflectance_detail_mean': L_reflectance_detail,
                                 'reflectance_decoder_mean': L_reflectance_decoder,
@@ -923,7 +970,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         'residual_chroma_boost': L_residual_chroma_boost,
                     })
                 wandb.log(residual_log)
-            if (iteration - 1) % 600 == 0:
+            if iteration % 600 == 0:
                 gt_image = torch.clamp(gt_image * enhance_ratio, 0.0, 1.0)
                 image = torch.clamp(image_tmp * enhance_ratio, 0.0, 1.0)
                 enhanced_image = torch.clamp(reflectance_image * illumination_image * enhance_ratio, 0.0, 1.0)
@@ -975,6 +1022,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         'reflectance_edge_uplift_mean': L_reflectance_edge_uplift,
                         'reflectance_contrast_mean': L_reflectance_contrast,
                         'reflectance_highfreq_mean': L_reflectance_highfreq,
+                        'reflectance_extra_edge_mean': L_reflectance_extra_edge,
+                        'needle_loss': L_needle,
+                        'oblate_loss': L_oblate,
+                        **scale_stats,
                         'reflectance_detail_mean': L_reflectance_detail,
                         'reflectance_decoder_mean': L_reflectance_decoder,
                         'reflectance_highlight_mean': L_reflectance_highlight,
@@ -989,7 +1040,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         'depth_piror_image':wandb.Image(torchvision.transforms.ToPILImage()(depth_piror_norm)),
                         'clear_image':wandb.Image(enhanced_image_pil),
                         'illumination_enhanced':wandb.Image(torchvision.transforms.ToPILImage()(illumination_enhanced_image)),
-                        'image_enhanced':wandb.Image(torchvision.transforms.ToPILImage()(illumination_enhanced_image * reflectance_image)),
+                        'image_enhanced':wandb.Image(torchvision.transforms.ToPILImage()(torch.clamp(illumination_enhanced_image * reflectance_image, 0.0, 1.0))),
                         'refined_image':wandb.Image(torchvision.transforms.ToPILImage()(get_refined_image(refined_image_dict, viewpoint_cam, gt_image).cuda())),
                 }
                 if dataset.use_dual_transient:
@@ -1014,6 +1065,11 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             # debug
             if iteration % 600 == 0:
                 print("reflectance_image", reflectance_image.mean())
+                print("needle_loss", L_needle)
+                print("oblate_loss", L_oblate)
+                print("needle_ratio_p99", scale_stats["needle_ratio_p99"])
+                print("needle_ratio_max", scale_stats["needle_ratio_max"])
+                print("radii_p99", scale_stats["radii_p99"])
                 print("illumination_image", illumination_image.mean())
                 print("sg_energy", L_sg_energy)
                 print("sg_lambda_mean", L_sg_sharpness)
@@ -1421,7 +1477,10 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train=False, skip_test=False, wandb=None, tb_writer=None, dataset_name=None, logger=None):
     gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
                               dataset.appearance_residual_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_reflectance_dist, dataset.add_illumination_dist, dataset.add_residual_dist, dataset.use_residual, dataset.use_dual_transient, dataset.use_3D_filter,
-                              use_sg_illumination=dataset.use_sg_illumination, use_asg_illumination=dataset.use_asg_illumination, illumination_mode=dataset.illumination_mode, sg_lobes=dataset.sg_lobes, sg_lambda_min=dataset.sg_lambda_min, asg_lobes=dataset.asg_lobes, asg_lambda_min=dataset.asg_lambda_min)
+                              use_sg_illumination=dataset.use_sg_illumination, use_asg_illumination=dataset.use_asg_illumination, illumination_mode=dataset.illumination_mode, sg_lobes=dataset.sg_lobes, sg_lambda_min=dataset.sg_lambda_min, asg_lobes=dataset.asg_lobes, asg_lambda_min=dataset.asg_lambda_min,
+                              clamp_needle_render=dataset.clamp_needle_render, needle_ratio_threshold=dataset.needle_ratio_threshold,
+                              oblate_ratio_threshold=dataset.oblate_ratio_threshold, render_scale_max=dataset.render_scale_max,
+                              render_min_opacity=getattr(dataset, "render_min_opacity", 0.0))
     scene = Scene(dataset, gaussians, depth_piror_model=None, load_iteration=iteration, shuffle=False)
     gaussians.eval()
 

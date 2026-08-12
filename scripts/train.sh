@@ -10,7 +10,7 @@ port=$(rand 10000 30000)
 lod=0
 iterations=8_000
 iterations_static=8_000
-update_until=5_000
+update_until=4_000
 feat_dim=32
 densify_grad_threshold=0.0002
 success_threshold=0.8
@@ -22,9 +22,10 @@ offset_lr_init=0.001 #edit
 offset_lr_final=0.00001 #edit
 mlp_color_lr_init=0.04
 mlp_color_lr_final=0.00025
-pose_lr_init=0.0001
-pose_lr_final=0.00001
-update_from=1000
+pose_lr_init=0
+pose_lr_final=0
+update_from=1500
+geometry_args="--use_3D_filter --needle_ratio_threshold 5.0 --needle_reg 0.1 --geometry_freeze_iter 4000 --scaling_lr 0.001 --mlp_cov_lr_init 0.0005 --mlp_cov_lr_final 0.00005 --min_opacity 0.01 --enhancement_diff_start_iter 9000 --reflectance_edge_reg 0 --reflectance_edge_uplift_reg 0 --reflectance_contrast_reg 0 --reflectance_highfreq_reg 0"
 
 position_lr_max_steps=${iterations_static}
 offset_lr_max_steps=${iterations_static}
@@ -77,7 +78,7 @@ if [ "$warmup" = "True" ]; then
         --pose_lr_max_steps ${pose_lr_max_steps} \
         --offset_lr_init ${offset_lr_init} --offset_lr_final ${offset_lr_final} --pose_lr_init ${pose_lr_init} --pose_lr_final ${pose_lr_final}\
         --update_from ${update_from}\
-        --appearance_lr_max_steps ${appearance_lr_max_steps}  --use_residual   --use_3D_filter --prune_ratio ${prune_ratio} \
+        --appearance_lr_max_steps ${appearance_lr_max_steps}  --use_residual --prune_ratio ${prune_ratio} ${geometry_args} \
         # >outputs/${logdir}/$time/${logdir}.log 2>&1 
         wait
     else
@@ -95,7 +96,7 @@ if [ "$warmup" = "True" ]; then
         --pose_lr_max_steps ${pose_lr_max_steps} \
         --offset_lr_init ${offset_lr_init} --offset_lr_final ${offset_lr_final} --pose_lr_init ${pose_lr_init} --pose_lr_final ${pose_lr_final}\
         --update_from ${update_from}\
-        --appearance_lr_max_steps ${appearance_lr_max_steps}  --use_3D_filter --prune_ratio ${prune_ratio}\
+        --appearance_lr_max_steps ${appearance_lr_max_steps} --prune_ratio ${prune_ratio} ${geometry_args}\
         # >outputs/${logdir}/$time/${logdir}.log 2>&1
     fi
 else
@@ -117,7 +118,7 @@ else
         --pose_lr_max_steps ${pose_lr_max_steps} \
         --offset_lr_init ${offset_lr_init} --offset_lr_final ${offset_lr_final} --pose_lr_init ${pose_lr_init} --pose_lr_final ${pose_lr_final}\
         --update_from ${update_from}\
-        --appearance_lr_max_steps ${appearance_lr_max_steps}  --use_residual --use_3D_filter --prune_ratio ${prune_ratio}\
+        --appearance_lr_max_steps ${appearance_lr_max_steps} --use_residual --prune_ratio ${prune_ratio} ${geometry_args}\
         # >outputs/${logdir}/$time/${logdir}.log 2>&1
     else
         CUDA_VISIBLE_DEVICES=${gpu} python train.py --eval -s ${data} --lod ${lod} \
@@ -135,7 +136,7 @@ else
         --pose_lr_max_steps ${pose_lr_max_steps} \
         --offset_lr_init ${offset_lr_init} --offset_lr_final ${offset_lr_final} --pose_lr_init ${pose_lr_init} --pose_lr_final ${pose_lr_final}\
         --update_from ${update_from} \
-        --appearance_lr_max_steps ${appearance_lr_max_steps}  --use_3D_filter --prune_ratio ${prune_ratio} \
+        --appearance_lr_max_steps ${appearance_lr_max_steps} --prune_ratio ${prune_ratio} ${geometry_args} \
         # >outputs/${logdir}/$time/${logdir}.log 2>&1
     fi
 fi

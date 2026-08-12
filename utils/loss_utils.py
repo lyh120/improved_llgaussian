@@ -284,6 +284,22 @@ def L_Reflectance_HighFreq(reflectance_image, gt_image, threshold=0.1, target_ra
     return (F.relu(target - reflectance_hf_norm) * structure_mask).mean()
 
 
+def L_Reflectance_Extra_Edge(reflectance_image, gt_image, threshold=0.1):
+    """Penalize reflectance gradients in regions that are smooth in the input image."""
+    gt_image = gt_image.detach()
+    reflectance_gray = reflectance_image.mean(dim=0, keepdim=True)
+    gt_gray = 0.299 * gt_image[0:1] + 0.587 * gt_image[1:2] + 0.114 * gt_image[2:3]
+
+    ref_dx = reflectance_gray[:, 1:, :-1] - reflectance_gray[:, :-1, :-1]
+    ref_dy = reflectance_gray[:, :-1, 1:] - reflectance_gray[:, :-1, :-1]
+    gt_dx = gt_gray[:, 1:, :-1] - gt_gray[:, :-1, :-1]
+    gt_dy = gt_gray[:, :-1, 1:] - gt_gray[:, :-1, :-1]
+    ref_grad = torch.sqrt(ref_dx.square() + ref_dy.square() + 1e-8)
+    gt_grad = torch.sqrt(gt_dx.square() + gt_dy.square() + 1e-8).detach()
+    smooth_mask = (gt_grad < threshold).to(ref_grad.dtype)
+    return (F.relu(ref_grad - gt_grad) * smooth_mask).mean()
+
+
 def L_Residual_Chroma_Boost(residual_image, reflectance_image, threshold=0.6):
     """Encourage residual to carry a small amount of chroma in bright reflectance regions."""
     reflectance_value = reflectance_image.mean(dim=0, keepdim=True).detach()

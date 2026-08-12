@@ -44,6 +44,7 @@ from argparse import ArgumentParser
 from gaussian_renderer import GaussianModel
 from utils.visualize_utils import minmax_normalize, visualize_cmap
 from utils.pose_utils import get_tensor_from_camera
+from utils.scaling_utils import scaling_diagnostics
 from utils.camera_utils import visualizer, generate_interpolated_path
 from scene.dataset_readers import loadCameras
 import matplotlib.cm as cm
@@ -474,6 +475,8 @@ def render_set(
     name_list = []
     per_view_dict = {}
     illumination_stats_dict = {}
+    scaling_stats_dict = {}
+    opacity_stats_dict = {}
     lowlight_metrics = {}
     enhanced_metrics = {}
     time_consume = 0
@@ -527,6 +530,22 @@ def render_set(
                 for key, value in illumination_stats.items()
                 if torch.is_tensor(value) and value.numel() == 1
             }
+        scale_stats = scaling_diagnostics(render_pkg["scaling"], render_pkg["radii"])
+        scaling_stats_dict[view.image_name + ".png"] = {
+            key: float(value.detach().cpu()) for key, value in scale_stats.items()
+        }
+        rendered_opacity = render_pkg.get("opacity")
+        if rendered_opacity is not None and rendered_opacity.numel() > 0:
+            opacity_values = rendered_opacity.detach().float().flatten()
+            opacity_stats_dict[view.image_name + ".png"] = {
+                "opacity_min": float(opacity_values.min().cpu()),
+                "opacity_p05": float(torch.quantile(opacity_values, 0.05).cpu()),
+                "opacity_p50": float(torch.quantile(opacity_values, 0.50).cpu()),
+                "opacity_p95": float(torch.quantile(opacity_values, 0.95).cpu()),
+                "opacity_max": float(opacity_values.max().cpu()),
+                "opacity_active_count": int(opacity_values.numel()),
+            }
+        per_view_dict[view.image_name + ".png"] = int((render_pkg["radii"] > 0).sum().item())
 
         rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
         rendering_enhance = torch.clamp(render_pkg["render"] * 30, 0.0, 1.0)
@@ -599,6 +618,20 @@ def render_set(
             json.dump(illumination_stats_dict, fp, indent=True)
         with open(os.path.join(model_path, name, "ours_{}".format(iteration), "illumination_stats.json"), 'w') as fp:
             json.dump(illumination_stats_dict, fp, indent=True)
+    if scaling_stats_dict:
+        summary = {}
+        for key in next(iter(scaling_stats_dict.values())):
+            values = [item[key] for item in scaling_stats_dict.values()]
+            summary[key] = max(values) if key.endswith("_max") else sum(values) / len(values)
+        with open(os.path.join(model_path, name, "ours_{}".format(iteration), "scaling_stats.json"), 'w') as fp:
+            json.dump({"summary": summary, "per_view": scaling_stats_dict}, fp, indent=True)
+    if opacity_stats_dict:
+        opacity_summary = {}
+        for key in next(iter(opacity_stats_dict.values())):
+            values = [item[key] for item in opacity_stats_dict.values()]
+            opacity_summary[key] = max(values) if key.endswith("_max") else sum(values) / len(values)
+        with open(os.path.join(model_path, name, "ours_{}".format(iteration), "opacity_stats.json"), 'w') as fp:
+            json.dump({"summary": opacity_summary, "per_view": opacity_stats_dict}, fp, indent=True)
     if evaluate_metrics:
         _dump_metric_report(
             os.path.join(model_path, name, "ours_{}".format(iteration), "metrics_lowlight.json"),
@@ -648,7 +681,10 @@ def render_sets(
 
         gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
                               dataset.appearance_residual_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_reflectance_dist, dataset.add_illumination_dist, dataset.add_residual_dist, dataset.use_residual, dataset.use_dual_transient, dataset.use_3D_filter,
-                              use_sg_illumination=use_sg_illumination, use_asg_illumination=use_asg_illumination, illumination_mode=illumination_mode, sg_lobes=sg_lobes, sg_lambda_min=sg_lambda_min, asg_lobes=asg_lobes, asg_lambda_min=asg_lambda_min)
+                              use_sg_illumination=use_sg_illumination, use_asg_illumination=use_asg_illumination, illumination_mode=illumination_mode, sg_lobes=sg_lobes, sg_lambda_min=sg_lambda_min, asg_lobes=asg_lobes, asg_lambda_min=asg_lambda_min,
+                              clamp_needle_render=getattr(dataset, "clamp_needle_render", False), needle_ratio_threshold=getattr(dataset, "needle_ratio_threshold", 5.0),
+                              oblate_ratio_threshold=getattr(dataset, "oblate_ratio_threshold", 20.0), render_scale_max=getattr(dataset, "render_scale_max", 0.0),
+                              render_min_opacity=getattr(dataset, "render_min_opacity", 0.0))
         scene = Scene(dataset, gaussians, depth_piror_model=None, load_iteration=iteration, shuffle=False)
         
         gaussians.eval()
