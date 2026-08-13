@@ -1306,6 +1306,38 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
                 image_log = {
                     monitor_step_key: iteration,
+                    f"watch/{monitor_stage}/final": wandb_image(
+                        fixed_enhanced,
+                        fixed_caption,
+                    ),
+                    f"watch/{monitor_stage}/normal": wandb_image(
+                        fixed_base,
+                        fixed_caption,
+                    ),
+                    f"watch/{monitor_stage}/brightened": wandb_image(
+                        torch.clamp(fixed_base * enhance_ratio, 0.0, 1.0),
+                        fixed_caption,
+                    ),
+                    f"watch/{monitor_stage}/gt": wandb_image(
+                        fixed_gt,
+                        fixed_caption,
+                    ),
+                    f"watch/{monitor_stage}/reflectance": wandb_image(
+                        fixed_reflectance,
+                        fixed_caption,
+                    ),
+                    f"watch/{monitor_stage}/illumination": wandb_image(
+                        fixed_illumination,
+                        fixed_caption,
+                    ),
+                    f"watch/{monitor_stage}/enhance_illumination": wandb_image(
+                        fixed_illumination_enhanced,
+                        fixed_caption,
+                    ),
+                    f"watch/{monitor_stage}/coverage": wandb_image(
+                        fixed_coverage,
+                        fixed_caption,
+                    ),
                     f"{random_prefix}/iteration": iteration,
                     f"{random_prefix}/camera_name": str(viewpoint_cam.image_name),
                     f"{random_prefix}/camera_uid": int(viewpoint_cam.uid),
@@ -2073,6 +2105,14 @@ if __name__ == "__main__":
         )
         wandb.define_metric(
             "monitor/main/*",
+            step_metric="main_iteration",
+        )
+        wandb.define_metric(
+            "watch/warmup/*",
+            step_metric="warmup_iteration",
+        )
+        wandb.define_metric(
+            "watch/main/*",
             step_metric="main_iteration",
         )
     else:
