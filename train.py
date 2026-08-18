@@ -752,6 +752,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
         t1 = time.time()
         reflectance_image, illumination_image, illumination_enhanced_image, depth_image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity= render_pkg["render_reflectance"], render_pkg["render_illumination"], render_pkg["render_illumination_enhanced"], render_pkg["render_depth"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
+        reflectance_aux_image = render_pkg["render_reflectance_aux"]
         
         
 
@@ -836,7 +837,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             ),
         ) * illumination_smooth_reg
         L_illu = L_Illu(gt_image, illumination_image) 
-        L_reflectance_smooth = L_Reflectance_Smooth(reflectance_image, illumination_image) * dataset.reflectance_smooth_reg
+        L_reflectance_smooth = L_Reflectance_Smooth(reflectance_aux_image, illumination_image) * dataset.reflectance_smooth_reg
         L_depth_similarity = (L_Depth_similarity(1 - minmax_normalize(depth_image).squeeze(0), depth_piror_norm.squeeze(0), 128, 0.5) ) * 0.15
         
         if FUSED_SSIM_AVAILABLE:
@@ -851,13 +852,16 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         L_asg_energy = L_ASG_Energy(illumination_stats)
         L_asg_sharpness = L_ASG_Sharpness(illumination_stats)
         L_asg_anisotropy = L_ASG_Anisotropy(illumination_stats)
-        L_reflectance_consistency = L_Reflectance_Consistency(reflectance_image)
-        L_reflectance_edge = L_Reflectance_Edge(reflectance_image, gt_image)
-        L_reflectance_edge_uplift = L_Reflectance_Edge_Uplift(reflectance_image, gt_image)
-        L_reflectance_contrast = L_Reflectance_LocalContrast(reflectance_image, gt_image)
-        L_reflectance_highfreq = L_Reflectance_HighFreq(reflectance_image, gt_image)
-        L_reflectance_highlight = L_Reflectance_Highlight(reflectance_image)
-        L_b0_spatial_smooth = L_B0_Spatial_Smooth(gaussians._base_log_reflectance, gaussians.get_anchor)
+        L_reflectance_consistency = L_Reflectance_Consistency(reflectance_aux_image)
+        L_reflectance_edge = L_Reflectance_Edge(reflectance_aux_image, gt_image)
+        L_reflectance_edge_uplift = L_Reflectance_Edge_Uplift(reflectance_aux_image, gt_image)
+        L_reflectance_contrast = L_Reflectance_LocalContrast(reflectance_aux_image, gt_image)
+        L_reflectance_highfreq = L_Reflectance_HighFreq(reflectance_aux_image, gt_image)
+        L_reflectance_highlight = L_Reflectance_Highlight(reflectance_aux_image)
+        L_b0_spatial_smooth = L_B0_Spatial_Smooth(
+            gaussians._base_log_reflectance,
+            gaussians.get_anchor.detach(),
+        )
         L_reflectance_detail = torch.mean(torch.abs(torch.tanh(gaussians._reflectance_offset_delta)))
         L_reflectance_decoder = gaussians._last_reflectance_decoder_mean
         L_residual_reg = torch.tensor(0.0, device=gt_image.device)
@@ -946,7 +950,11 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         * dataset.enhancement_smooth_reg
                     )
                 refined_target = get_refined_image(refined_image_dict, viewpoint_cam).cuda()
-                image_enhanced_pred = compose_decomposed_render(render_pkg, enhanced=True)
+                image_enhanced_pred = compose_decomposed_render(
+                    render_pkg,
+                    enhanced=True,
+                    detach_reflectance=True,
+                )
                 if dataset.enhancement_gain_smooth_reg > 0:
                     L_gain_smooth_enhancement_raw = L_Enhancement_Gain_Smooth(
                         illumination_enhanced_image,
@@ -992,7 +1000,9 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     # Keep a smaller reflectance-side correction than the illumination-side guidance.
                     if dataset.enhancement_reflectance_reg > 0:
                         L_diff_reflectance = torch.abs(
-                            illumination_enhanced_image.detach() * reflectance_image - refined_target
+                            illumination_enhanced_image.detach()
+                            * reflectance_aux_image
+                            - refined_target
                         ).mean()
                     guidance_progress = min(
                         1.0,

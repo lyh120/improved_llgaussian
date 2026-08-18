@@ -894,7 +894,9 @@ class GaussianModel:
         sharpness = F.softplus(self._enhancement_sg_sharpness[visible_mask])
         amplitude = torch.sigmoid(self._enhancement_sg_amplitude[visible_mask])
 
-        view_dirs = view_dirs.view(-1, 1, 3)
+        # Enhancement priors must not move anchors through the view-direction
+        # calculation. Base reconstruction still uses the original geometry.
+        view_dirs = view_dirs.detach().view(-1, 1, 3)
         cosine = torch.sum(axis * view_dirs, dim=-1, keepdim=True).clamp(-1.0, 1.0)
         sg_term = amplitude * torch.exp(sharpness * (cosine - 1.0))
 
