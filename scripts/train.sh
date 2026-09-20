@@ -1,143 +1,76 @@
-function rand(){
-    min=$1
-    max=$(($2-$min+1))
-    num=$(date +%s%N)
-    echo $(($num%$max+$min))  
+#!/usr/bin/env bash
+# Train v2; missing scene-local priors are generated once before optimization.
+set -euo pipefail
+
+DATA=""
+MODEL=""
+ENHANCEMENT_PRIOR=""
+DEPTH_PRIOR=""
+ENHANCEMENT_BACKEND="cidnet"
+STABLESR_INPUT_GAIN="15.0"
+GPU="0"
+ITERATIONS="8000"
+WARMUP=false
+WANDB=false
+
+usage() {
+    echo "Usage: bash scripts/train.sh -d DATA -m MODEL [options]"
+    echo "Options: --enhancement-backend cidnet|stablesr --stablesr-input-gain X"
+    echo "         --enhancement-prior DIR --depth-prior DIR --gpu N --iterations N --warmup --wandb"
 }
 
-port=$(rand 10000 30000)
-
-lod=0
-iterations=8_000
-iterations_static=8_000
-update_until=5_000
-feat_dim=32
-densify_grad_threshold=0.0002
-success_threshold=0.8
-# offset_lr_init=0.01
-# offset_lr_final=0.0001
-# mlp_color_lr_init=0.008 
-# mlp_color_lr_final=0.00005
-offset_lr_init=0.001 #edit
-offset_lr_final=0.00001 #edit
-mlp_color_lr_init=0.04
-mlp_color_lr_final=0.00025
-pose_lr_init=0.0001
-pose_lr_final=0.00001
-update_from=1000
-
-position_lr_max_steps=${iterations_static}
-offset_lr_max_steps=${iterations_static}
-mlp_opacity_lr_max_steps=${iterations_static}
-mlp_cov_lr_max_steps=${iterations_static}
-mlp_color_lr_max_steps=${iterations_static}
-mlp_featurebank_lr_max_steps=${iterations_static}
-appearance_lr_max_steps=${iterations_static}
-pose_lr_max_steps=${iterations_static}
-
-
-
-
-while [[ "$#" -gt 0 ]]; do
-    case $1 in
-        -l|--logdir) logdir="$2"; shift ;;
-        -d|--data) data="$2"; shift ;;
-        --lod) lod="$2"; shift ;;
-        --gpu) gpu="$2"; shift ;;
-        --warmup) warmup="$2"; shift ;;
-        --use_residual) use_residual="$2"; shift ;;
-        --voxel_size) vsize="$2"; shift ;;
-        --update_init_factor) update_init_factor="$2"; shift ;;
-        --appearance_residual_dim) appearance_residual_dim="$2"; shift ;;
-        --prune_ratio) prune_ratio="$2"; shift ;;
-        --kernel_size) kernel_size="$2"; shift ;;
-        *) echo "Unknown parameter passed: $1"; exit 1 ;;
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -d|--data) DATA="$2"; shift 2 ;;
+        -m|--model) MODEL="$2"; shift 2 ;;
+        --enhancement-prior) ENHANCEMENT_PRIOR="$2"; shift 2 ;;
+        --depth-prior) DEPTH_PRIOR="$2"; shift 2 ;;
+        --enhancement-backend) ENHANCEMENT_BACKEND="$2"; shift 2 ;;
+        --stablesr-input-gain) STABLESR_INPUT_GAIN="$2"; shift 2 ;;
+        --gpu) GPU="$2"; shift 2 ;;
+        --iterations) ITERATIONS="$2"; shift 2 ;;
+        --warmup) WARMUP=true; shift ;;
+        --wandb) WANDB=true; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "Unknown option: $1" >&2; usage; exit 2 ;;
     esac
-    shift
 done
 
-time=$(date "+%Y-%m-%d_%H:%M:%S")
-mkdir -p outputs/${logdir}/$time
-if [ "$warmup" = "True" ]; then
-    echo "warmup"
-    if [ "$use_residual" = "True" ]; then
-        echo "use_residual"
-        CUDA_VISIBLE_DEVICES=${gpu} python train.py --eval -s ${data} --lod ${lod} \
-        --iterations ${iterations} \
-        --gpu ${gpu} --voxel_size ${vsize} --update_init_factor ${update_init_factor}\
-        --use_asg_illumination --illumination_mode asg \
-        --appearance_residual_dim ${appearance_residual_dim}  \
-        --kernel_size ${kernel_size} --port $port -m outputs/${logdir}/$time --use_wandb --warmup  \
-        --update_until ${update_until} --feat_dim ${feat_dim} \
-        --densify_grad_threshold ${densify_grad_threshold} --success_threshold ${success_threshold}\
-        --position_lr_max_steps ${position_lr_max_steps} --offset_lr_max_steps ${offset_lr_max_steps}\
-        --mlp_opacity_lr_max_steps ${mlp_opacity_lr_max_steps} --mlp_cov_lr_max_steps ${mlp_cov_lr_max_steps}\
-        --mlp_color_lr_max_steps ${mlp_color_lr_max_steps} --mlp_featurebank_lr_max_steps ${mlp_featurebank_lr_max_steps}\
-        --mlp_color_lr_init ${mlp_color_lr_init} --mlp_color_lr_final ${mlp_color_lr_final}\
-        --pose_lr_max_steps ${pose_lr_max_steps} \
-        --offset_lr_init ${offset_lr_init} --offset_lr_final ${offset_lr_final} --pose_lr_init ${pose_lr_init} --pose_lr_final ${pose_lr_final}\
-        --update_from ${update_from}\
-        --appearance_lr_max_steps ${appearance_lr_max_steps}  --use_residual   --use_3D_filter --prune_ratio ${prune_ratio} \
-        # >outputs/${logdir}/$time/${logdir}.log 2>&1 
-        wait
-    else
-        CUDA_VISIBLE_DEVICES=${gpu} python train.py --eval -s ${data} --lod ${lod} \
-        --iterations ${iterations} \
-        --gpu ${gpu} --voxel_size ${vsize} --update_init_factor ${update_init_factor}\
-        --use_asg_illumination --illumination_mode asg \
-        --kernel_size ${kernel_size} --port $port -m outputs/${logdir}/$time --use_wandb  \
-        --update_until ${update_until} --feat_dim ${feat_dim}  \
-        --densify_grad_threshold ${densify_grad_threshold} --success_threshold ${success_threshold}\
-        --position_lr_max_steps ${position_lr_max_steps} --offset_lr_max_steps ${offset_lr_max_steps}\
-        --mlp_opacity_lr_max_steps ${mlp_opacity_lr_max_steps} --mlp_cov_lr_max_steps ${mlp_cov_lr_max_steps}\
-        --mlp_color_lr_max_steps ${mlp_color_lr_max_steps} --mlp_featurebank_lr_max_steps ${mlp_featurebank_lr_max_steps}\
-        --mlp_color_lr_init ${mlp_color_lr_init} --mlp_color_lr_final ${mlp_color_lr_final}\
-        --pose_lr_max_steps ${pose_lr_max_steps} \
-        --offset_lr_init ${offset_lr_init} --offset_lr_final ${offset_lr_final} --pose_lr_init ${pose_lr_init} --pose_lr_final ${pose_lr_final}\
-        --update_from ${update_from}\
-        --appearance_lr_max_steps ${appearance_lr_max_steps}  --use_3D_filter --prune_ratio ${prune_ratio}\
-        # >outputs/${logdir}/$time/${logdir}.log 2>&1
-    fi
-else
-    
-    if [ "$use_residual" = "True" ]; then
-        echo "use_residual"
-        CUDA_VISIBLE_DEVICES=${gpu} python train.py --eval -s ${data} --lod ${lod} \
-        --iterations ${iterations} \
-        --gpu ${gpu} --voxel_size ${vsize} --update_init_factor ${update_init_factor}\
-        --use_asg_illumination --illumination_mode asg \
-        --appearance_residual_dim ${appearance_residual_dim} \
-        --kernel_size ${kernel_size} --port $port -m outputs/${logdir}/$time --use_wandb   \
-        --update_until ${update_until} --feat_dim ${feat_dim} \
-        --densify_grad_threshold ${densify_grad_threshold} --success_threshold ${success_threshold}\
-        --position_lr_max_steps ${position_lr_max_steps} --offset_lr_max_steps ${offset_lr_max_steps}\
-        --mlp_opacity_lr_max_steps ${mlp_opacity_lr_max_steps} --mlp_cov_lr_max_steps ${mlp_cov_lr_max_steps}\
-        --mlp_color_lr_max_steps ${mlp_color_lr_max_steps} --mlp_featurebank_lr_max_steps ${mlp_featurebank_lr_max_steps}\
-        --mlp_color_lr_init ${mlp_color_lr_init} --mlp_color_lr_final ${mlp_color_lr_final}\
-        --pose_lr_max_steps ${pose_lr_max_steps} \
-        --offset_lr_init ${offset_lr_init} --offset_lr_final ${offset_lr_final} --pose_lr_init ${pose_lr_init} --pose_lr_final ${pose_lr_final}\
-        --update_from ${update_from}\
-        --appearance_lr_max_steps ${appearance_lr_max_steps}  --use_residual --use_3D_filter --prune_ratio ${prune_ratio}\
-        # >outputs/${logdir}/$time/${logdir}.log 2>&1
-    else
-        CUDA_VISIBLE_DEVICES=${gpu} python train.py --eval -s ${data} --lod ${lod} \
-        --iterations ${iterations} \
-        --gpu ${gpu} --voxel_size ${vsize} --update_init_factor ${update_init_factor}\
-        --use_asg_illumination --illumination_mode asg \
-        --appearance_residual_dim ${appearance_residual_dim} \
-        --kernel_size ${kernel_size} --port $port -m outputs/${logdir}/$time --use_wandb  \
-        --update_until ${update_until} --feat_dim ${feat_dim} \
-        --densify_grad_threshold ${densify_grad_threshold} --success_threshold ${success_threshold}\
-        --position_lr_max_steps ${position_lr_max_steps} --offset_lr_max_steps ${offset_lr_max_steps}\
-        --mlp_opacity_lr_max_steps ${mlp_opacity_lr_max_steps} --mlp_cov_lr_max_steps ${mlp_cov_lr_max_steps}\
-        --mlp_color_lr_max_steps ${mlp_color_lr_max_steps} --mlp_featurebank_lr_max_steps ${mlp_featurebank_lr_max_steps}\
-        --mlp_color_lr_init ${mlp_color_lr_init} --mlp_color_lr_final ${mlp_color_lr_final}\
-        --pose_lr_max_steps ${pose_lr_max_steps} \
-        --offset_lr_init ${offset_lr_init} --offset_lr_final ${offset_lr_final} --pose_lr_init ${pose_lr_init} --pose_lr_final ${pose_lr_final}\
-        --update_from ${update_from} \
-        --appearance_lr_max_steps ${appearance_lr_max_steps}  --use_3D_filter --prune_ratio ${prune_ratio} \
-        # >outputs/${logdir}/$time/${logdir}.log 2>&1
-    fi
+if [[ -z "$DATA" || -z "$MODEL" ]]; then
+    usage
+    exit 2
 fi
 
+ARGS=(
+    --eval --gpu "$GPU" -s "$DATA" -m "$MODEL"
+    --use_3D_filter
+    --iterations "$ITERATIONS"
+    --save_iterations "$((ITERATIONS / 4))" "$((ITERATIONS / 2))" "$((ITERATIONS * 3 / 4))" "$ITERATIONS"
+    --test_iterations "$((ITERATIONS / 4))" "$((ITERATIONS / 2))" "$((ITERATIONS * 3 / 4))" "$ITERATIONS"
+    --prune_ratio 1.0 --update_until "$((ITERATIONS * 3 / 4))"
+    --start_stat 500 --update_from 2000 --update_interval 100
+    --max_anchors 30000 --max_new_anchors_per_update 256
+    --densify_level_caps 128,80,48 --max_pruned_anchors_per_update 0
+    --warmup_iterations 2000 --warmup_start_stat 200
+    --warmup_update_from 1200 --warmup_update_until 1900
+    --warmup_update_interval 200 --warmup_max_new_anchors 128
+    --warmup_level_caps 64,40,24
+    --warmup_densify_grad_threshold 0.00025
+    --warmup_success_threshold 0.8
+    --position_lr_max_steps "$ITERATIONS" --offset_lr_max_steps "$ITERATIONS"
+    --mlp_opacity_lr_max_steps "$ITERATIONS" --mlp_cov_lr_max_steps "$ITERATIONS"
+    --mlp_featurebank_lr_max_steps "$ITERATIONS" --pose_lr_max_steps "$ITERATIONS"
+    --explicit_appearance_lr_init 0.008
+    --explicit_appearance_lr_final 0.00005
+    --lambda_dssim 0.2 --lambda_scaling 0.01
+    --lambda_reflectance_reconstruction 1.0 --lambda_illumination 1.0
+    --lambda_enhanced 1.0 --lambda_depth 1.0
+    --enhancement_prior_backend "$ENHANCEMENT_BACKEND"
+    --stablesr_input_gain "$STABLESR_INPUT_GAIN"
+)
+[[ -n "$ENHANCEMENT_PRIOR" ]] && ARGS+=(--enhancement_prior_path "$ENHANCEMENT_PRIOR")
+[[ -n "$DEPTH_PRIOR" ]] && ARGS+=(--depth_prior_path "$DEPTH_PRIOR")
+[[ "$WARMUP" == true ]] && ARGS+=(--warmup)
+[[ "$WANDB" == true ]] && ARGS+=(--use_wandb)
 
+python train.py "${ARGS[@]}"

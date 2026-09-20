@@ -9,9 +9,11 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
-from argparse import ArgumentParser, Namespace
-import sys
 import os
+import sys
+from argparse import ArgumentParser, Namespace
+
+from utils.model_format import MODEL_FORMAT_VERSION
 
 class GroupParams:
     pass
@@ -20,6 +22,12 @@ class ParamGroup:
     def __init__(self, parser: ArgumentParser, name : str, fill_none = False):
         group = parser.add_argument_group(name)
         for key, value in vars(self).items():
+            if key == "model_format_version":
+                # The file format is an invariant, not a user-selectable mode.
+                parser.set_defaults(
+                    model_format_version=value if not fill_none else None
+                )
+                continue
             shorthand = False
             if key.startswith("_"):
                 shorthand = True
@@ -46,7 +54,7 @@ class ParamGroup:
 
 class ModelParams(ParamGroup): 
     def __init__(self, parser, sentinel=False):
-        self.sh_degree = 3
+        self.model_format_version = MODEL_FORMAT_VERSION
         self.feat_dim = 32
         self.n_offsets = 10
         self.voxel_size =  0.001 # if voxel_size<=0, using 1nn dist
@@ -66,91 +74,33 @@ class ModelParams(ParamGroup):
         self.eval = False
         self.lod = 0
 
-        self.appearance_residual_dim = 32
-        self.lowpoly = False
-        self.ds = 1
-        self.ratio = 1 # sampling the input point cloud
-        self.undistorted = False 
-        
         # In the Bungeenerf dataset, we propose to set the following three parameters to True,
         # Because there are enough dist variations.
         self.add_opacity_dist = False
         self.add_cov_dist = False
-        # self.add_color_dist = False
-        self.add_reflectance_dist = False
-        self.add_illumination_dist = False
-        self.add_residual_dist = False
-        self.use_residual = False
-        self.use_dual_transient = False
         self.use_3D_filter = False
-        self.use_sg_illumination = True
-        self.use_asg_illumination = True
-        self.illumination_mode = "asg"
-        self.reflectance_mode = "explicit"
-        self.sg_lobes = 4
-        self.sg_lambda_min = 1.0
-        self.sg_energy_reg = 1e-4
-        self.sg_smooth_reg = 5e-5
-        self.asg_lobes = 1
-        self.asg_lambda_min = 1.0
-        self.asg_energy_reg = 1e-4
-        self.asg_sharpness_reg = 5e-5
-        self.asg_anisotropy_reg = 1e-5
-        self.reflectance_consistency_reg = 2e-5
-        self.reflectance_smooth_reg = 0.0
-        self.reflectance_edge_reg = 2e-4
-        self.reflectance_edge_uplift_reg = 3e-3
-        self.reflectance_contrast_reg = 2e-3
-        self.reflectance_highfreq_reg = 3e-3
-        self.highlight_reflectance_reg = 1e-3
-        self.residual_chroma_reg = 5e-4
-        self.noise_residual_reg = 1.0
-        self.artifact_residual_reg = 0.35
-        self.noise_zero_mean_reg = 0.05
-        self.noise_highfreq_reg = 0.05
-        self.noise_dark_weight_reg = 0.05
-        self.artifact_highlight_reg = 0.25
-        self.reflectance_detail_reg = 1e-6
-        self.reflectance_decoder_reg = 2e-5
-        self.enhancement_reflectance_reg = 0.06
-        self.enhancement_degree_reg = 0.2
-        self.enhancement_degree_global_reg = 0.05
-        self.enhancement_smooth_reg = 4e-4
-        self.enhancement_gain_smooth_reg = 0.0
-        self.enhancement_edge_preserve_reg = 0.0
-        self.enhancement_guidance_final_weight = 0.3
-        self.enhancement_guidance_ramp_iters = 0
-        self.illumination_smooth_reg = 1e-4
-        self.warmup_illumination_smooth_reg = 5e-5
-        self.illumination_smooth_kernel_size = 5
-        self.warmup_illumination_smooth_kernel_size = 9
-        self.enhancement_diff_start_iter = 2500
-        self.enhancement_color_reg = 0.06
-        self.enhancement_color_std_reg = 0.02
-        self.enhancement_green_bias_reg = 0.05
-        self.enhancement_prior = "cidnet"
-        self.wandb_monitor_camera = "1"
-        self.wandb_monitor_split = "test"
-        self.wandb_monitor_interval = 600
-        self.cidnet_conda_env = "CIDNet"
-        self.cidnet_root = "./submodules/HVI-CIDNet"
-        self.cidnet_weights = "./submodules/HVI-CIDNet/weights/LOLv2_real/w_perc.pth"
-        self.cidnet_refresh_interval = 2000
-        self.cidnet_mlp_steps = 100
-        self.cidnet_target_exposure = 0.5
-        self.cidnet_refresh_reg = 0.5
-        self.cidnet_color_reg = 0.2
-        self.cidnet_param_reg = 0.1
-        self.cidnet_mv_reg = 0.5
-        self.cidnet_gamma_init = 1.6
-        self.cidnet_alpha_init = 1.6
-        self.cidnet_force_refresh = False
-        self.residual_hardmask_percentile = 0.8
-        self.residual_higherror_percentile = 0.8
-        self.residual_highlight_percentile = 0.9
-        self.b0_spatial_smooth_reg = 0.0
-        self.prune_ratio = 0.05
+        # Scaffold anchor initialization only.  ``prune_ratio=1`` keeps the
+        # complete input point cloud; smaller values enable the baseline's
+        # distance-aware stochastic pruning controlled by ``beta``.
+        self.prune_ratio = 1.0
         self.beta = 1.0
+        self.enhancement_prior_path = ""
+        self.depth_prior_path = ""
+        self.enhancement_prior_backend = "cidnet"
+        self.cidnet_root = "submodules/HVI-CIDNet"
+        self.cidnet_weights = "submodules/HVI-CIDNet/weights/LOLv2_real/w_perc.pth"
+        self.stablesr_root = "submodules/StableSR"
+        self.stablesr_python = ""
+        self.stablesr_config = "configs/stableSRNew/v2-finetune_text_T_512.yaml"
+        self.stablesr_checkpoint = "checkpoints/stablesr_turbo.ckpt"
+        self.stablesr_vqgan_checkpoint = "checkpoints/vqgan_cfw_00011.ckpt"
+        # StableSR illumination is explicit and reproducible. It is never
+        # inferred from image brightness through a hidden 0.45/mean rule.
+        self.stablesr_input_gain = 15.0
+        self.depth_anything_root = "submodules/Depth-Anything-V2"
+        self.depth_anything_encoder = "vitl"
+        self.depth_anything_checkpoint = "checkpoints/depth_anything_v2_vitl.pth"
+        self.depth_anything_input_size = 518
         
         
         super().__init__(parser, "Loading Parameters", sentinel)
@@ -197,29 +147,13 @@ class OptimizationParams(ParamGroup):
         self.mlp_cov_lr_delay_mult = 0.01
         self.mlp_cov_lr_max_steps = 30_000
 
-        self.mlp_color_lr_init = 0.008 
-        self.mlp_color_lr_final = 0.00005  
-        self.mlp_color_lr_delay_mult = 0.01
-        self.mlp_color_lr_max_steps = 30_000
-
-
-        self.mlp_enhance_lr_init = 0.04
-        self.mlp_enhance_lr_final = 0.00025
-
-        # self.mlp_color_lr_init = 0.08
-        # self.mlp_color_lr_final = 0.0005
-        # self.mlp_color_lr_delay_mult = 0.01
-        # self.mlp_color_lr_max_steps = 30_000
+        self.explicit_appearance_lr_init = 0.008
+        self.explicit_appearance_lr_final = 0.00005
         
         self.mlp_featurebank_lr_init = 0.01
         self.mlp_featurebank_lr_final = 0.00001
         self.mlp_featurebank_lr_delay_mult = 0.01
         self.mlp_featurebank_lr_max_steps = 30_000
-
-        self.appearance_lr_init = 0.05
-        self.appearance_lr_final = 0.005
-        self.appearance_lr_delay_mult = 0.01    
-        self.appearance_lr_max_steps = 30_000
 
         self.pose_lr_init = 0.00002
         self.pose_lr_final = 0.0000002
@@ -228,21 +162,24 @@ class OptimizationParams(ParamGroup):
         self.pose_lr_delay_mult = 0.01
         self.pose_lr_max_steps = 30_000
 
-        self.percent_dense = 0.01
-        self.lambda_dssim = 0.3
-        self.b0_lr = 0.001
-        self.reflectance_offset_lr = 0.008
-        self.reflectance_decoder_lr = 0.002
+        self.lambda_dssim = 0.2
+        self.lambda_scaling = 0.01
+        self.lambda_reflectance_reconstruction = 1.0
+        self.lambda_illumination = 1.0
+        self.lambda_enhanced = 1.0
+        self.lambda_depth = 1.0
         
         # for anchor densification
         self.start_stat = 500
-        self.update_from = 1500
+        self.update_from = 2_000
         self.update_interval = 100
         self.update_until = 15_000
         # Warmup starts from the complete input point cloud.  Its separate,
         # small densification budget improves coverage without compounding the
         # main-stage anchor growth.
         self.warmup_start_stat = 200
+        self.warmup_iterations = 2_000
+        self.warmup_geometry_lr_scale = 0.1
         self.warmup_update_from = 1_200
         self.warmup_update_until = 1_900
         self.warmup_update_interval = 200
@@ -252,17 +189,12 @@ class OptimizationParams(ParamGroup):
         self.warmup_success_threshold = 0.8
         # Keep anchor growth bounded and reproducible.  These values are
         # intentionally conservative for the short 8k training schedule.
-        self.max_anchors = 60_000
-        self.max_new_anchors_per_update = 512
-        self.densify_level_caps = "256,160,96"
-        self.anchor_prune_grace_iters = 500
+        self.max_anchors = 30_000
+        self.max_new_anchors_per_update = 256
+        self.densify_level_caps = "128,80,48"
+        self.anchor_prune_grace_iters = 1_200
         self.prune_from_iter = 0
         self.max_pruned_anchors_per_update = 0
-        self.enhancement_grad_clip = 0.0
-        self.enhancement_from = 10_000
-        self.residual_start_iter = 3_000
-        self.residual_ramp_iters = 2_500
-        
         self.min_opacity = 0.005
         self.success_threshold = 0.8
         self.densify_grad_threshold = 0.0002 
@@ -270,129 +202,128 @@ class OptimizationParams(ParamGroup):
         super().__init__(parser, "Optimization Parameters")
 
 
-def _backfill_model_compatibility(merged_dict):
-    """Fill newly introduced model arguments and map legacy names."""
-    legacy_to_new = {
-        "num_sg": "sg_lobes",
-        "use_sg": "use_sg_illumination",
-    }
-    for legacy_key, new_key in legacy_to_new.items():
-        if new_key not in merged_dict and legacy_key in merged_dict:
-            merged_dict[new_key] = merged_dict[legacy_key]
+def _has_adjust_event(
+    stage_start: int,
+    start_stat: int,
+    update_from: int,
+    update_until: int,
+    update_interval: int,
+    iterations: int,
+) -> bool:
+    """Return whether a stage can reach an anchor-adjustment iteration."""
+    if update_interval <= 0:
+        raise ValueError("Scaffold update intervals must be positive")
+    first_candidate = max(stage_start, start_stat + 1, update_from + 1)
+    last_candidate = min(iterations, update_until - 1)
+    first_event = (
+        (first_candidate + update_interval - 1) // update_interval
+    ) * update_interval
+    return first_event <= last_candidate
 
-    defaults = {
-        "use_sg_illumination": True,
-        "use_asg_illumination": True,
-        "illumination_mode": "asg",
-        "reflectance_mode": "explicit",
-        "use_dual_transient": False,
-        "sg_lobes": 4,
-        "sg_lambda_min": 1.0,
-        "sg_energy_reg": 1e-4,
-        "sg_smooth_reg": 5e-5,
-        "asg_lobes": 1,
-        "asg_lambda_min": 1.0,
-        "asg_energy_reg": 1e-4,
-        "asg_sharpness_reg": 5e-5,
-        "asg_anisotropy_reg": 1e-5,
-        "reflectance_consistency_reg": 2e-5,
-        "reflectance_smooth_reg": 0.0,
-        "reflectance_edge_reg": 2e-4,
-        "reflectance_edge_uplift_reg": 3e-3,
-        "reflectance_contrast_reg": 2e-3,
-        "reflectance_highfreq_reg": 3e-3,
-        "highlight_reflectance_reg": 1e-3,
-        "residual_chroma_reg": 5e-4,
-        "noise_residual_reg": 1.0,
-        "artifact_residual_reg": 0.35,
-        "noise_zero_mean_reg": 0.05,
-        "noise_highfreq_reg": 0.05,
-        "noise_dark_weight_reg": 0.05,
-        "artifact_highlight_reg": 0.25,
-        "reflectance_detail_reg": 1e-6,
-        "reflectance_decoder_reg": 2e-5,
-        "enhancement_reflectance_reg": 0.06,
-        "enhancement_degree_reg": 0.2,
-        "enhancement_degree_global_reg": 0.05,
-        "enhancement_smooth_reg": 4e-4,
-        "enhancement_gain_smooth_reg": 0.0,
-        "enhancement_edge_preserve_reg": 0.0,
-        "enhancement_guidance_final_weight": 0.3,
-        "enhancement_guidance_ramp_iters": 0,
-        "illumination_smooth_reg": 1e-4,
-        "warmup_illumination_smooth_reg": 5e-5,
-        "illumination_smooth_kernel_size": 5,
-        "warmup_illumination_smooth_kernel_size": 9,
-        "enhancement_diff_start_iter": 2500,
-        "enhancement_color_reg": 0.06,
-        "enhancement_color_std_reg": 0.02,
-        "enhancement_green_bias_reg": 0.05,
-        "enhancement_prior": "cidnet",
-        "wandb_monitor_camera": "1",
-        "wandb_monitor_split": "test",
-        "wandb_monitor_interval": 600,
-        "cidnet_conda_env": "CIDNet",
-        "cidnet_root": "./submodules/HVI-CIDNet",
-        "cidnet_weights": "./submodules/HVI-CIDNet/weights/LOLv2_real/w_perc.pth",
-        "cidnet_refresh_interval": 2000,
-        "cidnet_mlp_steps": 100,
-        "cidnet_target_exposure": 0.5,
-        "cidnet_refresh_reg": 0.5,
-        "cidnet_color_reg": 0.2,
-        "cidnet_param_reg": 0.1,
-        "cidnet_mv_reg": 0.5,
-        "cidnet_gamma_init": 1.6,
-        "cidnet_alpha_init": 1.6,
-        "cidnet_force_refresh": False,
-        "b0_lr": 0.001,
-        "reflectance_offset_lr": 0.008,
-        "reflectance_decoder_lr": 0.002,
-        "residual_hardmask_percentile": 0.8,
-        "residual_higherror_percentile": 0.8,
-        "residual_highlight_percentile": 0.9,
-        "b0_spatial_smooth_reg": 0.0,
-        "residual_start_iter": 3_000,
-        "residual_ramp_iters": 2_500,
-        "max_anchors": 60_000,
-        "max_new_anchors_per_update": 512,
-        "densify_level_caps": "256,160,96",
-        "anchor_prune_grace_iters": 500,
-        "prune_from_iter": 0,
-        "max_pruned_anchors_per_update": 0,
-        "enhancement_grad_clip": 0.0,
-        "warmup_start_stat": 200,
-        "warmup_update_from": 1_200,
-        "warmup_update_until": 1_900,
-        "warmup_update_interval": 200,
-        "warmup_max_new_anchors": 128,
-        "warmup_level_caps": "64,40,24",
-        "warmup_densify_grad_threshold": 0.00025,
-        "warmup_success_threshold": 0.8,
-    }
-    for key, value in defaults.items():
-        merged_dict.setdefault(key, value)
 
-    return merged_dict
+def _growth_budget_enabled(max_new_anchors: int, level_caps) -> bool:
+    if max_new_anchors <= 0:
+        return False
+    if isinstance(level_caps, str):
+        level_caps = [int(value) for value in level_caps.split(",") if value.strip()]
+    return not level_caps or any(int(value) > 0 for value in level_caps)
+
+
+def validate_training_schedule(args) -> None:
+    """Reject active anchor growth that reaches the end without refinement."""
+    errors = []
+    warmup_enabled = bool(getattr(args, "warmup", False))
+    # Both stages use their own local 1..N counter even though checkpoints
+    # retain a monotonic global iteration.
+    main_stage_start = 1
+    main_adjust_event = _has_adjust_event(
+        main_stage_start,
+        args.start_stat,
+        args.update_from,
+        args.update_until,
+        args.update_interval,
+        args.iterations,
+    )
+    main_growth_event = main_adjust_event and _growth_budget_enabled(
+        args.max_new_anchors_per_update,
+        args.densify_level_caps,
+    )
+    if main_growth_event and args.update_until >= args.iterations:
+        errors.append(
+            f"update_until ({args.update_until}) must be smaller than iterations "
+            f"({args.iterations}) so inherited appearance has a refinement tail"
+        )
+
+    if args.max_pruned_anchors_per_update > 0:
+        pruning_event = _has_adjust_event(
+            max(1, args.prune_from_iter),
+            args.start_stat,
+            args.update_from,
+            args.update_until,
+            args.update_interval,
+            args.iterations,
+        )
+        if not main_adjust_event or not pruning_event:
+            errors.append(
+                "training-time pruning is enabled but no main-stage anchor "
+                "adjustment can occur at or after prune_from_iter "
+                f"({args.prune_from_iter}); require prune_from_iter < "
+                f"min(update_until, iterations) and a matching update interval"
+            )
+
+    if warmup_enabled:
+        warmup_growth_event = _has_adjust_event(
+            1,
+            args.warmup_start_stat,
+            args.warmup_update_from,
+            args.warmup_update_until,
+            args.warmup_update_interval,
+            args.warmup_iterations,
+        ) and _growth_budget_enabled(
+            args.warmup_max_new_anchors,
+            args.warmup_level_caps,
+        )
+        if warmup_growth_event and args.warmup_update_until >= args.warmup_iterations:
+            errors.append(
+                f"warmup_update_until ({args.warmup_update_until}) must be smaller "
+                f"than warmup_iterations ({args.warmup_iterations}) so warmup growth has a "
+                "refinement tail"
+            )
+    if errors:
+        raise ValueError("Invalid Scaffold densification schedule:\n- " + "\n- ".join(errors))
+
 
 def get_combined_args(parser : ArgumentParser):
     cmdlne_string = sys.argv[1:]
     cfgfile_string = "Namespace()"
     args_cmdline = parser.parse_args(cmdlne_string)
 
+    config_loaded = False
     try:
         cfgfilepath = os.path.join(args_cmdline.model_path, "cfg_args")
         print("Looking for config file in", cfgfilepath)
         with open(cfgfilepath) as cfg_file:
             print("Config file found: {}".format(cfgfilepath))
             cfgfile_string = cfg_file.read()
-    except TypeError:
+            config_loaded = True
+    except (TypeError, FileNotFoundError):
         print("Config file not found at")
-        pass
     args_cfgfile = eval(cfgfile_string)
+    cfg_dict = vars(args_cfgfile).copy()
+    if config_loaded and cfg_dict.get("model_format_version") != MODEL_FORMAT_VERSION:
+        raise RuntimeError(
+            "This configuration predates MODEL_FORMAT_VERSION=2 and cannot be loaded. "
+            "A command-line value cannot upgrade an old cfg_args file."
+        )
 
-    merged_dict = vars(args_cfgfile).copy()
+    merged_dict = cfg_dict
     for k,v in vars(args_cmdline).items():
         if v != None:
             merged_dict[k] = v
-    merged_dict = _backfill_model_compatibility(merged_dict)
+    version = merged_dict.get("model_format_version")
+    if merged_dict and version != MODEL_FORMAT_VERSION:
+        raise RuntimeError(
+            "This configuration predates MODEL_FORMAT_VERSION=2 and cannot be loaded. "
+            "Start a new explicit-appearance experiment."
+        )
     return Namespace(**merged_dict)

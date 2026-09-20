@@ -4,8 +4,6 @@ import torch
 import torch.nn.functional as F
 from typing import Tuple
 from .stepfun import sample_np, sample
-import scipy
-from scipy.spatial.transform import Rotation as R
 
 
 def quad2rotation(q):
@@ -83,6 +81,12 @@ def get_camera_from_tensor(inputs):
     w2c[:3, :3] = quad2rotation(quad)
     w2c[:3, 3] = T
     return w2c
+
+
+def get_camera_center_from_tensor(inputs):
+    """Return the differentiable world-space center of a world-to-camera pose."""
+    world_to_camera = get_camera_from_tensor(inputs)
+    return torch.linalg.inv(world_to_camera)[:3, 3]
 
 def quadmultiply(q1, q2):
     """
@@ -208,7 +212,6 @@ def slerp(quat1, quat2, w):
     # 返回插值结果
     return s1.unsqueeze(-1) * quat1 + s2.unsqueeze(-1) * quat2
 
-from scipy.spatial.transform import Rotation as R
 def get_tensor_from_camera_1(cam_pose):
     """
     cam_pose: [7] tensor/list = [quat (x, y, z, w), trans (x, y, z)]
@@ -218,7 +221,9 @@ def get_tensor_from_camera_1(cam_pose):
         cam_pose = cam_pose.detach().cpu().numpy() 
     quat = cam_pose[:4]
     trans = cam_pose[4:7]
-    R_c2w = R.from_quat(quat).as_matrix()
+    from scipy.spatial.transform import Rotation
+
+    R_c2w = Rotation.from_quat(quat).as_matrix()
     
     return np.array(trans), R_c2w
 
@@ -496,6 +501,8 @@ def generate_interpolated_path(
     Array of new camera poses with shape (n_interp * (n - 1), 3, 4), or
     (n_interp, 3, 4) if n_interp_as_total is set.
   """
+  from scipy import interpolate as scipy_interpolate
+
   poses = []
   for view in views:
     tmp_view = np.eye(4)
@@ -563,8 +570,8 @@ def generate_interpolated_path(
     sh = points.shape
     pts = np.reshape(points, (sh[0], -1))
     k = min(k, sh[0] - 1)
-    tck, u_keyframes = scipy.interpolate.splprep(pts.T, k=k, s=s, per=periodic)
-    new_points = np.array(scipy.interpolate.splev(u, tck))
+    tck, u_keyframes = scipy_interpolate.splprep(pts.T, k=k, s=s, per=periodic)
+    new_points = np.array(scipy_interpolate.splev(u, tck))
     new_points = np.reshape(new_points.T, (len(u), sh[1], sh[2]))
     return new_points, u_keyframes
 

@@ -1,1140 +1,339 @@
-#
-# Copyright (C) 2023, Inria
-# GRAPHDECO research group, https://team.inria.fr/graphdeco
-# All rights reserved.
-#
-# This software is free for non-commercial, research and evaluation use 
-# under the terms of the LICENSE.md file.
-#
-# For inquiries contact  george.drettakis@inria.fr
-#
-import torch
-from einops import rearrange, repeat
+"""Scaffold-GS rendering with explicit Gaussian-space R/L composition."""
+
+from __future__ import annotations
 
 import math
 import time
+
+import torch
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
-from diff_gaussian_rasterization_residual import GaussianRasterizationSettings_Residual, GaussianRasterizer_Residual
-from diff_gaussian_rasterization_fast import GaussianRasterizationSettings_Fast, GaussianRasterizer_Fast
+from einops import repeat
+
 from scene.gaussian_model import GaussianModel
-from utils.pose_utils import get_camera_from_tensor, quadmultiply
-from utils.sg_utils import evaluate_anisotropic_spherical_gaussians, evaluate_spherical_gaussians
+from utils.model_format import NUMERICAL_EPS
+from utils.pose_utils import (
+    get_camera_center_from_tensor,
+    get_camera_from_tensor,
+    get_tensor_from_camera,
+    quadmultiply,
+)
 
 
-def _compute_illumination(feat, ob_view, ob_dist, cat_with_dist, cat_without_dist, pc: GaussianModel, visible_mask):
-    if pc.illumination_mode == "asg" and pc.use_asg_illumination and pc.asg_illumination_available:
-        illumination, illumination_feat, illumination_stats = evaluate_anisotropic_spherical_gaussians(
-            pc._illum_asg_axis[visible_mask],
-            pc._illum_asg_tangent[visible_mask],
-            pc._illum_asg_sharpness[visible_mask],
-            pc._illum_asg_amplitude[visible_mask],
-            pc._illum_asg_bias[visible_mask],
-            pc._illum_asg_dist_weight[visible_mask],
-            ob_view,
-            ob_dist,
-            pc.asg_lambda_min,
-            use_distance=pc.add_illumination_dist,
-        )
-        return illumination, illumination_feat, illumination_stats
-
-    if pc.illumination_mode == "sg" and pc.use_sg_illumination and pc.sg_illumination_available:
-        sg_input = cat_with_dist if pc.add_illumination_dist else cat_without_dist
-        sg_raw = pc.get_sg_illumination_mlp(sg_input)
-        illumination, sg_stats = evaluate_spherical_gaussians(
-            sg_raw,
-            ob_view,
-            pc.n_offsets,
-            pc.sg_lobes,
-            pc.sg_lambda_min,
-        )
-        illumination_feat = illumination.view(feat.shape[0], pc.n_offsets)
-        return illumination, illumination_feat, sg_stats
-
-    if pc.illumination_mode not in {"mlp", "legacy"}:
-        raise RuntimeError("A valid illumination mode is required for the active decomposition mode.")
-
-    if pc.add_illumination_dist:
-        illumination_feat = pc.get_illumination_mlp(cat_with_dist)
-    else:
-        illumination_feat = pc.get_illumination_mlp(cat_without_dist)
-    illumination = torch.nn.Sigmoid()(illumination_feat)
-    illumination = illumination.reshape([feat.shape[0] * pc.n_offsets, 1])
-    return illumination, illumination_feat, None
-
-
-
-
-def generate_neural_gaussians(viewpoint_camera, pc : GaussianModel, visible_mask=None, is_training=False):
-    ## view frustum filtering for acceleration    
+def generate_neural_gaussians(
+    viewpoint_camera,
+    pc: GaussianModel,
+    visible_mask=None,
+    effective_camera_center=None,
+):
+    """Generate Scaffold neural Gaussians and query one explicit appearance API."""
     if visible_mask is None:
-        visible_mask = torch.ones(pc.get_anchor.shape[0], dtype=torch.bool, device = pc.get_anchor.device)
-    
+        visible_mask = torch.ones(pc.get_anchor.shape[0], dtype=torch.bool, device=pc.get_anchor.device)
     feat = pc._anchor_feat[visible_mask]
     anchor = pc.get_anchor[visible_mask]
     grid_offsets = pc._offset[visible_mask]
     grid_scaling = pc.get_scaling[visible_mask]
 
-
-    if pc.use_residual:
-        anchor_residual = pc.get_anchor[visible_mask]
-        anchor_feat_residual = pc._anchor_feat_residual[visible_mask]
-        grid_offsets_residual = pc._offset_residual[visible_mask]
-        grid_scaling_residual = pc.get_scaling_residual[visible_mask]
-    ## get view properties for anchor
-    ob_view = anchor - viewpoint_camera.camera_center
-    # dist
-    ob_dist = ob_view.norm(dim=1, keepdim=True)
-    # view
-    ob_view = ob_view / ob_dist
-    ## view-adaptive feature
+    camera_center = (
+        viewpoint_camera.camera_center
+        if effective_camera_center is None
+        else effective_camera_center
+    )
+    view_dirs = anchor - camera_center
+    view_distance = view_dirs.norm(dim=1, keepdim=True).clamp_min(NUMERICAL_EPS)
+    view_dirs = view_dirs / view_distance
     if pc.use_feat_bank:
-        cat_view = torch.cat([ob_view, ob_dist], dim=1)
-        bank_weight = pc.get_featurebank_mlp(cat_view).unsqueeze(dim=1) # [n, 1, 3]
-        ## multi-resolution feat
-        feat = feat.unsqueeze(dim=-1)
-        feat = feat[:,::4, :1].repeat([1,4,1])*bank_weight[:,:,:1] + \
-            feat[:,::2, :1].repeat([1,2,1])*bank_weight[:,:,1:2] + \
-            feat[:,::1, :1]*bank_weight[:,:,2:]
-        feat = feat.squeeze(dim=-1) # [n, c]
+        bank_weight = pc.get_featurebank_mlp(torch.cat([view_dirs, view_distance], dim=1)).unsqueeze(1)
+        bank_feat = feat.unsqueeze(-1)
+        feat = (
+            bank_feat[:, ::4, :1].repeat(1, 4, 1) * bank_weight[:, :, :1]
+            + bank_feat[:, ::2, :1].repeat(1, 2, 1) * bank_weight[:, :, 1:2]
+            + bank_feat * bank_weight[:, :, 2:]
+        ).squeeze(-1)
 
-    cat_local_view = torch.cat([feat, ob_view, ob_dist], dim=1) # [N, c+3+1]
-    cat_local_view_wodist = torch.cat([feat, ob_view], dim=1) # [N, c+3]
-    reflectance_base = None
-    reflectance_aux_base = None
-    if pc.reflectance_mode == "explicit":
-        if is_training:
-            reflectance_aux_base = pc.get_reflectance_with_decoder(
-                feat.detach(),
-                grid_offsets.detach(),
-                visible_mask,
-            )
-        # Keep the regular decoder statistic attached to the unchanged main path.
-        reflectance_base = pc.get_reflectance_with_decoder(feat, grid_offsets, visible_mask)
-
-    ## for illumination
-    cat_local_view_illumination = torch.cat([feat[:, pc.feat_dim//2:], ob_view, ob_dist], dim=1) # [N, c+3+1]
-    cat_local_view_illumination_wodist = torch.cat([feat[:, pc.feat_dim//2:], ob_view], dim=1) # [N, c+3]
-
-
-
-    if pc.use_residual:
-        cat_local_view_residual = torch.cat([anchor_feat_residual, ob_view, ob_dist], dim=1) # [N, c+3+1]
-        cat_local_view_wodist_residual = torch.cat([anchor_feat_residual, ob_view], dim=1) # [N, c+3]
-        if pc.appearance_residual_dim > 0:
-            camera_indicies = torch.ones_like(cat_local_view_residual[:,0], dtype=torch.long, device=ob_dist.device) * viewpoint_camera.uid
-            # camera_indicies = torch.ones_like(cat_local_view[:,0], dtype=torch.long, device=ob_dist.device) * 10
-            appearance_residual = pc.get_appearance_residual(camera_indicies)
-    # get offset's opacity
-    if pc.add_opacity_dist: 
-        neural_opacity = pc.get_opacity_mlp(cat_local_view) # [N, k]
-    else:
-        neural_opacity = pc.get_opacity_mlp(cat_local_view_wodist)
-    if pc.use_residual:
-        if pc.add_opacity_dist:
-            neural_opacity_residual = pc.get_opacity_residual_mlp(cat_local_view_residual)
-        else:
-            neural_opacity_residual = pc.get_opacity_residual_mlp(cat_local_view_wodist_residual)
-        # neural_opacity_residual = torch.ones_like(neural_opacity_residual) * 0.005
-        neural_opacity_residual = neural_opacity_residual.reshape([-1, 1]) 
-        mask_residual = (neural_opacity_residual>0.0)
-        mask_residual = mask_residual.view(-1)
-        opacity_residual = neural_opacity_residual[mask_residual]
-
-    # opacity mask generation
-    neural_opacity = neural_opacity.reshape([-1, 1])
+    local_without_distance = torch.cat([feat, view_dirs], dim=1)
+    local_with_distance = torch.cat([local_without_distance, view_distance], dim=1)
+    opacity_input = local_with_distance if pc.add_opacity_dist else local_without_distance
+    neural_opacity = pc.get_opacity_mlp(opacity_input).reshape(-1, 1)
     if pc.use_3D_filter:
         neural_opacity = pc.get_opacity_with_3D_filter(neural_opacity, visible_mask)
         grid_scaling = pc.get_scaling_with_3D_filter(grid_scaling, visible_mask)
-    mask = (neural_opacity>0.0)
-    mask = mask.view(-1)
+    selection_mask = neural_opacity.reshape(-1) > 0.0
+    opacity = neural_opacity[selection_mask]
 
-    # select opacity 
-    opacity = neural_opacity[mask]
-
-
-    # get offset's illumination
-    # if pc.appearance_residual_dim > 0:
-    #     # noise = pc.get_noise_net(torch.cat([cat_local_view, appearance], dim=1))
-    #     if pc.add_illumination_dist:
-    #         illumination = pc.get_illumination_mlp(torch.cat([cat_local_view_illumination, appearance], dim=1))
-    #     else:
-    #         illumination = pc.get_illumination_mlp(torch.cat([cat_local_view_illumination_wodist, appearance], dim=1))
-
-    # else:
-        # noise = pc.get_noise_net(cat_local_view)
-    illumination, illumination_feat, sg_stats = _compute_illumination(
-        feat,
-        ob_view,
-        ob_dist,
-        cat_local_view_illumination,
-        cat_local_view_illumination_wodist,
-        pc,
+    # Appearance directions are observations, not a geometry-optimization
+    # path. Geometry remains fully supervised by the main rasterization and
+    # Scaffold opacity/covariance heads, while TV/enhanced losses cannot leak
+    # into anchor positions through the directional lobes.
+    appearance = pc.evaluate_appearance(
+        view_dirs.detach(),
         visible_mask,
     )
-    illumination_enhanced = pc.get_enhanced_illumination(
-        feat,
-        illumination_feat,
-        ob_view,
-        visible_mask,
+    reflectance = appearance.reflectance.reshape(-1, 3)
+    illumination = appearance.illumination.reshape(-1, 1)
+    enhanced_color = appearance.enhanced_color.reshape(-1, 3)
+    illumination_enhanced = appearance.illumination_enhanced.reshape(-1, 3)
+
+    covariance_input = local_with_distance if pc.add_cov_dist else local_without_distance
+    scale_rotation = pc.get_cov_mlp(covariance_input).reshape(-1, 7)
+    offsets = grid_offsets.reshape(-1, 3)
+    repeated = repeat(torch.cat([grid_scaling, anchor], dim=-1), "n c -> (n k) c", k=pc.n_offsets)
+    packed = torch.cat(
+        [
+            repeated,
+            reflectance,
+            illumination,
+            enhanced_color,
+            illumination_enhanced,
+            scale_rotation,
+            offsets,
+        ],
+        dim=-1,
+    )[selection_mask]
+    scaling_repeat, repeated_anchor, reflectance, illumination, enhanced_color, illumination_enhanced, scale_rotation, offsets = packed.split(
+        [6, 3, 3, 1, 3, 3, 7, 3],
+        dim=-1,
     )
-    if pc.use_residual and pc.appearance_residual_dim>0:
-        if pc.add_residual_dist:
-            residual_input = torch.cat([cat_local_view_residual, appearance_residual], dim=1)
-        else:
-            residual_input = torch.cat([cat_local_view_wodist_residual, appearance_residual], dim=1)
-        color_artifact = pc.get_artifact_net(residual_input).reshape([anchor.shape[0]*pc.n_offsets_residual, 3])
-        if pc.use_dual_transient:
-            color_noise = pc.get_noise_net(residual_input).reshape([anchor.shape[0]*pc.n_offsets_residual, 3])
-        else:
-            color_noise = torch.zeros_like(color_artifact)
-    elif pc.use_residual:
-        residual_input = cat_local_view_residual if pc.add_residual_dist else cat_local_view_wodist_residual
-        color_artifact = pc.get_artifact_net(residual_input).reshape([anchor.shape[0]*pc.n_offsets_residual, 3])
-        if pc.use_dual_transient:
-            color_noise = pc.get_noise_net(residual_input).reshape([anchor.shape[0]*pc.n_offsets_residual, 3])
-        else:
-            color_noise = torch.zeros_like(color_artifact)
-    if pc.reflectance_mode == "mlp":
-        cat_local_view_woview = torch.cat([feat, ob_dist], dim=1) # [N, c+1]
-        cat_local_view_woview_wodist = torch.cat([feat], dim=1) # [N, c]
-        if pc.add_reflectance_dist:
-            reflectance = pc.mlp_reflectance(cat_local_view_woview)
-            if is_training:
-                reflectance_aux = pc.mlp_reflectance(
-                    torch.cat([feat.detach(), ob_dist.detach()], dim=1)
-                )
-        else:
-            reflectance = pc.mlp_reflectance(cat_local_view_woview_wodist)
-            if is_training:
-                reflectance_aux = pc.mlp_reflectance(feat.detach())
-    else:
-        reflectance = rearrange(reflectance_base, 'n k c -> (n k) c')
-        if is_training:
-            reflectance_aux = rearrange(reflectance_aux_base, 'n k c -> (n k) c')
+    scaling = scaling_repeat[:, 3:] * torch.sigmoid(scale_rotation[:, :3])
+    rotation = pc.rotation_activation(scale_rotation[:, 3:7])
+    xyz = repeated_anchor + offsets * scaling_repeat[:, :3]
+    return {
+        "xyz": xyz,
+        "reflectance": reflectance,
+        "illumination": illumination,
+        "enhanced_color": enhanced_color,
+        "illumination_enhanced": illumination_enhanced,
+        "opacity": opacity,
+        "scaling": scaling,
+        "rotation": rotation,
+        "neural_opacity": neural_opacity,
+        "selection_mask": selection_mask,
+    }
 
-    # color = illumination.repeat(1, 1, 3) * reflectance
-    # color = color.reshape([anchor.shape[0]*pc.n_offsets, 3])# [mask] 
-    illumination = illumination.reshape([anchor.shape[0]*pc.n_offsets, 1]) # [mask]
-    reflectance = reflectance.reshape([anchor.shape[0]*pc.n_offsets, 3]) # [mask]
-    if is_training:
-        reflectance_aux = reflectance_aux.reshape([anchor.shape[0]*pc.n_offsets, 3])
-    illumination_enhanced = illumination_enhanced.reshape([anchor.shape[0]*pc.n_offsets, 3])
 
-    
+def _camera_pose(viewpoint_camera, camera_pose):
+    if camera_pose is not None:
+        return camera_pose
+    return get_tensor_from_camera(viewpoint_camera.world_view_transform.transpose(0, 1))
 
-    # get offset's cov
-    if pc.add_cov_dist:
-        scale_rot = pc.get_cov_mlp(cat_local_view)
-        if pc.use_residual:
-            scale_rot_residual = pc.get_cov_residual_mlp(cat_local_view_residual)
-            scale_rot_residual = scale_rot_residual.reshape([anchor.shape[0]*pc.n_offsets_residual, 7]) # [mask]
-    else:
-        scale_rot = pc.get_cov_mlp(cat_local_view_wodist)
-        if pc.use_residual:
-            scale_rot_residual = pc.get_cov_residual_mlp(cat_local_view_wodist_residual)
-            scale_rot_residual = scale_rot_residual.reshape([anchor.shape[0]*pc.n_offsets_residual, 7]) # [mask]
-    scale_rot = scale_rot.reshape([anchor.shape[0]*pc.n_offsets, 7]) # [mask]
-    
-    # offsets
-    offsets = grid_offsets.view([-1, 3]) # [mask]
-    if pc.use_residual:
-        offsets_residual = grid_offsets_residual.view([-1, 3]) # [mask]
-    
-    # combine for parallel masking
-    # concatenated = torch.cat([grid_scaling, anchor], dim=-1)
-    # concatenated_repeated = repeat(concatenated, 'n (c) -> (n k) (c)', k=pc.n_offsets)
-    # # concatenated_all = torch.cat([concatenated_repeated, color, scale_rot, offsets], dim=-1)
-    # masked = concatenated_all[mask]
-    # scaling_repeat, repeat_anchor, color, scale_rot, offsets = masked.split([6, 3, 3, 7, 3], dim=-1)
-    
-    # combine for parallel masking
-    concatenated = torch.cat([grid_scaling, anchor], dim=-1)
-    concatenated_repeated = repeat(concatenated, 'n (c) -> (n k) (c)', k=pc.n_offsets)
-    concatenated_all = torch.cat([concatenated_repeated, reflectance, illumination, illumination_enhanced, scale_rot, offsets], dim=-1)
-    masked = concatenated_all[mask]
 
-    scaling_repeat, repeat_anchor, reflectance, illumination, illumination_enhanced, scale_rot, offsets = masked.split([6, 3, 3, 1, 3, 7, 3], dim=-1)
-    if is_training:
-        reflectance_aux = reflectance_aux[mask]
-    
+def _raster_settings(viewpoint_camera, pipe, background, kernel_size, scaling_modifier):
+    identity = torch.eye(4, device=background.device, dtype=background.dtype)
+    projection = identity.unsqueeze(0).bmm(viewpoint_camera.projection_matrix.unsqueeze(0)).squeeze(0)
+    return GaussianRasterizationSettings(
+        image_height=int(viewpoint_camera.image_height),
+        image_width=int(viewpoint_camera.image_width),
+        tanfovx=math.tan(viewpoint_camera.FoVx * 0.5),
+        tanfovy=math.tan(viewpoint_camera.FoVy * 0.5),
+        kernel_size=kernel_size,
+        bg=background,
+        scale_modifier=scaling_modifier,
+        viewmatrix=identity,
+        projmatrix=projection,
+        sh_degree=1,
+        campos=identity.inverse()[3, :3],
+        prefiltered=False,
+        debug=pipe.debug,
+    )
 
-    if pc.use_residual:
-        concatenated_residual = torch.cat([grid_scaling_residual, anchor_residual], dim=-1)
-        concatenated_repeated_residual = repeat(concatenated_residual, 'n (c) -> (n k) (c)', k=pc.n_offsets_residual)
-        feat_repeated_residual = repeat(anchor_feat_residual, 'n (c) -> (n k) (c)', k=pc.n_offsets_residual)
-        concatenated_all_residual = torch.cat([concatenated_repeated_residual, color_noise, color_artifact, scale_rot_residual, offsets_residual, feat_repeated_residual], dim=-1)# [[6,3],3,3,7,3,32]
-        masked_residual = concatenated_all_residual[mask_residual]
-        scaling_repeat_residual, repeat_anchor_residual, color_noise, color_artifact, scale_rot_residual, offsets_residual, feat_repeated_residual = masked_residual.split([6, 3, 3, 3, 7, 3, anchor_feat_residual.shape[1]], dim=-1)
-        scaling_residual = scaling_repeat_residual[:, 3:] * torch.sigmoid(scale_rot_residual[:, :3])
-        rot_residual = pc.rotation_activation(scale_rot_residual[:, 3:7])
-        offsets_residual = offsets_residual * scaling_residual[:,:3]
-        xyz_residual = repeat_anchor_residual + offsets_residual
-        # try:
-        #     feat_downsampled_residual, _, _ = torch.pca_lowrank(torch.abs(feat_repeated_residual), q=3)
-        # except:
-        #     feat_downsampled_residual = torch.zeros(feat_repeated_residual.shape[0], 3, device=feat_repeated_residual.device)
-    else:
-        xyz_residual = None
-        scaling_residual = None
-        rot_residual = None
-        opacity_residual = None
-        mask_residual = None
-        color_noise = None
-        color_artifact = None
-    # post-process cov
-    scaling = scaling_repeat[:,3:] * torch.sigmoid(scale_rot[:,:3]) # * (1+torch.sigmoid(repeat_dist))
-    rot = pc.rotation_activation(scale_rot[:,3:7])
 
-    # post-process offsets to get centers for gaussians
-    offsets = offsets * scaling_repeat[:,:3]
-    xyz = repeat_anchor + offsets
+def _transform_gaussians(xyz, rotation, camera_pose):
+    relative = get_camera_from_tensor(camera_pose)
+    homogeneous = torch.cat([xyz, torch.ones_like(xyz[:, :1])], dim=1)
+    transformed_xyz = (relative @ homogeneous.T).T[:, :3]
+    transformed_rotation = quadmultiply(camera_pose[:4], rotation)
+    return transformed_xyz, transformed_rotation
 
-    # 方案1：使用更稳定的SVD方法
-    # U, S, V = torch.svd(feat_repeated)
-    # feat_selected_tmp = torch.matmul(U[:, :1], torch.diag(S[:1]))
-    # selected_channels = torch.randperm(feat_repeated.shape[1])[:2]
-    # feat_selected = torch.cat([feat_selected_tmp, feat_repeated[:, selected_channels]], dim=1)
-    # try:
-    #     feat_downsampled, _, _ = torch.pca_lowrank(torch.abs(feat_repeated), q=3)
-    # except:
-    #     feat_downsampled = torch.zeros(feat_repeated.shape[0], 3, device=feat_repeated.device)
 
-    # feat_selected = feat_repeated.detach()÷
-    # feat_downsampled = feat_repeated.detach()
-
-    if is_training:
-        return xyz, reflectance, reflectance_aux, illumination, illumination_enhanced, opacity, scaling, rot, neural_opacity, mask, xyz_residual, color_noise, color_artifact, scaling_residual, rot_residual, opacity_residual, sg_stats
-    else:
-        return xyz, reflectance, illumination, illumination_enhanced, opacity, scaling, rot, xyz_residual, color_noise, color_artifact, scaling_residual, rot_residual, opacity_residual, sg_stats
-
-def _profile_sync_time() -> float:
+def _profile_now(enabled):
+    if not enabled:
+        return None
     torch.cuda.synchronize()
     return time.perf_counter()
 
 
-def _profile_add(profile_timings: dict | None, key: str, value: float) -> None:
-    if profile_timings is not None:
-        profile_timings[key] = profile_timings.get(key, 0.0) + value
+def _normalize_by_coverage(
+    accumulated: torch.Tensor,
+    coverage: torch.Tensor,
+) -> torch.Tensor:
+    """Convert an alpha-premultiplied raster attribute to its covered mean."""
+    return accumulated / coverage.clamp_min(NUMERICAL_EPS)
 
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, kernel_size: float, scaling_modifier = 1.0, visible_mask=None, retain_grad=False, camera_pose=None, profile_timings=None, return_coverage=False):
-    """
-    Render the scene. 
-    
-    Background tensor (bg_color) must be on GPU!
-    """
-    is_training = pc.get_illumination_mlp.training
-    # is_enhancing = pc.render_enhancement
-    profile_start = _profile_sync_time() if profile_timings is not None else None
-    if is_training:
-        xyz, reflectance, reflectance_aux, illumination, illumination_enhanced, opacity, scaling, rot, neural_opacity, mask, xyz_residual, color_noise, color_artifact, scaling_residual, rot_residual, opacity_residual, sg_stats = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
-    else:
-        xyz, reflectance, illumination, illumination_enhanced, opacity, scaling, rot, xyz_residual, color_noise, color_artifact, scaling_residual, rot_residual, opacity_residual, sg_stats = generate_neural_gaussians(viewpoint_camera, pc, visible_mask, is_training=is_training)
-    if profile_timings is not None:
-        profile_after_generate = _profile_sync_time()
-        _profile_add(profile_timings, "generate_neural_gaussians_time", profile_after_generate - profile_start)
-    
-    # print("ill_shape:", illumination.shape)
-    # print("ref_shape:", reflectance.shape)
-
-    illumination = illumination.repeat(1, 3) # align illumination dimension with the reflectance
-
-    # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-    screenspace_points = torch.zeros_like(xyz, dtype=pc.get_anchor.dtype, requires_grad=True, device="cuda") + 0
-    if retain_grad:
-        try:
-            screenspace_points.retain_grad()
-        except:
-            pass
-
-    # xyz_dist = torch.norm(xyz - viewpoint_camera.camera_center, dim=-1, keepdim=True)
-    # xyz_dist = xyz_dist.repeat([1, 3])
-    # import pdb;pdb.set_trace()
-    # Set up rasterization configuration
-    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
-    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
-
-####
-    # Set camera pose as identity. Then, we will transform the Gaussians around camera_pose
-    w2c = torch.eye(4).cuda()
-    projmatrix = (
-        w2c.unsqueeze(0).bmm(viewpoint_camera.projection_matrix.unsqueeze(0))
-    ).squeeze(0)
-    camera_pos = w2c.inverse()[3, :3]
-####
-
-    raster_settings = GaussianRasterizationSettings(
-        image_height=int(viewpoint_camera.image_height),
-        image_width=int(viewpoint_camera.image_width),
-        tanfovx=tanfovx,
-        tanfovy=tanfovy,
-        kernel_size=kernel_size,
-        bg=bg_color,
-        scale_modifier=scaling_modifier,
-        # viewmatrix=viewpoint_camera.world_view_transform,
-        # projmatrix=viewpoint_camera.full_proj_transform,
-        viewmatrix=w2c,
-        projmatrix=projmatrix,
-        sh_degree=1,
-        # campos=viewpoint_camera.camera_center,
-        campos=camera_pos,
-        prefiltered=False,
-        debug=pipe.debug
+def render(
+    viewpoint_camera,
+    pc: GaussianModel,
+    pipe,
+    bg_color: torch.Tensor,
+    kernel_size: float,
+    scaling_modifier=1.0,
+    visible_mask=None,
+    retain_grad=False,
+    camera_pose=None,
+    profile_timings=None,
+):
+    """Render all stable v2 outputs with explicit gradient ownership."""
+    start = _profile_now(profile_timings is not None)
+    pose = _camera_pose(viewpoint_camera, camera_pose)
+    generated = generate_neural_gaussians(
+        viewpoint_camera,
+        pc,
+        visible_mask,
+        effective_camera_center=get_camera_center_from_tensor(pose),
     )
+    if profile_timings is not None:
+        after_generate = _profile_now(True)
+        profile_timings["generate_neural_gaussians_time"] = profile_timings.get(
+            "generate_neural_gaussians_time", 0.0
+        ) + after_generate - start
 
+    xyz = generated["xyz"]
+    rotation = generated["rotation"]
+    means3d, transformed_rotation = _transform_gaussians(xyz, rotation, pose)
+    means2d = torch.zeros_like(xyz, requires_grad=True)
+    if retain_grad:
+        means2d.retain_grad()
 
-    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
-    # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    
-    rel_w2c = get_camera_from_tensor(camera_pose)
-    # Transform mean and rot of Gaussians to camera frame
-    gaussians_xyz = xyz
-    gaussians_rot = rot
+    main_rasterizer = GaussianRasterizer(
+        raster_settings=_raster_settings(
+            viewpoint_camera,
+            pipe,
+            bg_color,
+            kernel_size,
+            scaling_modifier,
+        )
+    )
+    diagnostic_rasterizer = GaussianRasterizer(
+        raster_settings=_raster_settings(
+            viewpoint_camera,
+            pipe,
+            torch.zeros_like(bg_color),
+            kernel_size,
+            scaling_modifier,
+        )
+    )
+    raster_start = _profile_now(profile_timings is not None)
+    reflectance = generated["reflectance"]
+    illumination = generated["illumination"].expand(-1, 3)
+    enhanced_illumination = generated["illumination_enhanced"]
+    enhanced_color = generated["enhanced_color"]
+    opacity = generated["opacity"]
+    scaling = generated["scaling"]
 
-    xyz_ones = torch.ones(gaussians_xyz.shape[0], 1).cuda().float()
-    xyz_homo = torch.cat((gaussians_xyz, xyz_ones), dim=1)
-    gaussians_xyz_trans = (rel_w2c @ xyz_homo.T).T[:, :3]
-    gaussians_rot_trans = quadmultiply(camera_pose[:4], gaussians_rot)
-    means3D = gaussians_xyz_trans
-    means2D = screenspace_points
-
-
-    # input_concated = torch.cat([reflectance, illumination, feat_repeated.detach(), feat_downsampled.detach()], dim=1)
-
-
-    # rendered_image, radii, depth_map = rasterizer(
-    #     # means3D = xyz,
-    #     means3D = means3D,
-    #     # means2D = screenspace_points,
-    #     means2D = means2D,
-    #     shs = None,
-    #     colors_precomp = illumination * reflectance,
-    #     opacities = opacity,
-    #     scales = scaling,
-    #     # rotations = rot,
-    #     rotations = gaussians_rot_trans,
-    #     cov3D_precomp = None)
-
-
-    raster_start = _profile_sync_time() if profile_timings is not None else None
-    # Composite R * L before rasterization.  Multiplying separately
-    # rasterized R and L images applies alpha twice at boundaries and turns
-    # otherwise valid semi-transparent splats into dark fringes.
-    rendered_image, radii, depth_map = rasterizer(
-        means3D=means3D,
-        means2D=means2D,
+    rendered, radii, _ = main_rasterizer(
+        means3D=means3d,
+        means2D=means2d,
         shs=None,
         colors_precomp=reflectance * illumination,
         opacities=opacity,
         scales=scaling,
-        rotations=gaussians_rot_trans,
+        rotations=transformed_rotation,
         cov3D_precomp=None,
     )
-    rendered_reflectance, _, _ = rasterizer(
-        # means3D = xyz,
-        means3D = means3D,
-        # means2D = screenspace_points,
-        means2D = means2D,
-        shs = None,
-        colors_precomp = reflectance,
-        opacities = opacity,
-        scales = scaling,
-        # rotations = rot,
-        rotations = gaussians_rot_trans,
-        cov3D_precomp = None)  
-
-    rendered_reflectance_aux = None
-    if is_training:
-        rendered_reflectance_aux, _, _ = rasterizer(
-            means3D=means3D.detach(),
-            means2D=means2D.detach(),
-            shs=None,
-            colors_precomp=reflectance_aux,
-            opacities=opacity.detach(),
-            scales=scaling.detach(),
-            rotations=gaussians_rot_trans.detach(),
-            cov3D_precomp=None,
-        )
-
-    rendered_illumination,_,_ = rasterizer(
-        # means3D = xyz,
-        means3D = means3D,
-        # means2D = screenspace_points,
-        means2D = means2D,
-        shs = None,
-        colors_precomp = illumination,
-        opacities = opacity,
-        scales = scaling,
-        # rotations = rot,
-        rotations = gaussians_rot_trans,
-        cov3D_precomp = None)
-
-    rendered_illumination_enhanced, _, _= rasterizer(
-        # means3D = xyz,
-        means3D = means3D.detach(),
-        # means2D = screenspace_points,
-        means2D = means2D,
-        shs = None,
-        colors_precomp = illumination_enhanced,
-        opacities = opacity.detach(),
-        scales = scaling.detach(),
-        # rotations = rot,
-        rotations = gaussians_rot_trans.detach(),
-        cov3D_precomp = None)
-    rendered_enhanced, _, _ = rasterizer(
-        means3D=means3D.detach(),
-        means2D=means2D,
+    depth_coverage, _, depth_accumulated = diagnostic_rasterizer(
+        means3D=means3d,
+        means2D=means2d,
         shs=None,
-        colors_precomp=reflectance.detach() * illumination_enhanced,
-        opacities=opacity.detach(),
-        scales=scaling.detach(),
-        rotations=gaussians_rot_trans.detach(),
+        colors_precomp=torch.ones_like(reflectance),
+        opacities=opacity,
+        scales=scaling,
+        rotations=transformed_rotation,
         cov3D_precomp=None,
     )
-    rendered_coverage = None
-    if return_coverage:
-        coverage_settings = GaussianRasterizationSettings(
-            image_height=int(viewpoint_camera.image_height),
-            image_width=int(viewpoint_camera.image_width),
-            tanfovx=tanfovx,
-            tanfovy=tanfovy,
-            kernel_size=kernel_size,
-            bg=torch.zeros_like(bg_color),
-            scale_modifier=scaling_modifier,
-            viewmatrix=w2c,
-            projmatrix=projmatrix,
-            sh_degree=1,
-            campos=camera_pos,
-            prefiltered=False,
-            debug=pipe.debug,
-        )
-        coverage_rasterizer = GaussianRasterizer(raster_settings=coverage_settings)
-        rendered_coverage, _, _ = coverage_rasterizer(
-            means3D=means3D.detach(),
-            means2D=means2D,
-            shs=None,
-            colors_precomp=torch.ones_like(reflectance),
-            opacities=opacity.detach(),
-            scales=scaling.detach(),
-            rotations=gaussians_rot_trans.detach(),
-            cov3D_precomp=None,
-        )
+    depth_coverage_scalar = depth_coverage.mean(dim=0, keepdim=True)
+    rendered_depth = _normalize_by_coverage(
+        depth_accumulated,
+        depth_coverage_scalar,
+    )
+    detached_coverage = depth_coverage.detach()
+    detached_geometry = {
+        "means3D": means3d.detach(),
+        "means2D": means2d.detach(),
+        "shs": None,
+        "opacities": opacity.detach(),
+        "scales": scaling.detach(),
+        "rotations": transformed_rotation.detach(),
+        "cov3D_precomp": None,
+    }
+    reflectance_accumulated, _, _ = diagnostic_rasterizer(
+        colors_precomp=reflectance,
+        **detached_geometry,
+    )
+    illumination_accumulated, _, _ = diagnostic_rasterizer(
+        colors_precomp=illumination,
+        **detached_geometry,
+    )
+    enhanced_illumination_accumulated, _, _ = diagnostic_rasterizer(
+        colors_precomp=enhanced_illumination,
+        **detached_geometry,
+    )
+    rendered_reflectance = _normalize_by_coverage(
+        reflectance_accumulated,
+        detached_coverage,
+    )
+    rendered_illumination = _normalize_by_coverage(
+        illumination_accumulated,
+        detached_coverage,
+    )
+    rendered_illumination_enhanced = _normalize_by_coverage(
+        enhanced_illumination_accumulated,
+        detached_coverage,
+    )
+    rendered_enhanced, _, _ = main_rasterizer(
+        colors_precomp=enhanced_color,
+        **detached_geometry,
+    )
     if profile_timings is not None:
-        raster_after_main = _profile_sync_time()
-        _profile_add(profile_timings, "rasterize_main_time", raster_after_main - raster_start)
+        after_raster = _profile_now(True)
+        profile_timings["rasterize_main_time"] = profile_timings.get(
+            "rasterize_main_time", 0.0
+        ) + after_raster - raster_start
 
-    # rendered_feat,_,_ = rasterizer(
-    #     # means3D = xyz,
-    #     means3D = means3D,
-    #     # means2D = screenspace_points,
-    #     means2D = means2D,
-    #     shs = None,
-    #     colors_precomp = feat_repeated,
-    #     opacities = opacity,
-    #     scales = scaling,
-    #     # rotations = rot,
-    #     rotations = gaussians_rot_trans,
-    #     cov3D_precomp = None)
+    return {
+        "render": rendered,
+        "render_enhanced": rendered_enhanced,
+        "render_reflectance": rendered_reflectance,
+        "render_illumination": rendered_illumination,
+        "render_illumination_enhanced": rendered_illumination_enhanced,
+        "render_depth": rendered_depth,
+        "_training_coverage": detached_coverage,
+        "viewspace_points": means2d,
+        "visibility_filter": radii > 0,
+        "radii": radii,
+        "selection_mask": generated["selection_mask"],
+        "neural_opacity": generated["neural_opacity"],
+        "scaling": scaling,
+    }
 
-    # rendered_feat_downsampled,_,_ = rasterizer(
-    #     # means3D = xyz,
-    #     means3D = means3D,
-    #     # means2D = screenspace_points,
-    #     means2D = means2D,
-    #     shs = None,
-    #     colors_precomp = feat_downsampled,
-    #     opacities = opacity,
-    #     scales = scaling,
-    #     # rotations = rot,
-    #     rotations = gaussians_rot_trans,
-    #     cov3D_precomp = None)
-    # rendered_reflectance = rendered_combined[:3,:,:]
-    # rendered_illumination = rendered_combined[3:6,:,:]
-    # rendered_image = rendered_reflectance * rendered_illumination
-    # rendered_feat = rendered_combined[6:-3,:,:]
-    # rendered_feat_downsampled = rendered_combined[-3:,:,:]
-    if pc.use_residual:
-        residual_raster_start = _profile_sync_time() if profile_timings is not None else None
-        # raster_settings_residual = GaussianRasterizationSettings_Residual(
-        #     image_height=int(viewpoint_camera.image_height),
-        #     image_width=int(viewpoint_camera.image_width),
-        #     tanfovx=tanfovx,
-        #     tanfovy=tanfovy,
-        #     bg=bg_color,
-        #     scale_modifier=scaling_modifier,
-        #     # viewmatrix=viewpoint_camera.world_view_transform,
-        #     # projmatrix=viewpoint_camera.full_proj_transform,
-        #     viewmatrix=w2c.detach(),
-        #     projmatrix=projmatrix.detach(),
-        #     sh_degree=1,
-        #     # campos=viewpoint_camera.camera_center,
-        #     campos=camera_pos.detach(),
-        #     prefiltered=False,
-        #     debug=pipe.debug
-        # )
-        raster_settings_residual = GaussianRasterizationSettings_Residual(
-            image_height=int(viewpoint_camera.image_height),
-            image_width=int(viewpoint_camera.image_width),
-            tanfovx=tanfovx,
-            tanfovy=tanfovy,
-            bg=bg_color,
-            scale_modifier=scaling_modifier,
-            # viewmatrix=view point_camera.world_view_transform,
-            # projmatrix=viewpoint_camera.full_proj_transform,
-            viewmatrix=w2c,
-            projmatrix=projmatrix,
-            sh_degree=1,
-            # campos=viewpoint_camera.camera_center,
-            campos=camera_pos.detach(),
-            prefiltered=False,
-            debug=pipe.debug
+def prefilter_voxel(
+    viewpoint_camera,
+    pc: GaussianModel,
+    pipe,
+    bg_color: torch.Tensor,
+    kernel_size: float,
+    scaling_modifier=1.0,
+    override_color=None,
+    camera_pose=None,
+):
+    del override_color
+    pose = _camera_pose(viewpoint_camera, camera_pose)
+    means3d, rotation = _transform_gaussians(pc.get_anchor, pc.get_rotation, pose)
+    rasterizer = GaussianRasterizer(
+        raster_settings=_raster_settings(
+            viewpoint_camera,
+            pipe,
+            bg_color,
+            kernel_size,
+            scaling_modifier,
         )
-        rasterizer_residual = GaussianRasterizer_Residual(raster_settings=raster_settings_residual)
-        screenspace_points_residual = torch.zeros_like(xyz_residual, dtype=pc.get_anchor.dtype, requires_grad=True, device="cuda") + 0
-        gaussians_xyz_residual = xyz_residual
-        gaussians_rot_residual = rot_residual
-
-        xyz_ones_residual = torch.ones(gaussians_xyz_residual.shape[0], 1).cuda().float()
-        xyz_homo_residual = torch.cat((gaussians_xyz_residual, xyz_ones_residual), dim=1)
-        gaussians_xyz_residual_trans = (rel_w2c @ xyz_homo_residual.T).T[:, :3]
-        gaussians_rot_residual_trans = quadmultiply(camera_pose[:4], gaussians_rot_residual)
-
-        means3D_residual = gaussians_xyz_residual_trans
-        means2D_residual = screenspace_points_residual
-        # input_concated_residual = torch.cat([color_residual, torch.zeros(color_residual.shape[0], input_concated.shape[1]-color_residual.shape[1]-feat_downsampled_residual.shape[1]).cuda().detach(), feat_downsampled_residual.detach()], dim=1)
-        # print("reflectance:", reflectance.mean(), "color_residual:", color_residual.mean())
-       
-        if pc.use_dual_transient:
-            rendered_noise,_ = rasterizer_residual(
-                # means3D = xyz_residual,
-                # means2D = screenspace_points_residual,
-                means3D = means3D_residual,
-                means2D = means2D_residual,
-                shs = None,
-                colors_precomp = color_noise,
-                opacities = opacity_residual,
-                scales = scaling_residual,
-                rotations = gaussians_rot_residual_trans,
-                # rotations = rot_residual,
-                cov3D_precomp = None)
-        else:
-            rendered_noise = torch.zeros((3, int(viewpoint_camera.image_height), int(viewpoint_camera.image_width)), device="cuda")
-        rendered_artifact,_ = rasterizer_residual(
-            means3D = means3D_residual,
-            means2D = means2D_residual,
-            shs = None,
-            colors_precomp = color_artifact,
-            opacities = opacity_residual,
-            scales = scaling_residual,
-            rotations = gaussians_rot_residual_trans,
-            # rotations = rot_residual,
-            cov3D_precomp = None)
-        rendered_residual = rendered_noise + rendered_artifact
-        if profile_timings is not None:
-            residual_raster_after = _profile_sync_time()
-            _profile_add(profile_timings, "rasterize_residual_time", residual_raster_after - residual_raster_start)
-        
-        # rendered_feat_downsampled_residual,_ = rasterizer_residual(
-        #     means3D = means3D_residual,
-        #     means2D = means2D_residual,
-        #     shs = None,
-        #     colors_precomp = feat_downsampled_residual,
-        #     opacities = opacity_residual,
-        #     scales = scaling_residual,
-        #     rotations = gaussians_rot_residual_trans,
-        #     cov3D_precomp = None)
-        
-        
-        # rendered_residual = rendered_combined_residual[:3,:,:]
-        # rendered_feat_downsampled_residual = rendered_combined_residual[6:-3,:,:]
-        # print("rendered_reflectance:", rendered_reflectance.mean(), "rendered_residual:", rendered_residual.mean())
-        # import pdb; pdb.set_trace()
-        if is_training:
-            return {"render": rendered_image,
-                    "render_enhanced": rendered_enhanced,
-                    "render_coverage": rendered_coverage,
-                    "render_reflectance":rendered_reflectance,
-                    "render_reflectance_aux": rendered_reflectance_aux,
-                    "render_illumination":rendered_illumination,
-                    "render_illumination_enhanced":rendered_illumination_enhanced,
-                    "render_depth":depth_map,
-                    # "render_depth_variance":depth_variance_map,
-                    "render_noise": rendered_noise * 0.1,
-                    "render_artifact": rendered_artifact * 0.1,
-                    "render_residual":rendered_residual * 0.1 ,
-                    # "render_feat":rendered_feat,
-                    # "render_feat_downsampled":rendered_feat_downsampled,
-                    # "render_feat_downsampled_residual":rendered_feat_downsampled_residual,
-                    "viewspace_points": screenspace_points,
-                    "visibility_filter" : radii > 0,
-                    "radii": radii,
-                    "selection_mask": mask,
-                    "neural_opacity": neural_opacity,
-                    "scaling": scaling,
-                    "scaling_residual":scaling_residual,
-                    "sg_stats": sg_stats,
-                    "illumination_stats": sg_stats,
-                    }
-        else:
-            return {"render": rendered_image,
-                    "render_enhanced": rendered_enhanced,
-                    "render_coverage": rendered_coverage,
-                    "render_reflectance":rendered_reflectance,
-                    "render_illumination":rendered_illumination,
-                    "render_illumination_enhanced":rendered_illumination_enhanced,
-                    "render_noise": rendered_noise * 0.1,
-                    "render_artifact": rendered_artifact * 0.1,
-                    "render_residual":rendered_residual * 0.1 ,
-                    "render_depth":depth_map,
-                    # "render_depth_variance":depth_variance_map,
-                    # "render_residual":rendered_residual,
-                    # "render_feat":rendered_feat,
-                    # "render_feat_downsampled":rendered_feat_downsampled,
-                    # "render_feat_downsampled_residual":rendered_feat_downsampled_residual,
-                    "viewspace_points": screenspace_points,
-                    "visibility_filter" : radii > 0,
-                    "radii": radii,
-                    "sg_stats": sg_stats,
-                    "illumination_stats": sg_stats,
-                    }
-
-    # rendered_image, radii, depth_map = rasterizer(
-    #     # means3D = xyz,
-    #     means3D = means3D,
-    #     # means2D = screenspace_points,
-    #     means2D = means2D,
-    #     shs = None,
-    #     colors_precomp = reflectance * illumination,
-    #     opacities = opacity,
-    #     scales = scaling,
-    #     # rotations = rot,
-    #     rotations = gaussians_rot_trans,
-    #     cov3D_precomp = None)
-
-    # rendered_reflectance,_,_ = rasterizer(
-    #     # means3D = xyz,
-    #     means3D = means3D,
-    #     # means2D = screenspace_points,
-    #     means2D = means2D,
-    #     shs = None,
-    #     colors_precomp = reflectance,
-    #     opacities = opacity,
-    #     scales = scaling,
-    #     # rotations = rot,
-    #     rotations = gaussians_rot_trans,
-    #     cov3D_precomp = None)
-    
-    # rendered_illumination,_,_ = rasterizer(
-    #     # means3D = xyz,
-    #     means3D = means3D,
-    #     # means2D = screenspace_points,
-    #     means2D = means2D,
-    #     shs = None,
-    #     colors_precomp = illumination,
-    #     opacities = opacity,
-    #     scales = scaling,
-    #     # rotations = rot,
-    #     rotations = gaussians_rot_trans,
-    #     cov3D_precomp = None)
-    # # import ipdb; ipdb.set_trace()
-    # # feat_repeated = torch.sigmoid(feat_repeated)
-    # # padding_size = 3 - feat_repeated.shape[1] % 3
-    # # if padding_size != 0:
-    # #     feat_repeated = torch.cat([feat_repeated, torch.zeros_like(feat_repeated[:, :padding_size])], dim=1)
-    # # rendered_feat = None
-    # # for i in range(0, feat_repeated.shape[1], 3):
-    # rendered_feat,_,_ = rasterizer(
-    #     # means3D = xyz,
-    #     means3D = means3D,
-    #     # means2D = screenspace_points,
-    #     means2D = means2D,
-    #     shs = None,
-    #     colors_precomp = feat_repeated,
-    #     opacities = opacity,
-    #     scales = scaling,
-    #     # rotations = rot,
-    #     rotations = gaussians_rot_trans,
-    #     cov3D_precomp = None)
-    #     # if rendered_feat is None:
-    #     #     rendered_feat = rendered_feat_tmp
-    #     # else:
-    #     #     rendered_feat = torch.cat([rendered_feat, rendered_feat_tmp], dim=0)
-    # # rendered_feat = rendered_feat[:feat_repeated.shape[1]-padding_size, :, :]
-    # rendered_feat_downsampled,_,_ = rasterizer(
-    #     # means3D = xyz,
-    #     means3D = means3D,
-    #     # means2D = screenspace_points,
-    #     means2D = means2D,
-    #     shs = None,
-    #     colors_precomp = feat_downsampled,
-    #     opacities = opacity,
-    #     scales = scaling,
-    #     # rotations = rot,
-    #     rotations = gaussians_rot_trans,
-    #     cov3D_precomp = None)
-    
-    # rendered_residual, radii = rasterizer(
-    #     means3D = xyz,
-    #     means2D = screenspace_points,
-    #     shs = None,
-    #     colors_precomp = residual,
-    #     opacities = opacity,
-    #     scales = scaling,
-    #     rotations = rot,
-    #     cov3D_precomp = None)
-    # # import pdb; pdb.set_trace()
-    # if pc.appearance_residual_dim > 0:
-    #     camera_indicies = torch.ones_like(rendered_image.permute(1,2,0)[:,:,0], dtype=torch.long, device=rendered_image.device) * viewpoint_camera.uid
-    #     # camera_indicies = torch.ones_like(cat_local_view[:,0], dtype=torch.long, device=ob_dist.device) * 10
-    #     appearance = pc.get_appearance(camera_indicies)
-    #     noise = pc.get_noise_net(torch.cat([rendered_image.detach(), appearance.permute(2,0,1)], dim=0).unsqueeze(dim=0))
-    # else:
-    #     noise = pc.get_noise_net(rendered_image.detach()).unsqueeze(dim=0)
-
-    # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
-
-    # import pdb; pdb.set_trace()
-    if is_training:
-        return {"render": rendered_image,
-                "render_enhanced": rendered_enhanced,
-                "render_coverage": rendered_coverage,
-                "render_reflectance":rendered_reflectance,
-                "render_reflectance_aux": rendered_reflectance_aux,
-                "render_illumination":rendered_illumination,
-                "render_illumination_enhanced":rendered_illumination_enhanced,
-                "render_depth":depth_map,
-                # "render_depth_variance":depth_variance_map,
-                # "render_residual":rendered_residual
-                # "render_feat":rendered_feat,
-                # "render_feat_downsampled":rendered_feat_downsampled,
-                "viewspace_points": screenspace_points,
-                "visibility_filter" : radii > 0,
-                "radii": radii,
-                "selection_mask": mask,
-                "neural_opacity": neural_opacity,
-                "scaling": scaling,
-                "sg_stats": sg_stats,
-                "illumination_stats": sg_stats,
-                }
-    else:
-        return {"render": rendered_image,
-                "render_enhanced": rendered_enhanced,
-                "render_coverage": rendered_coverage,
-                "render_reflectance":rendered_reflectance,
-                "render_illumination":rendered_illumination,
-                "render_illumination_enhanced":rendered_illumination_enhanced,
-                "render_depth":depth_map,
-                # "render_depth_variance":depth_variance_map,
-                # "render_residual":rendered_residual,
-                # "render_feat":rendered_feat,
-                # "render_feat_downsampled":rendered_feat_downsampled,
-                "viewspace_points": screenspace_points,
-                "visibility_filter" : radii > 0,
-                "radii": radii,
-                "sg_stats": sg_stats,
-                "illumination_stats": sg_stats,
-                }
-
-
-
-
-def generate_neural_gaussians_fast(viewpoint_camera, pc : GaussianModel, visible_mask=None, is_training=False):
-    ## view frustum filtering for acceleration    
-    if visible_mask is None:
-        visible_mask = torch.ones(pc.get_anchor.shape[0], dtype=torch.bool, device = pc.get_anchor.device)
-    
-    feat = pc._anchor_feat[visible_mask]
-    anchor = pc.get_anchor[visible_mask]
-    grid_offsets = pc._offset[visible_mask]
-    grid_scaling = pc.get_scaling[visible_mask]
-
-    ## get view properties for anchor
-    ob_view = anchor - viewpoint_camera.camera_center
-    # dist
-    ob_dist = ob_view.norm(dim=1, keepdim=True)
-    # view
-    ob_view = ob_view / ob_dist
-
-
-    # cat_local_view = torch.cat([feat, ob_view, ob_dist], dim=1) # [N, c+3+1]
-    cat_local_view_wodist = torch.cat([feat, ob_view], dim=1) # [N, c+3]
-    # cat_local_view_woview = torch.cat([feat, ob_dist], dim=1) # [N, c+1]
-    reflectance_base = None
-    if pc.reflectance_mode == "explicit":
-        reflectance_base = pc.get_reflectance_with_decoder(feat, grid_offsets, visible_mask)
-
-    ## for illumination
-    cat_local_view_illumination = torch.cat([feat[:, pc.feat_dim//2:], ob_view, ob_dist], dim=1) # [N, c+3+1]
-    cat_local_view_illumination_wodist = torch.cat([feat[:, pc.feat_dim//2:], ob_view], dim=1) # [N, c+3]
-
-
-
-
-    # get offset's opacity
-
-    neural_opacity = pc.get_opacity_mlp(cat_local_view_wodist)
-
-
-    # opacity mask generation
-    neural_opacity = neural_opacity.reshape([-1, 1])
+    )
+    scales = pc.get_scaling
     if pc.use_3D_filter:
-        neural_opacity = pc.get_opacity_with_3D_filter(neural_opacity, visible_mask)
-        grid_scaling = pc.get_scaling_with_3D_filter(grid_scaling, visible_mask)
-    mask = (neural_opacity>0.0)
-    mask = mask.view(-1)
-
-    # select opacity 
-    opacity = neural_opacity[mask]
-
-
-
-
-    illumination, illumination_feat, sg_stats = _compute_illumination(
-        feat,
-        ob_view,
-        ob_dist,
-        cat_local_view_illumination,
-        cat_local_view_illumination_wodist,
-        pc,
-        visible_mask,
+        visible = torch.ones(scales.shape[0], dtype=torch.bool, device=scales.device)
+        scales = pc.get_scaling_with_3D_filter(scales, visible)
+    radii = rasterizer.visible_filter(
+        means3D=means3d,
+        scales=scales[:, :3],
+        rotations=rotation,
+        cov3D_precomp=None,
     )
-    illumination_enhanced = pc.get_enhanced_illumination(
-        feat,
-        illumination_feat,
-        ob_view,
-        visible_mask,
-    )
-
-
-    if pc.reflectance_mode == "mlp":
-        if pc.add_reflectance_dist:
-            cat_local_view_woview = torch.cat([feat, ob_dist], dim=1)
-            reflectance = pc.mlp_reflectance(cat_local_view_woview)
-        else:
-            reflectance = pc.mlp_reflectance(feat)
-    else:
-        reflectance = rearrange(reflectance_base, 'n k c -> (n k) c')
-
-    # color = illumination.repeat(1, 1, 3) * reflectance
-    # color = color.reshape([anchor.shape[0]*pc.n_offsets, 3])# [mask] 
-    illumination = illumination.reshape([anchor.shape[0]*pc.n_offsets, 1]) # [mask]
-    reflectance = reflectance.reshape([anchor.shape[0]*pc.n_offsets, 3]) # [mask]
-    illumination_enhanced = illumination_enhanced.reshape([anchor.shape[0]*pc.n_offsets, 3])
-
-    
-
-
-    scale_rot = pc.get_cov_mlp(cat_local_view_wodist)
-    scale_rot = scale_rot.reshape([anchor.shape[0]*pc.n_offsets, 7]) # [mask]
-    
-    # offsets
-    offsets = grid_offsets.view([-1, 3]) # [mask]
-
-    
-
-    
-    # combine for parallel masking
-    concatenated = torch.cat([grid_scaling, anchor], dim=-1)
-    concatenated_repeated = repeat(concatenated, 'n (c) -> (n k) (c)', k=pc.n_offsets)
-    concatenated_all = torch.cat([concatenated_repeated, reflectance, illumination, illumination_enhanced, scale_rot, offsets], dim=-1)
-    masked = concatenated_all[mask]
-
-    scaling_repeat, repeat_anchor, reflectance, illumination, illumination_enhanced, scale_rot, offsets = masked.split([6, 3, 3, 1, 3, 7, 3], dim=-1)
-    
-    # post-process cov
-    scaling = scaling_repeat[:,3:] * torch.sigmoid(scale_rot[:,:3]) # * (1+torch.sigmoid(repeat_dist))
-    rot = pc.rotation_activation(scale_rot[:,3:7])
-
-    # post-process offsets to get centers for gaussians
-    offsets = offsets * scaling_repeat[:,:3]
-    xyz = repeat_anchor + offsets
-
-
-    if is_training:
-        return xyz, reflectance*illumination_enhanced, opacity, scaling, rot, neural_opacity, mask, sg_stats
-    else:
-        return xyz, reflectance*illumination_enhanced, opacity, scaling, rot, sg_stats
-
-def render_fast(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, kernel_size: float, scaling_modifier = 1.0, visible_mask=None, retain_grad=False, camera_pose=None):
-    """
-    Render the scene. 
-    
-    Background tensor (bg_color) must be on GPU!
-    """
-    is_training = False
-    previous_use_residual = pc.use_residual
-    pc.use_residual = False
-    xyz, color, opacity, scaling, rot, sg_stats = generate_neural_gaussians_fast(viewpoint_camera, pc, visible_mask, is_training=is_training)
-    pc.use_residual = previous_use_residual
-    
-    # print("ill_shape:", illumination.shape)
-    # print("ref_shape:", reflectance.shape)
-
-    # illumination = illumination.repeat(1, 3) # align illumination dimension with the reflectance
-
-    # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-    screenspace_points = torch.zeros_like(xyz, dtype=pc.get_anchor.dtype, requires_grad=True, device="cuda") + 0
-    if retain_grad:
-        try:
-            screenspace_points.retain_grad()
-        except:
-            pass
-
-    # xyz_dist = torch.norm(xyz - viewpoint_camera.camera_center, dim=-1, keepdim=True)
-    # xyz_dist = xyz_dist.repeat([1, 3])
-    # import pdb;pdb.set_trace()
-    # Set up rasterization configuration
-    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
-    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
-
-####
-    # Set camera pose as identity. Then, we will transform the Gaussians around camera_pose
-    # import pdb; pdb.set_trace()
-    w2c = torch.eye(4).cuda()
-    projmatrix = (
-        w2c.unsqueeze(0).bmm(viewpoint_camera.projection_matrix.unsqueeze(0))
-    ).squeeze(0)
-    camera_pos = w2c.inverse()[3, :3]
-####
-
-    raster_settings = GaussianRasterizationSettings_Fast(
-        image_height=int(viewpoint_camera.image_height),
-        image_width=int(viewpoint_camera.image_width),
-        tanfovx=tanfovx,
-        tanfovy=tanfovy,
-        kernel_size=kernel_size,
-        bg=bg_color,
-        scale_modifier=scaling_modifier,
-        # viewmatrix=viewpoint_camera.world_view_transform,
-        # projmatrix=viewpoint_camera.full_proj_transform,
-        viewmatrix=w2c,
-        projmatrix=projmatrix,
-        sh_degree=1,
-        # campos=viewpoint_camera.camera_center,
-        campos=camera_pos,
-        prefiltered=False,
-        debug=pipe.debug
-    )
-
-
-    rasterizer_fast = GaussianRasterizer_Fast(raster_settings=raster_settings)
-    # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    
-    rel_w2c = get_camera_from_tensor(camera_pose)
-    # Transform mean and rot of Gaussians to camera frame
-    gaussians_xyz = xyz
-    gaussians_rot = rot
-
-    xyz_ones = torch.ones(gaussians_xyz.shape[0], 1).cuda().float()
-    xyz_homo = torch.cat((gaussians_xyz, xyz_ones), dim=1)
-    gaussians_xyz_trans = (rel_w2c @ xyz_homo.T).T[:, :3]
-    gaussians_rot_trans = quadmultiply(camera_pose[:4], gaussians_rot)
-    means3D = gaussians_xyz_trans
-    means2D = screenspace_points
-
-    rendering,_,_= rasterizer_fast(
-        # means3D = xyz,
-        means3D = means3D,
-        # means2D = screenspace_points,
-        means2D = means2D,
-        shs = None,
-        colors_precomp = color,
-        opacities = opacity,
-        scales = scaling,
-        # rotations = rot,
-        rotations = gaussians_rot_trans,
-        cov3D_precomp = None)  
-       
-    return {"render": rendering, "sg_stats": sg_stats, "illumination_stats": sg_stats}
-
-
-
-
-def prefilter_voxel(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, kernel_size: float, scaling_modifier = 1.0, override_color = None, camera_pose=None):
-
-    """
-    Render the scene. 
-    
-    Background tensor (bg_color) must be on GPU!
-    """
-    # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
-    screenspace_points = torch.zeros_like(pc.get_anchor, dtype=pc.get_anchor.dtype, requires_grad=True, device="cuda") + 0
-    try:
-        screenspace_points.retain_grad()
-    except:
-        pass
-
-####
-    # Set camera pose as identity. Then, we will transform the Gaussians around camera_pose
-
-    w2c = torch.eye(4).cuda()
-    projmatrix = (
-        w2c.unsqueeze(0).bmm(viewpoint_camera.projection_matrix.unsqueeze(0))
-    ).squeeze(0)
-    camera_pos = w2c.inverse()[3, :3]
-####
-
-
-    # Set up rasterization configuration
-    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
-    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
-
-    raster_settings = GaussianRasterizationSettings(
-        image_height=int(viewpoint_camera.image_height),
-        image_width=int(viewpoint_camera.image_width),
-        tanfovx=tanfovx,
-        tanfovy=tanfovy,
-        kernel_size=kernel_size,
-        bg=bg_color,
-        scale_modifier=scaling_modifier,
-        # viewmatrix=viewpoint_camera.world_view_transform,
-        # projmatrix=viewpoint_camera.full_proj_transform,
-        viewmatrix=w2c,
-        projmatrix=projmatrix,
-        sh_degree=1,
-        # campos=viewpoint_camera.camera_center,
-        campos=camera_pos,
-        prefiltered=False,
-        debug=pipe.debug
-    )
-
-    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
-
-    # means3D = pc.get_anchor
-
-
-#####
-    rel_w2c = get_camera_from_tensor(camera_pose)
-    # Transform mean and rot of Gaussians to camera frame
-    gaussians_xyz = pc.get_anchor.clone()
-    gaussians_rot = pc.get_rotation.clone()
-
-    xyz_ones = torch.ones(gaussians_xyz.shape[0], 1).cuda().float()
-    xyz_homo = torch.cat((gaussians_xyz, xyz_ones), dim=1)
-    gaussians_xyz_trans = (rel_w2c @ xyz_homo.T).T[:, :3]
-    gaussians_rot_trans = quadmultiply(camera_pose[:4], gaussians_rot)
-    means3D = gaussians_xyz_trans
-#####
-
-    # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
-    # scaling / rotation by the rasterizer.
-    scales = None
-    rotations = None
-    cov3D_precomp = None
-###
-    pipe.compute_cov3D_python = False
-###
-    if pipe.compute_cov3D_python:
-        cov3D_precomp = pc.get_covariance(scaling_modifier)
-    else:
-        scales = pc.get_scaling
-        scales = pc.get_scaling_with_3D_filter(scales,torch.ones(scales.shape[0]).bool().cuda())
-        # rotations = pc.get_rotation
-        rotations = gaussians_rot_trans
-
-    radii_pure = rasterizer.visible_filter(means3D = means3D,
-        scales = scales[:,:3],
-        rotations = rotations,
-        cov3D_precomp = cov3D_precomp)
-
-    return radii_pure > 0
+    return radii > 0

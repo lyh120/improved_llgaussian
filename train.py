@@ -1,2127 +1,1183 @@
-#
-# Copyright (C) 2023, Inria
-# GRAPHDECO research group, https://team.inria.fr/graphdeco
-# All rights reserved.
-#
-# This software is free for non-commercial, research and evaluation use 
-# under the terms of the LICENSE.md file.
-#
-# For inquiries contact  george.drettakis@inria.fr
-#
+"""Training entry point for MODEL_FORMAT_VERSION=2 explicit R/L."""
 
+from __future__ import annotations
+
+import logging
 import os
-import numpy as np
-import sys
-import importlib.util
-
+import random
 import subprocess
+import sys
+import uuid
+from argparse import ArgumentParser, Namespace
+from pathlib import Path
+
+import torch
+from PIL import Image
+from tqdm import tqdm
+from torchvision.transforms.functional import pil_to_tensor, to_pil_image
+
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-cmd = 'nvidia-smi -q -d Memory |grep -A4 GPU|grep Used'
-result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).stdout.decode().split('\n')
-os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in result[:-1]]))
-
-os.system('echo $CUDA_VISIBLE_DEVICES')
-
-
-import torch
-import torchvision
-import json
-import wandb
-import time
-from time import perf_counter
-from os import makedirs
-import shutil, pathlib
-from pathlib import Path
-from PIL import Image
-import torchvision.transforms.functional as tf
-
-sys.modules['torchvision.transforms.functional_tensor'] = tf
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.append("./submodules/Depth-Anything-V2")
-
-# from lpipsPyTorch import lpips
-import lpips
-from random import randint
-from utils.enhancement_loss_utils import L_Enhancement_Gain_Smooth, L_Enhancement_Edge_Preserve
-from utils.loss_utils import l1_loss, ssim, l1_plus_loss, L_Smooth, L_Illu, L_Gray, L_Green_Bias, L_Depth_similarity, L_Reflectance_Smooth, L_Depth_Smooth, pearson_depth_loss, L_Reflectance_Consistency, L_Reflectance_Edge, L_Reflectance_Edge_Uplift, L_Reflectance_Highlight, L_Reflectance_LocalContrast, L_Reflectance_HighFreq, L_Residual_Chroma_Boost, L_Noise_Zero_Mean, L_Noise_Dark_Weighted, L_Noise_HighFreq, L_SG_Energy, L_SG_Sharpness, L_ASG_Energy, L_ASG_Sharpness, L_ASG_Anisotropy, L_B0_Spatial_Smooth, build_dual_transient_masks
-from gaussian_renderer import prefilter_voxel, render, network_gui
-from scene import Scene, GaussianModel
+from arguments import (
+    ModelParams,
+    OptimizationParams,
+    PipelineParams,
+    validate_training_schedule,
+)
+from gaussian_renderer import prefilter_voxel, render
+from render import render_sets
+from scene import Scene
+from scene.explicit_appearance import decompose_enhanced_prior
+from utils.model_format import MODEL_FORMAT_VERSION, training_stage_state
+from scene.gaussian_model import GaussianModel
 from utils.general_utils import safe_state
-from utils.composition_utils import compose_decomposed_render
-import uuid
-from tqdm import tqdm
-from utils.image_utils import psnr, Camera_Reprojection, Camera_Reprojection_inverse
-from argparse import ArgumentParser, Namespace
-from utils.visualize_utils import minmax_normalize, visualize_camera_trajectories, visualize_anchor_with_camera, visualize_heatmap, plot_point_cloud_projection, visualize_cmap
-import numpy as np
-import cv2
-from utils.pose_utils import get_tensor_from_camera, save_pose, load_pose
-import matplotlib.cm as cm
-
-try:
-    from arguments import ModelParams, PipelineParams, OptimizationParams
-except ImportError:
-    arguments_path = os.path.join(PROJECT_ROOT, "arguments", "__init__.py")
-    spec = importlib.util.spec_from_file_location("arguments", arguments_path)
-    arguments_module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    sys.modules["arguments"] = arguments_module
-    spec.loader.exec_module(arguments_module)
-    ModelParams = arguments_module.ModelParams
-    PipelineParams = arguments_module.PipelineParams
-    OptimizationParams = arguments_module.OptimizationParams
-
-from depth_anything_v2.dpt import DepthAnythingV2
-lpips_fn = lpips.LPIPS(net='vgg').to('cuda')
-
-try:
-    from torch.utils.tensorboard import SummaryWriter
-    TENSORBOARD_FOUND = True
-    print("found tf board")
-except ImportError:
-    TENSORBOARD_FOUND = False
-    print("not found tf board")
+from utils.image_utils import psnr
+from utils.loss_utils import (
+    coverage_masked_prediction,
+    edge_aware_illumination_tv_loss,
+    inverse_depth_pearson_loss,
+    photo_loss,
+    retinex_targets,
+    scaling_loss,
+    ssim,
+)
+from utils.model_format import NUMERICAL_EPS
+from utils.pose_utils import get_tensor_from_camera, save_pose
+from utils.prior_utils import (
+    prior_generation_required,
+    resolve_required_file,
+    stablesr_prior_directory_name,
+)
 
 try:
     from fused_ssim import fused_ssim
+
     FUSED_SSIM_AVAILABLE = True
-except:
+except ImportError:
     FUSED_SSIM_AVAILABLE = False
 
-ENHANCEMENT_PARAM_GROUP_NAMES = {
-    "enhancement_sg_axis",
-    "enhancement_sg_sharpness",
-    "enhancement_sg_amplitude",
-    "enhancement_context_feat",
-    "enhancement_context_illum",
-    "enhancement_context_bias",
+try:
+    from torch.utils.tensorboard import SummaryWriter
+
+    TENSORBOARD_FOUND = True
+except ImportError:
+    TENSORBOARD_FOUND = False
+
+
+WANDB_CORE_IMAGE_FIELDS = {
+    "image": "render",
+    "image_enhanced": "render_enhanced",
+    "reflectance": "render_reflectance",
+    "illumination": "render_illumination",
+    "illumination_enhanced": "render_illumination_enhanced",
 }
 
-
-def depth_piror_Model():
-    model_configs = {
-        'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
-        'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
-        'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
-        'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
-    }
-    model_encoder = 'vitl'
-    depth_anything = DepthAnythingV2(**model_configs[model_encoder])
-    depth_anything.load_state_dict(torch.load(f'./checkpoints/depth_anything_v2_{model_encoder}.pth', map_location='cpu'))
-    depth_anything = depth_anything.to('cuda').eval()
-    return depth_anything
+SCENE_ENHANCEMENT_PRIOR_DIRECTORY = "cidnet_prior"
+SCENE_DEPTH_PRIOR_DIRECTORY = "depth_maps"
+ENHANCEMENT_PRIOR_BACKENDS = {"cidnet", "stablesr"}
+# The clean LL-Gaussian monitor exposes dark renders by mapping the scene's
+# mean training brightness to a visible mid-tone. This constant is display
+# only: it never enters a prior, appearance evaluation, target, or loss.
+WANDB_DISPLAY_TARGET_MEAN = 0.45
 
 
+def _training_split_brightness(dataset) -> float:
+    """Return mean RGB brightness using the prior preprocessing split."""
+    from scripts.precompute_depth_prior import _images_by_name, _select_training_images
 
-def depth_piror_generator(model, scene):
-    depth_piror_dict = dict()
-    for camera in scene.getTrainCameras().copy():
-        gt_path = os.path.join(args.source_path,'images',camera.image_name+'.png')
-        gt_image = cv2.imread(gt_path)
-        depth_piror = model.infer_image(gt_image).unsqueeze(0)
-        idx = camera.uid
-        depth_piror_dict[idx] = depth_piror
-    return depth_piror_dict
-
-def saveRuntimeCode(dst: str) -> None:
-    additionalIgnorePatterns = ['.git', '.gitignore']
-    ignorePatterns = set()
-    ROOT = '.'
-    with open(os.path.join(ROOT, '.gitignore')) as gitIgnoreFile:
-        for line in gitIgnoreFile:
-            if not line.startswith('#'):
-                if line.endswith('\n'):
-                    line = line[:-1]
-                if line.endswith('/'):
-                    line = line[:-1]
-                ignorePatterns.add(line)
-    ignorePatterns = list(ignorePatterns)
-    for additionalPattern in additionalIgnorePatterns:
-        ignorePatterns.append(additionalPattern)
-    log_dir = pathlib.Path(__file__).parent.resolve()
-    shutil.copytree(log_dir, dst, ignore=shutil.ignore_patterns(*ignorePatterns))
-    print('Backup Finished!')
-
-def get_closest_uid(cameras, uid):
-    other_cameras = [(cam.uid, cam.camera_center) for cam in cameras if cam.uid != uid]
-    camera_uids, camera_centers = zip(*other_cameras)
-    distances = torch.norm(torch.stack(camera_centers) - cameras[uid].camera_center, dim=1)
-    return camera_uids[torch.argmin(distances).item()]
+    images = _select_training_images(
+        _images_by_name(Path(dataset.source_path) / dataset.images),
+        bool(dataset.eval),
+        int(dataset.lod),
+        8,
+    )
+    if not images:
+        raise RuntimeError(
+            "No training-split images found at "
+            f"{os.path.join(dataset.source_path, dataset.images)}"
+        )
+    total = 0.0
+    for path in images.values():
+        with Image.open(path) as image:
+            total += float(pil_to_tensor(image.convert("RGB")).float().mean()) / 255.0
+    return total / len(images)
 
 
-def setup_closest_pose_dic(cameras, closest_pose_dic):
-    for cam in cameras:
-        closest_idx = get_closest_uid(cameras, cam.uid)
-        closest_pose_dic[cam.uid] = closest_idx
-    return closest_pose_dic
-
-class LinearDecayWeight:
-    def __init__(self, 
-                 initial_weight: float = 1.0, 
-                 final_weight: float = 0.5, 
-                 total_steps: int = 10000):
-        self.initial = initial_weight
-        self.final = final_weight
-        self.total_steps = total_steps
-        self.decay_rate = (initial_weight - final_weight) / total_steps
-    
-    def __call__(self, step: int):
-        weight = self.initial - self.decay_rate * step
-        return max(weight, self.final)  # 确保不低于最终值
+def _wandb_display_gain(mean_brightness: float) -> float:
+    """Match the clean-reference dark-map display transform, for W&B only."""
+    return float(
+        max(
+            1,
+            int(WANDB_DISPLAY_TARGET_MEAN / max(mean_brightness, NUMERICAL_EPS)),
+        )
+    )
 
 
-def _visible_count_value(visible_count):
-    if visible_count is None:
-        return 0.0
-    if isinstance(visible_count, (int, float)):
-        return float(visible_count)
-    if torch.is_tensor(visible_count):
-        if visible_count.numel() == 0:
-            return 0.0
-        return float(visible_count.float().mean().item())
-    if isinstance(visible_count, (list, tuple)):
-        if len(visible_count) == 0:
-            return 0.0
-        values = []
-        for item in visible_count:
-            if torch.is_tensor(item):
-                values.append(float(item.detach().float().item()))
-            else:
-                values.append(float(item))
-        return float(sum(values) / len(values))
-    return float(visible_count)
-
-
-def _visible_count_per_view(visible_count, image_names):
-    if visible_count is None:
-        return {name: 0.0 for name in image_names}
-    if isinstance(visible_count, (int, float)):
-        return {name: float(visible_count) for name in image_names}
-    if torch.is_tensor(visible_count):
-        values = visible_count.detach().flatten().float().cpu().tolist()
-    elif isinstance(visible_count, (list, tuple)):
-        values = []
-        for item in visible_count:
-            if torch.is_tensor(item):
-                values.append(float(item.detach().float().item()))
-            else:
-                values.append(float(item))
-    else:
-        return {name: float(visible_count) for name in image_names}
-
-    if len(values) == 0:
-        return {name: 0.0 for name in image_names}
-    if len(values) == 1 and len(image_names) > 1:
-        values = values * len(image_names)
-
-    return {
-        name: float(values[min(idx, len(values) - 1)])
-        for idx, name in enumerate(image_names)
-    }
-
-
-def _resolve_project_path(path):
-    if os.path.isabs(path):
-        return path
-    return os.path.abspath(os.path.join(PROJECT_ROOT, path))
-
-
-def _find_source_image(images_dir, image_name):
-    for suffix in (".png", ".jpg", ".jpeg", ".JPG", ".bmp"):
-        candidate = os.path.join(images_dir, image_name + suffix)
-        if os.path.exists(candidate):
-            return os.path.basename(candidate)
-    raise FileNotFoundError(f"Could not find source image for {image_name} in {images_dir}")
-
-
-def _write_cidnet_manifest(dataset, cameras, prior_root):
-    images_dir = os.path.join(dataset.source_path, dataset.images)
-    if not os.path.isdir(images_dir):
-        raise FileNotFoundError(f"CIDNet input image directory does not exist: {images_dir}")
-
-    manifest = {
-        "images_dir": images_dir,
-        "images": [
-            {
-                "uid": int(camera.uid),
-                "image_name": camera.image_name,
-                "file_name": _find_source_image(images_dir, camera.image_name),
-                "target_width": int(camera.image_width),
-                "target_height": int(camera.image_height),
-            }
-            for camera in cameras
-        ],
-    }
-    os.makedirs(prior_root, exist_ok=True)
-    manifest_path = os.path.join(prior_root, "train_manifest.json")
-    with open(manifest_path, "w", encoding="utf-8") as fp:
-        json.dump(manifest, fp, indent=2)
-    return manifest_path, images_dir
-
-
-def _cidnet_round_dir(prior_root, round_idx):
-    return os.path.join(prior_root, f"round_{round_idx:03d}")
-
-
-def _cidnet_round_complete(round_dir, cameras):
-    image_dir = os.path.join(round_dir, "images")
-    if not os.path.isdir(image_dir):
-        return False
-    if not os.path.exists(os.path.join(round_dir, "params.json")):
-        return False
-    return all(os.path.exists(os.path.join(image_dir, camera.image_name + ".png")) for camera in cameras)
-
-
-def load_cidnet_prior_round(round_dir, cameras):
-    image_dir = os.path.join(round_dir, "images")
-    refined_images = {}
-    missing = []
+@torch.no_grad()
+def _scene_display_gain(cameras) -> tuple[float, float]:
+    """Compute the W&B-only display gain from already-built cameras."""
+    if not cameras:
+        raise RuntimeError("Scene enhance ratio requires at least one training camera")
+    means = torch.zeros(3, device=cameras[0].original_image.device)
     for camera in cameras:
-        candidates = [
-            os.path.join(image_dir, camera.image_name + ".png"),
-            os.path.join(image_dir, f"{camera.uid}.png"),
-        ]
-        image_path = next((path for path in candidates if os.path.exists(path)), None)
-        if image_path is None:
-            missing.append(camera.image_name)
-            continue
-        refined_images[camera.uid] = tf.to_tensor(Image.open(image_path).convert("RGB"))
-    if missing:
-        raise FileNotFoundError(f"CIDNet prior round is missing images: {missing[:5]} from {image_dir}")
-    return refined_images
+        means += camera.original_image.mean(dim=(1, 2))
+    brightness = float((means / len(cameras)).mean().item())
+    return _wandb_display_gain(brightness), brightness
 
 
-def _stablesr_prior_dir(dataset, enhance_ratio):
-    return os.path.join(dataset.source_path, "diffusion_prior_" + str(enhance_ratio))
-
-
-def _stablesr_round_complete(prior_dir, cameras):
-    if not os.path.isdir(prior_dir):
-        return False
-    return all(os.path.exists(os.path.join(prior_dir, f"{camera.uid}.png")) for camera in cameras)
-
-
-def load_stablesr_prior(prior_dir, cameras):
-    refined_images = {}
-    missing = []
-    for camera in cameras:
-        candidates = [
-            os.path.join(prior_dir, f"{camera.uid}.png"),
-            os.path.join(prior_dir, camera.image_name + ".png"),
-        ]
-        image_path = next((path for path in candidates if os.path.exists(path)), None)
-        if image_path is None:
-            missing.append(camera.image_name)
-            continue
-        refined_images[camera.uid] = tf.to_tensor(Image.open(image_path).convert("RGB"))
-    if missing:
-        raise FileNotFoundError(f"StableSR prior is missing images: {missing[:5]} from {prior_dir}")
-    return refined_images
-
-
-def build_or_load_stablesr_prior(dataset, cameras, enhance_ratio, logger=None):
-    prior_dir = _stablesr_prior_dir(dataset, enhance_ratio)
-    os.makedirs(prior_dir, exist_ok=True)
-    if _stablesr_round_complete(prior_dir, cameras):
-        if logger is not None:
-            logger.info(f"[INFO] Loading existing StableSR prior images from {prior_dir}")
-        return load_stablesr_prior(prior_dir, cameras)
-
-    if logger is not None:
-        logger.info(f"[INFO] Generating StableSR prior images in {prior_dir}")
-
-    stablesr_root = os.path.join(PROJECT_ROOT, "submodules", "StableSR")
-    if stablesr_root not in sys.path:
-        sys.path.append(stablesr_root)
-    from utils.StableSR_utlis import SD_refine, get_SRModel
-
-    sd_model, vq_model, sd_opt = get_SRModel()
-    refined_images = {}
-    try:
-        for camera in tqdm(cameras, desc="StableSR prior"):
-            input_image = torch.clamp(camera.original_image.cuda() * enhance_ratio, 0.0, 1.0)
-            refined = SD_refine(sd_model, vq_model, input_image.unsqueeze(0), sd_opt)
-            refined = torch.clamp(refined.detach().cpu(), 0.0, 1.0)
-            refined_images[camera.uid] = refined
-            torchvision.utils.save_image(refined, os.path.join(prior_dir, f"{camera.uid}.png"))
-    finally:
-        sd_model.cpu()
-        vq_model.cpu()
-        del sd_model
-        del vq_model
-        torch.cuda.empty_cache()
-
-    return refined_images
-
-
-def log_cidnet_round_stats(round_dir, logger=None):
-    if logger is None:
-        return
-    stats_path = os.path.join(round_dir, "stats.json")
-    if not os.path.exists(stats_path):
-        logger.info(f"[INFO] CIDNet stats not found: {stats_path}")
-        return
-    with open(stats_path, "r", encoding="utf-8") as fp:
-        stats = json.load(fp)
-    gamma_stats = stats.get("gamma", {})
-    alpha_stats = stats.get("alpha", {})
-    logger.info(
-        "[INFO] CIDNet stats %s | gamma mean/min/max: %.4f/%.4f/%.4f | "
-        "alpha mean/min/max: %.4f/%.4f/%.4f | gamma abs delta: %s | alpha abs delta: %s",
-        os.path.basename(round_dir),
-        gamma_stats.get("mean", 0.0),
-        gamma_stats.get("min", 0.0),
-        gamma_stats.get("max", 0.0),
-        alpha_stats.get("mean", 0.0),
-        alpha_stats.get("min", 0.0),
-        alpha_stats.get("max", 0.0),
-        stats.get("gamma_abs_delta_from_previous_mean"),
-        stats.get("alpha_abs_delta_from_previous_mean"),
+def _start_training_progress(phase: str, next_iteration: int, total_iterations: int):
+    """Start one progress bar per training phase for a visible warmup/main split."""
+    return tqdm(
+        total=max(total_iterations, 0),
+        initial=min(max(next_iteration, 0), max(total_iterations, 0)),
+        desc=f"Training [{phase}]",
     )
 
 
-def get_refined_image(refined_image_dict, camera, fallback_image=None):
-    refined_image = refined_image_dict.get(camera.uid)
-    if refined_image is not None:
-        return refined_image
-    if fallback_image is not None:
-        return fallback_image.detach().cpu()
-    raise KeyError(f"No refined image loaded for camera uid={camera.uid}, name={camera.image_name}")
-
-
-def select_monitor_camera(scene, requested_name="1", requested_split="test", logger=None):
-    """Select a deterministic camera for longitudinal WandB monitoring."""
-    requested_split = str(requested_split).lower()
-    if requested_split not in {"train", "test"}:
-        if logger is not None:
-            logger.warning(
-                "Unknown wandb_monitor_split=%s; falling back to test.",
-                requested_split,
-            )
-        requested_split = "test"
-
-    split_cameras = {
-        "train": scene.getTrainCameras().copy(),
-        "test": scene.getTestCameras().copy(),
-    }
-    search_order = (requested_split, "train" if requested_split == "test" else "test")
-    requested_name = str(requested_name)
-
-    for split in search_order:
-        for camera in split_cameras[split]:
-            if str(camera.image_name) == requested_name:
-                return camera, split
-
-    for split in search_order:
-        if split_cameras[split]:
-            camera = sorted(
-                split_cameras[split],
-                key=lambda candidate: str(candidate.image_name),
-            )[0]
-            if logger is not None:
-                logger.warning(
-                    "Monitor camera %s was not found; using %s camera %s.",
-                    requested_name,
-                    split,
-                    camera.image_name,
-                )
-            return camera, split
-
-    raise RuntimeError("No train or test camera is available for WandB monitoring.")
-
-
-def wandb_image(tensor, caption=None):
-    """Convert a render tensor to a finite, detached WandB image."""
-    image = torch.nan_to_num(tensor.detach(), nan=0.0, posinf=1.0, neginf=0.0)
-    image = torch.clamp(image, 0.0, 1.0).cpu()
-    return wandb.Image(
-        torchvision.transforms.ToPILImage()(image),
-        caption=caption,
+def create_gaussian_model(dataset) -> GaussianModel:
+    return GaussianModel(
+        feat_dim=dataset.feat_dim,
+        n_offsets=dataset.n_offsets,
+        voxel_size=dataset.voxel_size,
+        update_depth=dataset.update_depth,
+        update_init_factor=dataset.update_init_factor,
+        update_hierachy_factor=dataset.update_hierachy_factor,
+        use_feat_bank=dataset.use_feat_bank,
+        add_opacity_dist=dataset.add_opacity_dist,
+        add_cov_dist=dataset.add_cov_dist,
+        use_3D_filter=dataset.use_3D_filter,
     )
 
 
-def coverage_for_monitor(coverage, reference):
-    """Convert renderer coverage to one display channel."""
-    if coverage is None:
-        return torch.zeros_like(reference[:1])
-    if coverage.ndim == 2:
-        coverage = coverage.unsqueeze(0)
-    elif coverage.ndim == 3 and coverage.shape[0] != 1:
-        coverage = coverage.mean(dim=0, keepdim=True)
-    return torch.clamp(coverage, 0.0, 1.0)
-
-
-def refresh_cidnet_prior(dataset, prior_root, manifest_path, images_dir, round_idx, previous_round_dir=None, logger=None):
-    if dataset.enhancement_prior != "cidnet":
-        raise ValueError(f"Unsupported enhancement_prior: {dataset.enhancement_prior}")
-
-    script_path = os.path.join(PROJECT_ROOT, "scripts", "cidnet_refresh.py")
-    output_round = _cidnet_round_dir(prior_root, round_idx)
-    controller_path = os.path.join(prior_root, "mlp_controller.pt")
-    cidnet_root = _resolve_project_path(dataset.cidnet_root)
-    cidnet_weights = _resolve_project_path(dataset.cidnet_weights)
-    cmd = [
-        "conda",
-        "run",
-        "--no-capture-output",
-        "-n",
-        dataset.cidnet_conda_env,
-        "python",
-        script_path,
-        "--cidnet_root",
-        cidnet_root,
-        "--weights",
-        cidnet_weights,
-        "--input_dir",
-        images_dir,
-        "--manifest",
-        manifest_path,
-        "--output_round",
-        output_round,
-        "--controller",
-        controller_path,
-        "--mlp_steps",
-        str(dataset.cidnet_mlp_steps),
-        "--target_exposure",
-        str(dataset.cidnet_target_exposure),
-        "--refresh_reg",
-        str(dataset.cidnet_refresh_reg),
-        "--color_reg",
-        str(dataset.cidnet_color_reg),
-        "--param_reg",
-        str(dataset.cidnet_param_reg),
-        "--mv_reg",
-        str(dataset.cidnet_mv_reg),
-        "--gamma_init",
-        str(dataset.cidnet_gamma_init),
-        "--alpha_init",
-        str(dataset.cidnet_alpha_init),
-    ]
-    if previous_round_dir:
-        cmd.extend(["--previous_round", previous_round_dir])
-    if logger is not None:
-        logger.info(f"Refreshing CIDNet prior round {round_idx:03d}: {output_round}")
-    result = subprocess.run(cmd, cwd=PROJECT_ROOT, text=True)
-    if result.returncode != 0:
-        message = (
-            f"CIDNet refresh failed for round {round_idx:03d}.\n"
-            f"Command: {' '.join(cmd)}\n"
-        )
-        raise RuntimeError(message)
-    return output_round
-
-
-def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, wandb=None, logger=None, ply_path=None, mode="train"):
-    first_iter = 0
-    tb_writer = prepare_output_and_logger(dataset)
-
-    gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
-                              dataset.appearance_residual_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_reflectance_dist, dataset.add_illumination_dist, dataset.add_residual_dist, dataset.use_residual, dataset.use_dual_transient, dataset.use_3D_filter,
-                              use_sg_illumination=dataset.use_sg_illumination, use_asg_illumination=dataset.use_asg_illumination, illumination_mode=dataset.illumination_mode, reflectance_mode=dataset.reflectance_mode, sg_lobes=dataset.sg_lobes, sg_lambda_min=dataset.sg_lambda_min, asg_lobes=dataset.asg_lobes, asg_lambda_min=dataset.asg_lambda_min)
-    depth_piror_model = depth_piror_Model()
-    if mode == "warmuped":
-        scene = Scene(dataset, gaussians, depth_piror_model, ply_path=ply_path, shuffle=False, load_iteration=-1, only_ply=False)
-        gaussians.train()
-    elif mode == "train" or mode == "warmup":
-        scene = Scene(dataset, gaussians, depth_piror_model, ply_path=ply_path, shuffle=False)
-    depth_piror_dict = scene.depth_piror_dict
-    gaussians.training_setup(opt)
-
-    train_cams_init = scene.getTrainCameras().copy()
-    os.makedirs(scene.model_path + '/pose', exist_ok=True)
-    save_pose(scene.model_path + '/pose' + "/pose_org.npy", gaussians.P, train_cams_init)
-    if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
-        gaussians.restore(model_params, opt)
-
-    iter_start = torch.cuda.Event(enable_timing = True)
-    iter_end = torch.cuda.Event(enable_timing = True)
-
-
-    bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
-    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-
-
-    trainCameras = scene.getTrainCameras().copy()
-    gaussians.compute_3D_filter(cameras=trainCameras)
-    ## setup the closest pose dictionary    
-    closest_pose_dic = {}
-    setup_closest_pose_dic(scene.getTrainCameras().copy(), closest_pose_dic)
-
-####
-    if args.optim_pose == False:
-        gaussians.P.requires_grad_(False)
-####
-    if mode=="warmup":
-        gaussians.P.requires_grad_(False)
-
-    weight_scheduler = LinearDecayWeight(initial_weight=2, final_weight=1.0,total_steps=opt.iterations)
-    weight_scheduler2 = LinearDecayWeight(initial_weight=5e-4, final_weight=1e-3,total_steps=opt.update_until)
-
-    if mode == "warmup":
-        gaussians.P.requires_grad_(False)
-        os.makedirs( os.path.join(scene.model_path, 'view'), exist_ok=True)
-        # for i in range(len(scene.getTrainCameras())):
-        #     torchvision.utils.save_image(scene.getTrainCameras().copy()[i].original_image * 20, os.path.join(scene.model_path, 'view', f"view{i}.png"))
-
-        visualize_camera_trajectories(scene.getTrainCameras().copy(), scene.getTestCameras().copy (), os.path.join(scene.model_path, "camera_pose_downsampled.png"))
-        visualize_anchor_with_camera(scene.getTrainCameras().copy(), scene.getTrainCameras().copy(), gaussians.get_anchor, os.path.join(scene.model_path, "anchor_with_camera_downsampled.png"))
-        os.makedirs( os.path.join(scene.model_path, 'fitered'), exist_ok=True)
-        plot_point_cloud_projection(gaussians._anchor, scene.getTrainCameras().copy()[0], os.path.join(scene.model_path, 'fitered', f"anchor_in_view0.png"))
-        # for i in range(len(scene.getTrainCameras())):
-        #     plot_point_cloud_projection(gaussians._anchor, scene.getTrainCameras().copy()[i], os.path.join(scene.model_path, 'fitered', f"anchor_in_view{i}.png"))
-
-    if mode == "train" or mode == "warmuped":
-        visualize_camera_trajectories(scene.getTrainCameras().copy(), scene.getTestCameras().copy (), os.path.join(scene.model_path, "camera_pose_warmuped.png"))
-        visualize_anchor_with_camera(scene.getTrainCameras().copy(), scene.getTrainCameras().copy(), gaussians.get_anchor, os.path.join(scene.model_path, "anchor_with_camera_downsampled.png"))
-        os.makedirs( os.path.join(scene.model_path, 'warmuped'), exist_ok=True)
-        plot_point_cloud_projection(gaussians._anchor, scene.getTrainCameras().copy()[0], os.path.join(scene.model_path, 'warmuped', f"anchor_in_view0.png"))
-        # for i in range(len(scene.getTrainCameras())):
-        #     plot_point_cloud_projection(gaussians._anchor, scene.getTrainCameras().copy()[i], os.path.join(scene.model_path, 'warmuped', f"anchor_in_view{i}.png"))
-    viewpoint_stack = None
-    ema_loss_for_log = 0.0
-    progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
-
-    refined_image_dict = {}
-
-
-    cams = scene.getTrainCameras().copy()
-    monitor_camera, monitor_camera_split = select_monitor_camera(
-        scene,
-        requested_name=dataset.wandb_monitor_camera,
-        requested_split=dataset.wandb_monitor_split,
-        logger=logger,
-    )
-    logger.info(
-        "[monitor] fixed_camera=%s split=%s interval=%d",
-        monitor_camera.image_name,
-        monitor_camera_split,
-        dataset.wandb_monitor_interval,
-    )
-    monitor_stage = "warmup" if mode == "warmup" else "main"
-    monitor_step_key = f"{monitor_stage}_iteration"
-    means = torch.zeros(3, device="cuda")
-    for cam in cams:
-        means += cam.original_image.mean(dim=(1,2))
-    mean = (means / len(cams)).mean()
-    enhance_ratio = max(1, int(0.45 / mean))
-    first_iter += 1
-    # Statistics are reinitialized after loading a warmup checkpoint, so the
-    # prune grace period starts at the current training stage rather than at
-    # global iteration zero.
-    gaussians.anchor_birth_iteration.fill_(first_iter)
-
-    cidnet_prior_root = os.path.join(dataset.source_path, "cidnet_prior")
-    cidnet_manifest_path = None
-    cidnet_images_dir = None
-    cidnet_round_idx = 0
-    cidnet_round_dir = _cidnet_round_dir(cidnet_prior_root, cidnet_round_idx)
-    last_cidnet_refresh_iter = first_iter - 1
-    if mode != "warmup":
-        if dataset.enhancement_prior == "cidnet":
-            if dataset.cidnet_force_refresh and os.path.isdir(cidnet_prior_root):
-                logger.info(f"[INFO] Removing existing CIDNet prior cache: {cidnet_prior_root}")
-                shutil.rmtree(cidnet_prior_root)
-            cidnet_manifest_path, cidnet_images_dir = _write_cidnet_manifest(dataset, cams, cidnet_prior_root)
-            if _cidnet_round_complete(cidnet_round_dir, cams):
-                logger.info(f"[INFO] Loading existing CIDNet prior images from {cidnet_round_dir}")
-            else:
-                refresh_cidnet_prior(
-                    dataset,
-                    cidnet_prior_root,
-                    cidnet_manifest_path,
-                    cidnet_images_dir,
-                    cidnet_round_idx,
-                    logger=logger,
-                )
-            refined_image_dict = load_cidnet_prior_round(cidnet_round_dir, cams)
-            log_cidnet_round_stats(cidnet_round_dir, logger)
-        elif dataset.enhancement_prior == "stablesr":
-            refined_image_dict = build_or_load_stablesr_prior(dataset, cams, enhance_ratio, logger)
-        else:
-            raise ValueError(f"Unsupported enhancement_prior: {dataset.enhancement_prior}")
-
-    def log_densification(stage, iteration, densification_stats):
-        """Emit one auditable anchor-growth record to stdout, logs, and WandB."""
-        logger.info("[%s densify %d] %s", stage, iteration, densification_stats)
-        print(f"[{stage} densify {iteration}] {densification_stats}")
-        if wandb is not None:
-            densification_log = {
-                f"{stage}_densify/{key}": value
-                for key, value in densification_stats.items()
-                if key != "added_by_level"
-            }
-            densification_log.update(
-                {
-                    f"{stage}_densify/added_level_{level}": value
-                    for level, value in enumerate(densification_stats["added_by_level"])
-                }
-            )
-            # A single training iteration can emit several WandB records
-            # (scalars, images, evaluation, and densification).  Therefore
-            # WandB's internal step is generally larger than ``iteration``.
-            # Forcing the local iteration into ``step`` makes the timeline go
-            # backwards and causes WandB to discard densification records.
-            # Keep the real stage iteration as data and let WandB maintain its
-            # own monotonically increasing internal step.
-            densification_log[f"{stage}_densify/iteration"] = iteration
-            wandb.log(densification_log)
-          
-    timing_stats = {}
-    total_start_time = time.time()
-    for iteration in range(first_iter, opt.iterations + 1):        
-        # network gui not available in scaffold-gs yet
-        # if network_gui.conn == None:
-        #     network_gui.try_connect()
-        # while network_gui.conn != None:
-        #     try:
-        #         net_image_bytes = None
-        #         custom_cam, do_training, pipe.convert_SHs_python, pipe.compute_cov3D_python, keep_alive, scaling_modifer = network_gui.receive()
-        #         if custom_cam != None:
-        #             net_image = render(custom_cam, gaussians, pipe, background,  scaling_modifer)["render"]
-        #             net_image_bytes = memoryview((torch.clamp(net_image, min=0, max=1.0) * 255).byte().permute(1, 2, 0).contiguous().cpu().numpy())
-        #         network_gui.send(net_image_bytes, dataset.source_path)
-        #         if do_training and ((iteration < int(opt.iterations)) or not keep_alive):
-        #             break
-        #     except Exception as e:
-        #         network_gui.conn = None
-        t0 = time.time()
-        iter_start.record()
-
-        gaussians.update_learning_rate(iteration)
-
-        if (
-            mode != "warmup"
-            and dataset.enhancement_prior == "cidnet"
-            and dataset.cidnet_refresh_interval > 0
-            and iteration >= opt.update_from
-            and iteration < opt.update_until
-            and iteration - last_cidnet_refresh_iter >= dataset.cidnet_refresh_interval
-        ):
-            previous_round_dir = cidnet_round_dir
-            cidnet_round_idx += 1
-            cidnet_round_dir = _cidnet_round_dir(cidnet_prior_root, cidnet_round_idx)
-            if _cidnet_round_complete(cidnet_round_dir, cams):
-                logger.info(f"[INFO] Loading cached CIDNet prior round {cidnet_round_idx:03d}")
-            else:
-                refresh_cidnet_prior(
-                    dataset,
-                    cidnet_prior_root,
-                    cidnet_manifest_path,
-                    cidnet_images_dir,
-                    cidnet_round_idx,
-                    previous_round_dir=previous_round_dir,
-                    logger=logger,
-                )
-            refined_image_dict = load_cidnet_prior_round(cidnet_round_dir, cams)
-            log_cidnet_round_stats(cidnet_round_dir, logger)
-            last_cidnet_refresh_iter = iteration
-            if wandb is not None:
-                wandb.log({"cidnet_prior_round": cidnet_round_idx, "iteration": iteration})
-        
-
-        # Pick a random Camera
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
-
-        pose = gaussians.get_RT(viewpoint_cam.uid) 
-        # Render
-        if (iteration - 1) == debug_from:
-            pipe.debug = True
-        
-        t1 = time.time()
-        voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe,background, dataset.kernel_size, camera_pose=pose)
-        densify_until = opt.warmup_update_until if mode == "warmup" else opt.update_until
-        retain_grad = (iteration < densify_until and iteration >= 0)
-        render_pkg = render(
-            viewpoint_cam,
-            gaussians,
-            pipe,
-            background,
-            kernel_size=dataset.kernel_size,
-            visible_mask=voxel_visible_mask,
-            retain_grad=retain_grad,
-            camera_pose=pose,
-            return_coverage=(iteration % 100 == 0),
-        )
-        timing_stats['render_time'] = timing_stats.get('render_time', 0) + (time.time() - t1)
-
-        t1 = time.time()
-        reflectance_image, illumination_image, illumination_enhanced_image, depth_image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity= render_pkg["render_reflectance"], render_pkg["render_illumination"], render_pkg["render_illumination_enhanced"], render_pkg["render_depth"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
-        reflectance_aux_image = render_pkg["render_reflectance_aux"]
-        
-        
-
-        gt_image = viewpoint_cam.original_image.cuda()
-        depth_piror_norm = depth_piror_dict[viewpoint_cam.uid]
-        base_image = compose_decomposed_render(render_pkg)
-        coverage_image = render_pkg.get("render_coverage")
-        coverage_low_ratio = (
-            (coverage_image < 0.95).float().mean()
-            if coverage_image is not None
-            else torch.tensor(0.0, device=gt_image.device)
-        )
-
-        residual_active = dataset.use_residual and mode != "warmup" and iteration >= opt.residual_start_iter
-        residual_mix_weight = 0.0
-        if residual_active:
-            ramp_iters = max(1, opt.residual_ramp_iters)
-            residual_mix_weight = min(1.0, float(iteration - opt.residual_start_iter + 1) / float(ramp_iters))
-        noise_mask = torch.zeros_like(gt_image[:1])
-        artifact_mask = torch.zeros_like(gt_image[:1])
-        noise_mask_coverage = torch.tensor(0.0, device=gt_image.device)
-        artifact_mask_coverage = torch.tensor(0.0, device=gt_image.device)
-
-        if mode == "warmup":
-            noise_image = torch.zeros_like(gt_image)
-            artifact_image = torch.zeros_like(gt_image)
-            residual_image = torch.zeros_like(gt_image)
-            noise_image_for_loss = noise_image
-            artifact_image_for_loss = artifact_image
-            residual_image_for_loss = residual_image
-            image_tmp = base_image
-        else:
-            if "render_residual" in render_pkg:
-                scaling_residual = render_pkg["scaling_residual"]
-                noise_image = render_pkg.get("render_noise", torch.zeros_like(gt_image))
-                artifact_image = render_pkg.get("render_artifact", torch.zeros_like(gt_image))
-                residual_image = render_pkg["render_residual"]
-                if not dataset.use_dual_transient:
-                    noise_image_for_loss = torch.zeros_like(noise_image)
-                    artifact_image_for_loss = residual_image
-                    residual_image_for_loss = residual_image
-                elif residual_active:
-                    noise_mask, artifact_mask, noise_mask_coverage, artifact_mask_coverage = build_dual_transient_masks(
-                        base_image,
-                        gt_image,
-                        higherror_percentile=dataset.residual_higherror_percentile,
-                        highlight_percentile=dataset.residual_highlight_percentile,
-                    )
-                    noise_image_for_loss = noise_image * residual_mix_weight * noise_mask
-                    artifact_image_for_loss = artifact_image * residual_mix_weight * artifact_mask
-                    residual_image_for_loss = noise_image_for_loss + artifact_image_for_loss
-                else:
-                    noise_image_for_loss = torch.zeros_like(noise_image)
-                    artifact_image_for_loss = torch.zeros_like(artifact_image)
-                    residual_image_for_loss = torch.zeros_like(residual_image)
-                image_tmp = torch.clamp(base_image + residual_image_for_loss, 0.0, 1.0)
-            else:
-                noise_image = torch.zeros_like(gt_image)
-                artifact_image = torch.zeros_like(gt_image)
-                residual_image = torch.zeros_like(gt_image)
-                noise_image_for_loss = noise_image
-                artifact_image_for_loss = artifact_image
-                residual_image_for_loss = residual_image
-                image_tmp = base_image
-        timing_stats["data_time"] = timing_stats.get("data_time", 0) + (time.time() - t1)
-        t2 = time.time()
-
-        Ll1_value = l1_plus_loss(image_tmp, gt_image, phi=0.5/255)
-        Ll1 = torch.abs(Ll1_value).mean()
-        illumination_smooth_reg = (
-            dataset.warmup_illumination_smooth_reg
-            if mode == "warmup"
-            else dataset.illumination_smooth_reg
-        )
-        L_smooth = L_Smooth(
-            illumination_image,
-            gt_image,
-            kernel_size=(
-                dataset.warmup_illumination_smooth_kernel_size
-                if mode == "warmup"
-                else dataset.illumination_smooth_kernel_size
-            ),
-        ) * illumination_smooth_reg
-        L_illu = L_Illu(gt_image, illumination_image) 
-        L_reflectance_smooth = L_Reflectance_Smooth(reflectance_image, illumination_image) * dataset.reflectance_smooth_reg
-        L_depth_similarity = (L_Depth_similarity(1 - minmax_normalize(depth_image).squeeze(0), depth_piror_norm.squeeze(0), 128, 0.5) ) * 0.15
-        
-        if FUSED_SSIM_AVAILABLE:
-            ssim_loss = fused_ssim(image_tmp.unsqueeze(0), gt_image.unsqueeze(0))
-        else:
-            ssim_loss = ssim(image_tmp, gt_image)
-        ssim_loss = 1.0 - ssim_loss
-        scaling_reg = scaling.prod(dim=1).mean()
-        illumination_stats = render_pkg.get("illumination_stats", render_pkg.get("sg_stats"))
-        L_sg_energy = L_SG_Energy(illumination_stats)
-        L_sg_sharpness = L_SG_Sharpness(illumination_stats)
-        L_asg_energy = L_ASG_Energy(illumination_stats)
-        L_asg_sharpness = L_ASG_Sharpness(illumination_stats)
-        L_asg_anisotropy = L_ASG_Anisotropy(illumination_stats)
-        L_reflectance_consistency = L_Reflectance_Consistency(reflectance_image)
-        L_reflectance_edge = L_Reflectance_Edge(reflectance_image, gt_image)
-        L_reflectance_edge_uplift = L_Reflectance_Edge_Uplift(reflectance_aux_image, gt_image)
-        L_reflectance_contrast = L_Reflectance_LocalContrast(reflectance_aux_image, gt_image)
-        L_reflectance_highfreq = L_Reflectance_HighFreq(reflectance_aux_image, gt_image)
-        L_reflectance_highlight = L_Reflectance_Highlight(reflectance_image)
-        L_b0_spatial_smooth = L_B0_Spatial_Smooth(gaussians._base_log_reflectance, gaussians.get_anchor)
-        L_reflectance_detail = torch.mean(torch.abs(torch.tanh(gaussians._reflectance_offset_delta)))
-        L_reflectance_decoder = gaussians._last_reflectance_decoder_mean
-        L_residual_reg = torch.tensor(0.0, device=gt_image.device)
-        residual_chroma_mean = torch.tensor(0.0, device=gt_image.device)
-        L_residual_chroma_boost = torch.tensor(0.0, device=gt_image.device)
-        L_noise_sparse = torch.tensor(0.0, device=gt_image.device)
-        L_artifact_sparse = torch.tensor(0.0, device=gt_image.device)
-        L_noise_zero_mean = torch.tensor(0.0, device=gt_image.device)
-        L_noise_dark_weighted = torch.tensor(0.0, device=gt_image.device)
-        L_noise_highfreq = torch.tensor(0.0, device=gt_image.device)
-        noise_abs_mean = torch.tensor(0.0, device=gt_image.device)
-        artifact_abs_mean = torch.tensor(0.0, device=gt_image.device)
-        artifact_chroma_mean = torch.tensor(0.0, device=gt_image.device)
-        enhancement_guidance_weight = 0.0
-        L_diff_reflectance = torch.tensor(0.0, device=gt_image.device)
-        L_diff_illumination = torch.tensor(0.0, device=gt_image.device)
-        L_enhanced_color = torch.tensor(0.0, device=gt_image.device)
-        L_enhanced_color_std = torch.tensor(0.0, device=gt_image.device)
-        L_enhanced_green_bias = torch.tensor(0.0, device=gt_image.device)
-        L_smooth_enhancement = torch.tensor(0.0, device=gt_image.device)
-        L_gain_smooth_enhancement_raw = torch.tensor(0.0, device=gt_image.device)
-        L_gain_smooth_enhancement = torch.tensor(0.0, device=gt_image.device)
-        L_enhancement_edge_preserve_raw = torch.tensor(0.0, device=gt_image.device)
-        L_enhancement_edge_preserve = torch.tensor(0.0, device=gt_image.device)
-
-        if torch.isnan(scaling_reg) or torch.isinf(scaling_reg):
-            print("Warning: scaling_reg is nan or inf")
-            print("scaling_reg:", scaling_reg.item())
-
-        if mode == "warmup":
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + L_illu + 0.01 * scaling_reg
-            if iteration >= opt.warmup_update_from:
-                loss += L_smooth + L_depth_similarity
-            loss += dataset.reflectance_consistency_reg * (L_reflectance_consistency + L_reflectance_smooth)
-            loss += dataset.reflectance_edge_reg * L_reflectance_edge
-            loss += dataset.reflectance_edge_uplift_reg * L_reflectance_edge_uplift
-            loss += dataset.reflectance_contrast_reg * L_reflectance_contrast
-            loss += dataset.reflectance_highfreq_reg * L_reflectance_highfreq
-            loss += dataset.highlight_reflectance_reg * L_reflectance_highlight
-            if dataset.reflectance_mode == "explicit":
-                loss += dataset.reflectance_detail_reg * L_reflectance_detail
-                loss += dataset.reflectance_decoder_reg * L_reflectance_decoder
-                loss += dataset.b0_spatial_smooth_reg * L_b0_spatial_smooth
-        else:
-            loss = (1.0 - opt.lambda_dssim ) * Ll1 + opt.lambda_dssim *  ssim_loss + L_illu + 0.01 * scaling_reg  
-            
-            if iteration >= opt.update_from:
-                loss +=  L_smooth + L_depth_similarity
-                if dataset.illumination_mode == "asg":
-                    loss += dataset.asg_energy_reg * L_asg_energy
-                    loss += dataset.asg_sharpness_reg * L_asg_sharpness
-                    loss += dataset.asg_anisotropy_reg * L_asg_anisotropy
-                elif dataset.illumination_mode == "sg":
-                    loss += dataset.sg_energy_reg * L_sg_energy
-                    loss += dataset.sg_smooth_reg * L_sg_sharpness
-                loss += dataset.reflectance_consistency_reg * (L_reflectance_consistency + L_reflectance_smooth)
-                loss += dataset.reflectance_edge_reg * L_reflectance_edge
-                loss += dataset.reflectance_edge_uplift_reg * L_reflectance_edge_uplift
-                loss += dataset.reflectance_contrast_reg * L_reflectance_contrast
-                loss += dataset.reflectance_highfreq_reg * L_reflectance_highfreq
-                loss += dataset.highlight_reflectance_reg * L_reflectance_highlight
-                if dataset.reflectance_mode == "explicit":
-                    loss += dataset.reflectance_detail_reg * L_reflectance_detail
-                    loss += dataset.reflectance_decoder_reg * L_reflectance_decoder
-                    loss += dataset.b0_spatial_smooth_reg * L_b0_spatial_smooth
-
-            L_diff = 0
-            if iteration >= opt.update_from:
-                L_degree = (
-                    torch.abs(
-                        illumination_enhanced_image.mean(0)
-                        - torch.clamp(illumination_image.mean(0).detach() * enhance_ratio, 0, 1)
-                    ).mean() * dataset.enhancement_degree_reg
-                    + torch.abs(
-                        illumination_enhanced_image.mean()
-                        - illumination_image.mean().detach() * enhance_ratio
-                    ).mean() * dataset.enhancement_degree_global_reg
-                )
-                if dataset.enhancement_smooth_reg > 0:
-                    L_smooth_enhancement = (
-                        L_Smooth(
-                            illumination_enhanced_image / enhance_ratio,
-                            gt_image,
-                            kernel_size=dataset.illumination_smooth_kernel_size,
-                        )
-                        * dataset.enhancement_smooth_reg
-                    )
-                refined_target = get_refined_image(refined_image_dict, viewpoint_cam).cuda()
-                image_enhanced_pred = compose_decomposed_render(
-                    render_pkg,
-                    enhanced=True,
-                    detach_reflectance=True,
-                )
-                if dataset.enhancement_gain_smooth_reg > 0:
-                    L_gain_smooth_enhancement_raw = L_Enhancement_Gain_Smooth(
-                        illumination_enhanced_image,
-                        illumination_image,
-                        coverage=coverage_image,
-                    )
-                    L_gain_smooth_enhancement = (
-                        L_gain_smooth_enhancement_raw
-                        * dataset.enhancement_gain_smooth_reg
-                    )
-                if dataset.enhancement_edge_preserve_reg > 0:
-                    L_enhancement_edge_preserve_raw = L_Enhancement_Edge_Preserve(
-                        image_enhanced_pred,
-                        base_image,
-                        enhance_ratio,
-                        coverage=coverage_image,
-                    )
-                    L_enhancement_edge_preserve = (
-                        L_enhancement_edge_preserve_raw
-                        * dataset.enhancement_edge_preserve_reg
-                    )
-                pred_mean = image_enhanced_pred.mean(dim=(1, 2))
-                target_mean = refined_target.mean(dim=(1, 2))
-                pred_std = image_enhanced_pred.view(3, -1).std(dim=1, unbiased=False)
-                target_std = refined_target.view(3, -1).std(dim=1, unbiased=False)
-                L_enhanced_color = torch.abs(pred_mean - target_mean).mean()
-                L_enhanced_color_std = torch.abs(pred_std - target_std).mean()
-                L_enhanced_green_bias = L_Green_Bias(image_enhanced_pred)
-                loss += (
-                    L_degree
-                    + L_smooth_enhancement
-                    + L_gain_smooth_enhancement
-                    + L_enhancement_edge_preserve
-                    + dataset.enhancement_color_reg * L_enhanced_color
-                    + dataset.enhancement_color_std_reg * L_enhanced_color_std
-                    + dataset.enhancement_green_bias_reg * L_enhanced_green_bias
-                )
-
-                if iteration >= dataset.enhancement_diff_start_iter:
-                    L_diff_illumination = torch.abs(
-                        illumination_enhanced_image * reflectance_image.detach() - refined_target
-                    ).mean()
-                    # Keep a smaller reflectance-side correction than the illumination-side guidance.
-                    if dataset.enhancement_reflectance_reg > 0:
-                        L_diff_reflectance = torch.abs(
-                            illumination_enhanced_image.detach() * reflectance_image - refined_target
-                        ).mean()
-                    guidance_progress = min(
-                        1.0,
-                        max(
-                            0.0,
-                            float(iteration - dataset.enhancement_diff_start_iter)
-                            / float(max(1, opt.iterations - dataset.enhancement_diff_start_iter)),
-                        ),
-                    )
-                    enhancement_guidance_weight = 1.0 - (
-                        1.0 - dataset.enhancement_guidance_final_weight
-                    ) * guidance_progress
-                    guidance_ramp = min(
-                        1.0,
-                        max(
-                            0.0,
-                            float(
-                                iteration
-                                - dataset.enhancement_diff_start_iter
-                                + 1
-                            )
-                            / float(
-                                max(
-                                    1,
-                                    dataset.enhancement_guidance_ramp_iters,
-                                )
-                            ),
-                        ),
-                    )
-                    enhancement_guidance_weight *= guidance_ramp
-                    L_diff = L_diff_illumination + dataset.enhancement_reflectance_reg * L_diff_reflectance
-                    loss += enhancement_guidance_weight * L_diff
-            if dataset.use_residual and not dataset.use_dual_transient:
-                scaling_residual_reg = scaling_residual.prod(dim=1).mean()
-                artifact_image_for_loss = residual_image
-                L_artifact_sparse = torch.mean(residual_image) * weight_scheduler(iteration)
-                L_residual_reg = L_artifact_sparse
-                artifact_abs_mean = torch.abs(residual_image).mean()
-                artifact_chroma_mean = torch.abs(residual_image - residual_image.mean(dim=0, keepdim=True)).mean()
-                loss += L_residual_reg + 0.05 * scaling_residual_reg
-            elif dataset.use_residual and residual_active:
-                scaling_residual_reg = scaling_residual.prod(dim=1).mean()
-                L_noise_sparse = torch.mean(torch.abs(noise_image_for_loss)) * weight_scheduler(iteration)
-                L_artifact_sparse = torch.mean(torch.abs(artifact_image_for_loss)) * weight_scheduler(iteration)
-                L_noise_zero_mean = L_Noise_Zero_Mean(noise_image_for_loss, noise_mask)
-                L_noise_dark_weighted = L_Noise_Dark_Weighted(noise_image_for_loss, gt_image)
-                L_noise_highfreq = L_Noise_HighFreq(noise_image_for_loss)
-                L_residual_chroma_boost = L_Residual_Chroma_Boost(artifact_image_for_loss, reflectance_image)
-                L_residual_reg = L_noise_sparse + L_artifact_sparse
-                noise_abs_mean = torch.abs(noise_image_for_loss).mean()
-                artifact_abs_mean = torch.abs(artifact_image_for_loss).mean()
-                artifact_chroma_mean = torch.abs(artifact_image_for_loss - artifact_image_for_loss.mean(dim=0, keepdim=True)).mean()
-                loss += (
-                    dataset.noise_residual_reg * L_noise_sparse
-                    + dataset.artifact_residual_reg * L_artifact_sparse
-                    + dataset.noise_zero_mean_reg * L_noise_zero_mean
-                    + dataset.noise_dark_weight_reg * L_noise_dark_weighted
-                    + dataset.noise_highfreq_reg * L_noise_highfreq
-                    + dataset.artifact_highlight_reg * L_residual_chroma_boost
-                    + dataset.residual_chroma_reg * L_residual_chroma_boost
-                    + 0.05 * scaling_residual_reg
-                )
- 
-        timing_stats['loss_time'] = timing_stats.get('loss_time', 0) + (time.time() - t2)
-
-
-        t1 = time.time()
-        loss.backward()
-        enhancement_grad_norm = torch.tensor(0.0, device=gt_image.device)
-        if opt.enhancement_grad_clip > 0:
-            enhancement_parameters = [
-                parameter
-                for param_group in gaussians.optimizer.param_groups
-                if param_group.get("name") in ENHANCEMENT_PARAM_GROUP_NAMES
-                for parameter in param_group["params"]
-                if parameter.grad is not None
-            ]
-            if enhancement_parameters:
-                enhancement_grad_norm = torch.nn.utils.clip_grad_norm_(
-                    enhancement_parameters,
-                    max_norm=opt.enhancement_grad_clip,
-                )
-        timing_stats['backward_time'] = timing_stats.get('backward_time', 0) + (time.time() - t1)
-
-        t1 = time.time()
-        iter_end.record()
-        
-        with torch.no_grad():
-
-            if mode=="warmup" or not dataset.use_residual:
-                wandb.log({'loss':loss, 'iteration':iteration,
-                           monitor_step_key: iteration,
-                           'anchor_count': int(gaussians.get_anchor.shape[0]),
-                           'illumination_mean': illumination_image.mean(),
-                           'illumination_smooth': L_smooth,
-                           'enhancement_smooth': L_smooth_enhancement,
-                           'enhancement_gain_smooth': L_gain_smooth_enhancement,
-                           'enhancement_gain_smooth_raw': L_gain_smooth_enhancement_raw,
-                           'enhancement_gain_smooth_weighted': L_gain_smooth_enhancement,
-                           'enhancement_edge_preserve': L_enhancement_edge_preserve,
-                           'enhancement_edge_preserve_raw': L_enhancement_edge_preserve_raw,
-                           'enhancement_edge_preserve_weighted': L_enhancement_edge_preserve,
-                           'enhancement_grad_norm_pre_clip': enhancement_grad_norm,
-                           'sg_energy': L_sg_energy,
-                           'sg_lambda_mean': L_sg_sharpness,
-                           'asg_energy': L_asg_energy,
-                           'asg_lambda_mean': L_asg_sharpness,
-                           'asg_anisotropy': L_asg_anisotropy,
-                           'reflectance_consistency': L_reflectance_consistency,
-                           'reflectance_edge_mean': L_reflectance_edge,
-                           'reflectance_edge_uplift_mean': L_reflectance_edge_uplift,
-                           'reflectance_contrast_mean': L_reflectance_contrast,
-                           'reflectance_highfreq_mean': L_reflectance_highfreq,
-                           'reflectance_highlight_mean': L_reflectance_highlight,
-                           'reflectance_detail_mean': L_reflectance_detail,
-                           'reflectance_decoder_mean': L_reflectance_decoder,
-                           'coverage_low_ratio': coverage_low_ratio,
-                           'residual_mix_weight': residual_mix_weight,
-                           'residual_chroma_boost': L_residual_chroma_boost})
-            else:
-                residual_chroma_mean = torch.abs(residual_image_for_loss - residual_image_for_loss.mean(dim=0, keepdim=True)).mean()
-                residual_log = {'loss':loss, 'iteration':iteration,
-                                monitor_step_key: iteration,
-                                'anchor_count': int(gaussians.get_anchor.shape[0]),
-                                'illumination_mean': illumination_image.mean(),
-                                'illumination_smooth': L_smooth,
-                                'enhancement_smooth': L_smooth_enhancement,
-                                'enhancement_gain_smooth': L_gain_smooth_enhancement,
-                                'enhancement_gain_smooth_raw': L_gain_smooth_enhancement_raw,
-                                'enhancement_gain_smooth_weighted': L_gain_smooth_enhancement,
-                                'enhancement_edge_preserve': L_enhancement_edge_preserve,
-                                'enhancement_edge_preserve_raw': L_enhancement_edge_preserve_raw,
-                                'enhancement_edge_preserve_weighted': L_enhancement_edge_preserve,
-                                 'enhancement_grad_norm_pre_clip': enhancement_grad_norm,
-                                'sg_energy': L_sg_energy,
-                                'sg_lambda_mean': L_sg_sharpness,
-                                'asg_energy': L_asg_energy,
-                                'asg_lambda_mean': L_asg_sharpness,
-                                'asg_anisotropy': L_asg_anisotropy,
-                                'reflectance_consistency': L_reflectance_consistency,
-                                'reflectance_edge_mean': L_reflectance_edge,
-                                'reflectance_edge_uplift_mean': L_reflectance_edge_uplift,
-                                'reflectance_contrast_mean': L_reflectance_contrast,
-                                'reflectance_highfreq_mean': L_reflectance_highfreq,
-                                'reflectance_highlight_mean': L_reflectance_highlight,
-                                'reflectance_detail_mean': L_reflectance_detail,
-                                'reflectance_decoder_mean': L_reflectance_decoder,
-                                'residual_enabled': float(residual_active),
-                                'residual_abs_mean': torch.abs(residual_image_for_loss).mean(),
-                                'residual_reg': L_residual_reg,
-                                'residual_chroma_mean': residual_chroma_mean,
-                                'enhancement_guidance_weight': enhancement_guidance_weight,
-                                'enhancement_color_mean': L_enhanced_color,
-                                'enhancement_color_std': L_enhanced_color_std,
-                                'enhancement_green_bias': L_enhanced_green_bias,
-                                'enhancement_illumination_guidance': L_diff_illumination,
-                                'enhancement_reflectance_guidance': L_diff_reflectance}
-                if dataset.use_dual_transient:
-                    residual_log.update({
-                        'residual_mix_weight': residual_mix_weight,
-                        'noise_mask_coverage': noise_mask_coverage,
-                        'artifact_mask_coverage': artifact_mask_coverage,
-                        'noise_abs_mean': noise_abs_mean,
-                        'artifact_abs_mean': artifact_abs_mean,
-                        'noise_zero_mean': L_noise_zero_mean,
-                        'noise_highfreq_mean': L_noise_highfreq,
-                        'artifact_chroma_mean': artifact_chroma_mean,
-                        'residual_chroma_boost': L_residual_chroma_boost,
-                    })
-                wandb.log(residual_log)
-            monitor_interval = int(dataset.wandb_monitor_interval)
-            if (
-                wandb is not None
-                and monitor_interval > 0
-                and iteration % monitor_interval == 0
-            ):
-                random_prefix = f"monitor/{monitor_stage}/random"
-                fixed_prefix = f"monitor/{monitor_stage}/fixed"
-                random_caption = (
-                    f"{monitor_stage} iteration={iteration}, "
-                    f"camera={viewpoint_cam.image_name}, split=train"
-                )
-                random_base = torch.clamp(base_image, 0.0, 1.0)
-                random_base_brightened = torch.clamp(
-                    base_image * enhance_ratio,
-                    0.0,
-                    1.0,
-                )
-                random_enhanced = torch.clamp(
-                    compose_decomposed_render(render_pkg, enhanced=True),
-                    0.0,
-                    1.0,
-                )
-                random_coverage = coverage_for_monitor(coverage_image, random_base)
-                random_refined = get_refined_image(
-                    refined_image_dict,
-                    viewpoint_cam,
-                    gt_image,
-                ).cuda()
-
-                fixed_gt = torch.clamp(
-                    monitor_camera.original_image.cuda(),
-                    0.0,
-                    1.0,
-                )
-                fixed_monitor_error = ""
-                try:
-                    fixed_pose = (
-                        gaussians.get_RT(monitor_camera.uid)
-                        if monitor_camera_split == "train"
-                        else get_tensor_from_camera(
-                            monitor_camera.world_view_transform.transpose(0, 1)
-                        )
-                    )
-                    fixed_visible_mask = prefilter_voxel(
-                        monitor_camera,
-                        gaussians,
-                        pipe,
-                        background,
-                        dataset.kernel_size,
-                        camera_pose=fixed_pose,
-                    )
-                    fixed_render_pkg = render(
-                        monitor_camera,
-                        gaussians,
-                        pipe,
-                        background,
-                        kernel_size=dataset.kernel_size,
-                        visible_mask=fixed_visible_mask,
-                        retain_grad=False,
-                        camera_pose=fixed_pose,
-                        return_coverage=True,
-                    )
-                    fixed_base = torch.clamp(
-                        compose_decomposed_render(fixed_render_pkg),
-                        0.0,
-                        1.0,
-                    )
-                    fixed_enhanced = torch.clamp(
-                        compose_decomposed_render(fixed_render_pkg, enhanced=True),
-                        0.0,
-                        1.0,
-                    )
-                    fixed_reflectance = torch.clamp(
-                        fixed_render_pkg["render_reflectance"],
-                        0.0,
-                        1.0,
-                    )
-                    fixed_illumination = torch.clamp(
-                        fixed_render_pkg["render_illumination"],
-                        0.0,
-                        1.0,
-                    )
-                    fixed_illumination_enhanced = torch.clamp(
-                        fixed_render_pkg["render_illumination_enhanced"],
-                        0.0,
-                        1.0,
-                    )
-                    fixed_coverage = coverage_for_monitor(
-                        fixed_render_pkg.get("render_coverage"),
-                        fixed_base,
-                    )
-                    fixed_coverage_low_ratio = (
-                        fixed_coverage < 0.95
-                    ).float().mean()
-                except Exception as monitor_error:
-                    fixed_monitor_error = repr(monitor_error)
-                    logger.exception(
-                        "[monitor] fixed camera render failed at %s iteration %d; "
-                        "training will continue.",
-                        monitor_stage,
-                        iteration,
-                    )
-                    fixed_base = torch.zeros_like(fixed_gt)
-                    fixed_enhanced = torch.zeros_like(fixed_gt)
-                    fixed_reflectance = torch.zeros_like(fixed_gt)
-                    fixed_illumination = torch.zeros_like(fixed_gt)
-                    fixed_illumination_enhanced = torch.zeros_like(fixed_gt)
-                    fixed_coverage = torch.zeros_like(fixed_gt[:1])
-                    fixed_coverage_low_ratio = torch.tensor(
-                        1.0,
-                        device=fixed_gt.device,
-                    )
-                enhancement_amplitude_values = torch.sigmoid(
-                    gaussians._enhancement_sg_amplitude.detach()
-                ).reshape(-1)
-                enhancement_sharpness_values = torch.nn.functional.softplus(
-                    gaussians._enhancement_sg_sharpness.detach()
-                ).reshape(-1)
-                enhancement_amplitude_q99 = torch.quantile(
-                    enhancement_amplitude_values.float(),
-                    0.99,
-                )
-                enhancement_sharpness_q99 = torch.quantile(
-                    enhancement_sharpness_values.float(),
-                    0.99,
-                )
-                enhancement_lr = next(
-                    (
-                        param_group["lr"]
-                        for param_group in gaussians.optimizer.param_groups
-                        if param_group.get("name") == "enhancement_sg_amplitude"
-                    ),
-                    0.0,
-                )
-                fixed_caption = (
-                    f"{monitor_stage} iteration={iteration}, "
-                    f"camera={monitor_camera.image_name}, "
-                    f"split={monitor_camera_split}"
-                )
-
-                image_log = {
-                    monitor_step_key: iteration,
-                    f"{random_prefix}/iteration": iteration,
-                    f"{random_prefix}/camera_name": str(viewpoint_cam.image_name),
-                    f"{random_prefix}/camera_uid": int(viewpoint_cam.uid),
-                    f"{random_prefix}/coverage_low_ratio": coverage_low_ratio,
-                    f"{random_prefix}/gt_lowlight": wandb_image(
-                        gt_image,
-                        random_caption,
-                    ),
-                    f"{random_prefix}/base_lowlight": wandb_image(
-                        random_base,
-                        random_caption,
-                    ),
-                    f"{random_prefix}/base_brightened": wandb_image(
-                        random_base_brightened,
-                        random_caption,
-                    ),
-                    f"{random_prefix}/enhanced": wandb_image(
-                        random_enhanced,
-                        random_caption,
-                    ),
-                    f"{random_prefix}/reflectance": wandb_image(
-                        reflectance_image,
-                        random_caption,
-                    ),
-                    f"{random_prefix}/illumination": wandb_image(
-                        illumination_image,
-                        random_caption,
-                    ),
-                    f"{random_prefix}/illumination_enhanced": wandb_image(
-                        illumination_enhanced_image,
-                        random_caption,
-                    ),
-                    f"{random_prefix}/coverage": wandb_image(
-                        random_coverage,
-                        random_caption,
-                    ),
-                    f"{random_prefix}/cidnet_target": wandb_image(
-                        random_refined,
-                        random_caption,
-                    ),
-                    f"{random_prefix}/gain_smooth_raw": L_gain_smooth_enhancement_raw,
-                    f"{random_prefix}/gain_smooth_weighted": L_gain_smooth_enhancement,
-                    f"{random_prefix}/edge_preserve_raw": L_enhancement_edge_preserve_raw,
-                    f"{random_prefix}/edge_preserve_weighted": L_enhancement_edge_preserve,
-                    f"{fixed_prefix}/iteration": iteration,
-                    f"{fixed_prefix}/camera_name": str(monitor_camera.image_name),
-                    f"{fixed_prefix}/camera_uid": int(monitor_camera.uid),
-                    f"{fixed_prefix}/camera_split": monitor_camera_split,
-                    f"{fixed_prefix}/render_error": fixed_monitor_error,
-                    f"{fixed_prefix}/anchor_count": int(gaussians.get_anchor.shape[0]),
-                    f"{fixed_prefix}/coverage_low_ratio": fixed_coverage_low_ratio,
-                    f"{fixed_prefix}/enhancement_grad_norm_pre_clip": enhancement_grad_norm,
-                    f"{fixed_prefix}/enhancement_lr": enhancement_lr,
-                    f"{fixed_prefix}/enhancement_amplitude_mean": enhancement_amplitude_values.mean(),
-                    f"{fixed_prefix}/enhancement_amplitude_max": enhancement_amplitude_values.max(),
-                    f"{fixed_prefix}/enhancement_amplitude_q99": enhancement_amplitude_q99,
-                    f"{fixed_prefix}/enhancement_sharpness_mean": enhancement_sharpness_values.mean(),
-                    f"{fixed_prefix}/enhancement_sharpness_max": enhancement_sharpness_values.max(),
-                    f"{fixed_prefix}/enhancement_sharpness_q99": enhancement_sharpness_q99,
-                    f"{fixed_prefix}/gt_lowlight": wandb_image(
-                        fixed_gt,
-                        fixed_caption,
-                    ),
-                    f"{fixed_prefix}/base_lowlight": wandb_image(
-                        fixed_base,
-                        fixed_caption,
-                    ),
-                    f"{fixed_prefix}/base_brightened": wandb_image(
-                        torch.clamp(fixed_base * enhance_ratio, 0.0, 1.0),
-                        fixed_caption,
-                    ),
-                    f"{fixed_prefix}/enhanced": wandb_image(
-                        fixed_enhanced,
-                        fixed_caption,
-                    ),
-                    f"{fixed_prefix}/reflectance": wandb_image(
-                        fixed_reflectance,
-                        fixed_caption,
-                    ),
-                    f"{fixed_prefix}/illumination": wandb_image(
-                        fixed_illumination,
-                        fixed_caption,
-                    ),
-                    f"{fixed_prefix}/illumination_enhanced": wandb_image(
-                        fixed_illumination_enhanced,
-                        fixed_caption,
-                    ),
-                    f"{fixed_prefix}/coverage": wandb_image(
-                        fixed_coverage,
-                        fixed_caption,
-                    ),
-                }
-                wandb.log(image_log)
-
-            # debug
-            if iteration % 600 == 0:
-                residual_scaled_debug = residual_image * enhance_ratio
-                residual_used_scaled_debug = residual_image_for_loss * enhance_ratio
-                print("reflectance_image", reflectance_image.mean())
-                print("illumination_image", illumination_image.mean())
-                print("sg_energy", L_sg_energy)
-                print("sg_lambda_mean", L_sg_sharpness)
-                print("asg_energy", L_asg_energy)
-                print("asg_lambda_mean", L_asg_sharpness)
-                print("asg_anisotropy", L_asg_anisotropy)
-                print("residual_image_raw_mean", residual_scaled_debug.mean())
-                print("residual_abs_mean_raw", residual_scaled_debug.abs().mean())
-                print("residual_abs_mean_used", residual_used_scaled_debug.abs().mean())
-                print("reflectance_edge_mean", L_reflectance_edge)
-                print("reflectance_edge_uplift_mean", L_reflectance_edge_uplift)
-                print("reflectance_contrast_mean", L_reflectance_contrast)
-                print("reflectance_highfreq_mean", L_reflectance_highfreq)
-                print("reflectance_detail_mean", L_reflectance_detail)
-                print("reflectance_decoder_mean", L_reflectance_decoder)
-                print("reflectance_highlight_mean", L_reflectance_highlight)
-                print("residual_chroma_mean", residual_chroma_mean)
-                if dataset.use_dual_transient:
-                    print("noise_abs_mean", noise_abs_mean)
-                    print("artifact_abs_mean", artifact_abs_mean)
-                    print("noise_zero_mean", L_noise_zero_mean)
-                    print("noise_highfreq_mean", L_noise_highfreq)
-                    print("artifact_chroma_mean", artifact_chroma_mean)
-                    print("residual_mix_weight", residual_mix_weight)
-                    print("noise_mask_coverage", noise_mask_coverage)
-                    print("artifact_mask_coverage", artifact_mask_coverage)
-                    print("residual_chroma_boost", L_residual_chroma_boost)
-                print("enhancement_color_mean", L_enhanced_color)
-                print("enhancement_color_std", L_enhanced_color_std)
-                print("enhancement_green_bias", L_enhanced_green_bias)
-                print("enhancement_gain_smooth_raw", L_gain_smooth_enhancement_raw)
-                print("enhancement_gain_smooth_weighted", L_gain_smooth_enhancement)
-                print("enhancement_edge_preserve_raw", L_enhancement_edge_preserve_raw)
-                print("enhancement_edge_preserve_weighted", L_enhancement_edge_preserve)
-                print("enhancement_illumination_guidance", L_diff_illumination)
-                print("enhancement_reflectance_guidance", L_diff_reflectance)
-                print("image", base_image.mean())
-                print("gt_image", gt_image.mean())
-
-            
-            # Progress bar
-            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-            anchor_count = int(gaussians.get_anchor.shape[0])
-
-            if iteration % 10 == 0:
-                if mode=="warmup" or not dataset.use_residual:
-                    progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{4}f}","L1": f"{Ll1:.{4}f}", "L_smooth": f"{L_smooth:.{5}f}","L_depth_similarity": f"{L_depth_similarity:.{5}f}", "L_sg": f"{L_sg_energy:.{5}f}", "Anchors": anchor_count})
-                else:
-                    progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{4}f}","L1": f"{Ll1:.{4}f}", "L_illu": f"{L_illu:.{5}f}", "L_smooth": f"{L_smooth:.{5}f}","L_depth_similarity": f"{L_depth_similarity:.{5}f}", "L_residual_reg": f"{L_residual_reg:.{5}f}", "L_sg": f"{L_sg_energy:.{5}f}", "Anchors": anchor_count})
-                progress_bar.update(10)
-
-            if iteration % 100 == 0:
-                coverage_value = float(coverage_low_ratio.detach().cpu())
-                logger.info(
-                    "[anchor] iter=%d anchors=%d coverage_low_ratio=%.6f",
-                    iteration,
-                    anchor_count,
-                    coverage_value,
-                )
-                if tb_writer:
-                    tb_writer.add_scalar(f'{dataset_name}/anchors', anchor_count, iteration)
-                    tb_writer.add_scalar(f'{dataset_name}/coverage_low_ratio', coverage_value, iteration)
-            
-
-            if iteration == opt.iterations:
-                progress_bar.close()
-
-            # Log and save"
-            training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger, dataset.kernel_size)
-            if (iteration in saving_iterations):
-                logger.info("\n[ITER {}] Saving Gaussians".format(iteration))
-                scene.save(iteration)
-                save_pose(scene.model_path + '/pose' + f"/pose_{iteration}.npy", gaussians.P, train_cams_init)
-
-            timing_stats['log_time'] = timing_stats.get('log_time', 0) + (time.time() - t1)
-            # densification
-            t1 = time.time()
-            if mode == "warmup":
-                # Preserve the complete initial point cloud, then make three
-                # small coverage-oriented updates (1400/1600/1800 by default).
-                # Pruning is deliberately disabled until the main stage.
-                if iteration < opt.warmup_update_until and iteration > opt.warmup_start_stat:
-                    gaussians.training_statis(
-                        viewspace_point_tensor,
-                        opacity,
-                        visibility_filter,
-                        offset_selection_mask,
-                        voxel_visible_mask,
-                    )
-                    if (
-                        iteration > opt.warmup_update_from
-                        and iteration % opt.warmup_update_interval == 0
-                    ):
-                        densification_stats = gaussians.adjust_anchor(
-                            check_interval=opt.warmup_update_interval,
-                            success_threshold=opt.warmup_success_threshold,
-                            grad_threshold=opt.warmup_densify_grad_threshold,
-                            min_opacity=opt.min_opacity,
-                            mode=mode,
-                            max_anchors=opt.max_anchors,
-                            max_new_anchors=opt.warmup_max_new_anchors,
-                            level_caps=opt.warmup_level_caps,
-                            current_iteration=iteration,
-                            prune_grace_iters=opt.anchor_prune_grace_iters,
-                            prune_from_iter=opt.prune_from_iter,
-                            max_pruned_anchors=opt.max_pruned_anchors_per_update,
-                            allow_prune=False,
-                        )
-                        log_densification("warmup", iteration, densification_stats)
-                        gaussians.compute_3D_filter(cameras=trainCameras)
-            else:
-                if iteration < opt.update_until and iteration > opt.start_stat:
-                    # add statis
-                    gaussians.training_statis(viewspace_point_tensor, opacity, visibility_filter, offset_selection_mask, voxel_visible_mask)
-                    # densification
-                    if iteration > opt.update_from and iteration % opt.update_interval == 0:
-                        densification_stats = gaussians.adjust_anchor(
-                            check_interval=opt.update_interval,
-                            success_threshold=opt.success_threshold,
-                            grad_threshold=opt.densify_grad_threshold,
-                            min_opacity=opt.min_opacity,
-                            mode=mode,
-                            max_anchors=opt.max_anchors,
-                            max_new_anchors=opt.max_new_anchors_per_update,
-                            level_caps=opt.densify_level_caps,
-                            current_iteration=iteration,
-                            prune_grace_iters=opt.anchor_prune_grace_iters,
-                            prune_from_iter=opt.prune_from_iter,
-                            max_pruned_anchors=opt.max_pruned_anchors_per_update,
-                        )
-                        log_densification("main", iteration, densification_stats)
-                        gaussians.compute_3D_filter(cameras=trainCameras)
-                elif iteration == opt.update_until:
-                    del gaussians.opacity_accum
-                    del gaussians.offset_gradient_accum
-                    del gaussians.offset_denom
-                    torch.cuda.empty_cache()
-                if iteration % 100 == 0 and iteration > opt.update_until:
-                    if iteration < opt.iterations - 100:
-                        # don't update in the end of training
-                        gaussians.compute_3D_filter(cameras=trainCameras)
-
-            
-            timing_stats['densification_time'] = timing_stats.get('densification_time', 0) + (time.time() - t1)
-
-            # Optimizer step
-            if iteration < opt.iterations:
-                gaussians.optimizer.step()
-                gaussians.optimizer.zero_grad(set_to_none = True)
-            if (iteration in checkpoint_iterations):
-                logger.info("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
-           
-            timing_stats['total_time'] = timing_stats.get('total_time', 0) + (time.time() - t0)
-
-def prepare_output_and_logger(args):    
+def prepare_output_and_logger(args):
     if not args.model_path:
-        if os.getenv('OAR_JOB_ID'):
-            unique_str=os.getenv('OAR_JOB_ID')
-        else:
-            unique_str = str(uuid.uuid4())
-        args.model_path = os.path.join("./output/", unique_str[0:10])
-        
-    # Set up output folder
-    print("Output folder: {}".format(args.model_path))
-    os.makedirs(args.model_path, exist_ok = True)
-    with open(os.path.join(args.model_path, "cfg_args"), 'w') as cfg_log_f:
-        cfg_log_f.write(str(Namespace(**vars(args))))
+        args.model_path = os.path.join("./output", str(uuid.uuid4())[:10])
+    os.makedirs(args.model_path, exist_ok=True)
+    with open(os.path.join(args.model_path, "cfg_args"), "w", encoding="utf-8") as handle:
+        handle.write(str(Namespace(**vars(args))))
+    return SummaryWriter(args.model_path) if TENSORBOARD_FOUND else None
 
-    # Create Tensorboard writer
-    tb_writer = None
-    if TENSORBOARD_FOUND:
-        tb_writer = SummaryWriter(args.model_path)
-    else:
-        print("Tensorboard not available: not logging progress")
-    return tb_writer
 
-def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, wandb=None, logger=None, kernel_size=None):
-    if tb_writer:
-        tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/l1_loss', Ll1.item(), iteration)
-        tb_writer.add_scalar(f'{dataset_name}/train_loss_patches/total_loss', loss.item(), iteration)
-        tb_writer.add_scalar(f'{dataset_name}/iter_time', elapsed, iteration)
-
-
-    
-    # Report test and samples of training set
-    if iteration in testing_iterations:
-        scene.gaussians.eval()
-        torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
-
-        for config in validation_configs:
-            if config['cameras'] and len(config['cameras']) > 0:
-                l1_test = 0.0
-                psnr_test = 0.0
-                
-                if wandb is not None:
-                    gt_image_list = []
-                    render_image_list = []
-
-                for idx, viewpoint in enumerate(config['cameras']):
-                ##
-                    pose = scene.gaussians.get_RT(viewpoint.uid)
-                    voxel_visible_mask = prefilter_voxel(viewpoint, scene.gaussians, *renderArgs,  kernel_size=kernel_size, camera_pose=pose)
-                    report_render_pkg = renderFunc(
-                        viewpoint,
-                        scene.gaussians,
-                        *renderArgs,
-                        visible_mask=voxel_visible_mask,
-                        kernel_size=kernel_size,
-                        camera_pose=pose,
-                    )
-                    image = compose_decomposed_render(report_render_pkg)
-                ##
-                    gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
-                    if tb_writer and (idx < 30):
-                        tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
-                        tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/errormap".format(viewpoint.image_name), (gt_image[None]-image[None]).abs(), global_step=iteration)
-
-                        if wandb:
-                            render_image_list.append(image[None])
-                            # errormap_list.append((gt_image[None]-image[None]).abs())
-                            
-                        if iteration == testing_iterations[0]:
-                            tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name), gt_image[None], global_step=iteration)
-                            if wandb:
-                                gt_image_list.append(gt_image[None])
-
-                    l1_test += l1_loss(image, gt_image).mean().double()
-                    psnr_test += psnr(image, gt_image).mean().double()
-
-                
-                
-                psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])          
-                logger.info("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
-
-                
-                if tb_writer:
-                    tb_writer.add_scalar(f'{dataset_name}/'+config['name'] + '/loss_viewpoint - l1_loss', l1_test, iteration)
-                    tb_writer.add_scalar(f'{dataset_name}/'+config['name'] + '/loss_viewpoint - psnr', psnr_test, iteration)
-                if wandb is not None:
-                    wandb.log({f"{config['name']}_loss_viewpoint_l1_loss":l1_test, f"{config['name']}_PSNR":psnr_test})
-
-        if tb_writer:
-            tb_writer.add_scalar(f'{dataset_name}/'+'total_points', scene.gaussians.get_anchor.shape[0], iteration)
-        torch.cuda.empty_cache()
-
-        scene.gaussians.train()
-
-
-
-def render_set_optimize(model_path, name, iteration, views, gaussians, pipeline, background, kernel_size):
-    render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
-    render_reflectance_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_reflectances")
-    render_illumination_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_illuminations")
-    render_enhanced_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_enhanceds")
-    render_depth_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_depths")
-    render_residual_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_residuals")
-    error_path = os.path.join(model_path, name, "ours_{}".format(iteration), "errors")
-    gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
-    makedirs(render_path, exist_ok=True)
-    makedirs(render_reflectance_path, exist_ok=True)
-    makedirs(render_illumination_path, exist_ok=True)
-    makedirs(render_enhanced_path, exist_ok=True)
-    makedirs(render_depth_path, exist_ok=True)
-    makedirs(render_residual_path, exist_ok=True)
-    makedirs(error_path, exist_ok=True)
-    makedirs(gts_path, exist_ok=True)
-
-    depth_curve_fn = lambda x: -np.log(x + np.finfo(np.float32).eps)
-
-    gaussians._anchor.requires_grad_(False)
-    gaussians._offset.requires_grad_(False)
-    gaussians._scaling.requires_grad_(False)
-    gaussians._rotation.requires_grad_(False)
-    gaussians._opacity.requires_grad_(False)
-    gaussians.eval()
-
-    from utils.pose_utils import get_tensor_from_camera
-    for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
-        num_iter = 500
-        camera_pose = get_tensor_from_camera(view.world_view_transform.transpose(0, 1))
-
-        camera_tensor_T = camera_pose[-3:].requires_grad_(True)
-        camera_tensor_q = camera_pose[:4].requires_grad_(True)
-        pose_optimizer = torch.optim.Adam([
-            {"params": [camera_tensor_T], "lr": 0.0003},
-            {"params": [camera_tensor_q], "lr": 0.0001}
-        ],
-        betas=(0.9, 0.999),
-        weight_decay=1e-4
-        )
-
-        # Add a learning rate scheduler
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(pose_optimizer, T_max=num_iter, eta_min=0.0001)
-        with tqdm(total=num_iter, desc=f"Tracking Time Step: {idx+1}", leave=True) as progress_bar:
-            candidate_q = camera_tensor_q.clone().detach()
-            candidate_T = camera_tensor_T.clone().detach()
-            current_min_loss = float(1e20)
-            gt = view.original_image[0:3, :, :]
-            initial_loss = None
-
-            for iteration in range(num_iter):
-                # rendering = render(view, gaussians, pipeline, background, camera_pose=torch.cat([camera_tensor_q, camera_tensor_T]))["render"]
-                voxel_visible_mask = prefilter_voxel(view, gaussians, pipeline, background, kernel_size=kernel_size, camera_pose=torch.cat([camera_tensor_q, camera_tensor_T]))
-                render_pkg = render(view, gaussians, pipeline, background, kernel_size=kernel_size, visible_mask=voxel_visible_mask, camera_pose=torch.cat([camera_tensor_q, camera_tensor_T]))
-                rendering = compose_decomposed_render(render_pkg)
-                black_hole_threshold = 0.0
-                mask = (rendering > black_hole_threshold).float()
-                loss = torch.abs(l1_plus_loss(rendering, gt) * mask).mean()
-                loss.backward()
-                with torch.no_grad():
-                    pose_optimizer.step()
-                    pose_optimizer.zero_grad(set_to_none=True)
-
-                    if iteration == 0:
-                        initial_loss = loss.item()  # Capture initial loss
-
-                    if loss < current_min_loss:
-                        current_min_loss = loss
-                        candidate_q = camera_tensor_q.clone().detach()
-                        candidate_T = camera_tensor_T.clone().detach()
-
-                    progress_bar.update(1)
-                    progress_bar.set_postfix(loss=loss.item(), initial_loss=initial_loss)
-                scheduler.step()
-
-            camera_tensor_q = candidate_q
-            camera_tensor_T = candidate_T
-        with torch.no_grad():
-            optimal_pose = torch.cat([camera_tensor_q, camera_tensor_T])
-            voxel_visible_mask = prefilter_voxel(view, gaussians, pipeline, background, kernel_size=kernel_size, camera_pose=optimal_pose)
-            render_pkg_opt = render(view, gaussians, pipeline, background, kernel_size=kernel_size, visible_mask=voxel_visible_mask, camera_pose=optimal_pose)
-
-        
-            
-            rendering = compose_decomposed_render(render_pkg_opt)
-            rendering_reflectance = torch.clamp(render_pkg_opt["render_reflectance"], 0.0, 1.0)
-            rendering_illumination = torch.clamp(render_pkg_opt["render_illumination"] , 0.0, 1.0)
-            rendering_enhanced = compose_decomposed_render(render_pkg_opt, enhanced=True)
-            rendering_depth = 1 - minmax_normalize(render_pkg["render_depth"])
-            if 'render_residual' in render_pkg:
-                rendering_residual = torch.clamp(render_pkg["render_residual"], 0.0, 1.0)
-                torchvision.utils.save_image(rendering_residual, os.path.join(render_residual_path, view.image_name + ".png"))
-
-
-
-            # gts
-            gt = view.original_image[0:3, :, :]
-            
-            # error maps
-            errormap = (rendering - gt).abs()
-
-
-            torchvision.utils.save_image(rendering, os.path.join(render_path, view.image_name + ".png"))
-            torchvision.utils.save_image(rendering_reflectance, os.path.join(render_reflectance_path, view.image_name + ".png"))
-            torchvision.utils.save_image(rendering_illumination, os.path.join(render_illumination_path, view.image_name + ".png"))
-            torchvision.utils.save_image(rendering_enhanced, os.path.join(render_enhanced_path, view.image_name + ".png"))
-
-            torchvision.utils.save_image(rendering_depth, os.path.join(render_depth_path, view.image_name + ".png"))
-            torchvision.utils.save_image(errormap, os.path.join(error_path, view.image_name + ".png"))
-            torchvision.utils.save_image(gt, os.path.join(gts_path, view.image_name + ".png"))
-
-            depth_est = rendering_depth.squeeze().cpu().numpy()
-            depth_est = visualize_cmap(depth_est, np.ones_like(depth_est), cm.get_cmap('turbo'), curve_fn=depth_curve_fn).copy()
-            depth_est = torch.as_tensor(depth_est).permute(2,0,1)
-            torchvision.utils.save_image(depth_est, os.path.join(render_depth_path, 'color_{0:05d}'.format(idx) + ".png"))
-
-
-    with torch.no_grad():
-        print(">>> Calculate FPS: ")
-        fps_list = []
-        for _ in range(1000):
-            start = perf_counter()
-            _ = render(view, gaussians, pipeline, background, kernel_size=kernel_size, camera_pose=optimal_pose)
-            end = perf_counter()
-            fps_list.append(end - start)        
-        fps_list.sort()
-        fps_list = fps_list[100:900]
-        fps = 1 / (sum(fps_list) / len(fps_list))
-        print(">>> FPS = ", fps)
-        with open(f"{model_path}/total_fps.json", 'a') as fp:
-            json.dump(f'{fps}', fp, indent=True)
-            fp.write('\n')
-
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background, kernel_size):
-    render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
-    render_reflectance_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_reflectances")
-    render_illumination_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_illuminations")
-    render_enhanced_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_enhanceds")
-    render_depth_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_depths")
-    render_residual_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_residuals")
-    error_path = os.path.join(model_path, name, "ours_{}".format(iteration), "errors")
-    gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
-    makedirs(render_path, exist_ok=True)
-    makedirs(render_reflectance_path, exist_ok=True)
-    makedirs(render_illumination_path, exist_ok=True)
-    makedirs(render_enhanced_path, exist_ok=True)
-    makedirs(render_depth_path, exist_ok=True)
-    makedirs(render_residual_path, exist_ok=True)
-    makedirs(error_path, exist_ok=True)
-    makedirs(gts_path, exist_ok=True)
-    depth_curve_fn = lambda x: -np.log(x + np.finfo(np.float32).eps)
-    t_list = []
-    visible_count_list = []
-    name_list = []
-    per_view_dict = {}
-    for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
-        
-        torch.cuda.synchronize();t_start = time.time()
-        ####
-        pose = gaussians.get_RT(view.uid)
-        ####
-        voxel_visible_mask = prefilter_voxel(view, gaussians, pipeline, background, kernel_size=kernel_size, camera_pose=pose)
-        render_pkg = render(view, gaussians, pipeline, background, kernel_size=kernel_size, visible_mask=voxel_visible_mask, camera_pose=pose)
-        torch.cuda.synchronize();t_end = time.time()
-
-        t_list.append(t_end - t_start)
-
-        # renders
-        rendering = compose_decomposed_render(render_pkg)
-        rendering_reflectance = torch.clamp(render_pkg["render_reflectance"], 0.0, 1.0)
-        rendering_illumination = torch.clamp(render_pkg["render_illumination"] , 0.0, 1.0)
-        rendering_enhanced = compose_decomposed_render(render_pkg, enhanced=True)
-        rendering_depth = 1 - minmax_normalize(render_pkg["render_depth"])
-        if 'render_residual' in render_pkg:
-            rendering_residual = torch.clamp(render_pkg["render_residual"], 0.0, 1.0)
-            torchvision.utils.save_image(rendering_residual, os.path.join(render_residual_path, view.image_name + ".png"))
-        visible_count = (render_pkg["radii"] > 0).sum()
-        visible_count_list.append(visible_count)
-
-
-        # gts
-        gt = view.original_image[0:3, :, :]
-        
-        # error maps
-        errormap = (rendering - gt).abs()
-
-
-        name_list.append(view.image_name + ".png")
-        torchvision.utils.save_image(rendering, os.path.join(render_path, view.image_name + ".png"))
-        torchvision.utils.save_image(rendering_reflectance, os.path.join(render_reflectance_path, view.image_name + ".png"))
-        torchvision.utils.save_image(rendering_illumination, os.path.join(render_illumination_path, view.image_name + ".png"))
-        torchvision.utils.save_image(rendering_enhanced, os.path.join(render_enhanced_path, view.image_name + ".png"))
-
-        torchvision.utils.save_image(rendering_depth, os.path.join(render_depth_path, view.image_name + ".png"))
-        torchvision.utils.save_image(errormap, os.path.join(error_path, view.image_name + ".png"))
-        torchvision.utils.save_image(gt, os.path.join(gts_path, view.image_name + ".png"))
-
-        depth_est = rendering_depth.squeeze().cpu().numpy()
-        depth_est = visualize_cmap(depth_est, np.ones_like(depth_est), cm.get_cmap('turbo'), curve_fn=depth_curve_fn).copy()
-        depth_est = torch.as_tensor(depth_est).permute(2,0,1)
-        torchvision.utils.save_image(depth_est, os.path.join(render_depth_path, 'color_{0:05d}'.format(idx) + ".png"))
-
-        per_view_dict[view.image_name + ".png"] = visible_count.item()
-    
-    with open(os.path.join(model_path, name, "ours_{}".format(iteration), "per_view_count.json"), 'w') as fp:
-            json.dump(per_view_dict, fp, indent=True)
-    
-    return t_list, visible_count_list
-
-def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train=False, skip_test=False, wandb=None, tb_writer=None, dataset_name=None, logger=None):
-    gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
-                              dataset.appearance_residual_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_reflectance_dist, dataset.add_illumination_dist, dataset.add_residual_dist, dataset.use_residual, dataset.use_dual_transient, dataset.use_3D_filter,
-                              use_sg_illumination=dataset.use_sg_illumination, use_asg_illumination=dataset.use_asg_illumination, illumination_mode=dataset.illumination_mode, reflectance_mode=dataset.reflectance_mode, sg_lobes=dataset.sg_lobes, sg_lambda_min=dataset.sg_lambda_min, asg_lobes=dataset.asg_lobes, asg_lambda_min=dataset.asg_lambda_min)
-    scene = Scene(dataset, gaussians, depth_piror_model=None, load_iteration=iteration, shuffle=False)
-    gaussians.eval()
-
-    bg_color = [1,1,1] if dataset.white_background else [0, 0, 0]
-    background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-    if not os.path.exists(dataset.model_path):
-        os.makedirs(dataset.model_path)
-
-    visible_count = None
-
-    with torch.no_grad():
-        if not skip_train:
-            t_train_list, visible_count  = render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, dataset.kernel_size)
-            train_fps = 1.0 / torch.tensor(t_train_list[5:]).mean()
-            logger.info(f'Train FPS: \033[1;35m{train_fps.item():.5f}\033[0m')
-            if wandb is not None:
-                wandb.log({"train_fps":train_fps.item(), })
-
-    if not skip_test:
-        gaussians.init_RT_seq(scene.test_cameras)
-        with torch.enable_grad():
-            render_set_optimize(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, dataset.kernel_size)
-
-    return visible_count
-
-
-def readImages(renders_dir, gt_dir):
-    renders = []
-    gts = []
-    image_names = []
-    for fname in os.listdir(renders_dir):
-        render = Image.open(renders_dir / fname)
-        gt = Image.open(gt_dir / fname)
-        renders.append(tf.to_tensor(render).unsqueeze(0)[:, :3, :, :].cuda())
-        gts.append(tf.to_tensor(gt).unsqueeze(0)[:, :3, :, :].cuda())
-        image_names.append(fname)
-    return renders, gts, image_names
-
-
-def evaluate(model_paths, visible_count=None, wandb=None, tb_writer=None, dataset_name=None, logger=None):
-
-    full_dict = {}
-    per_view_dict = {}
-    full_dict_polytopeonly = {}
-    per_view_dict_polytopeonly = {}
-    print("")
-    
-    scene_dir = model_paths
-    full_dict[scene_dir] = {}
-    per_view_dict[scene_dir] = {}
-    full_dict_polytopeonly[scene_dir] = {}
-    per_view_dict_polytopeonly[scene_dir] = {}
-
-    test_dir = Path(scene_dir) / "test"
-
-    for method in os.listdir(test_dir):
-
-        full_dict[scene_dir][method] = {}
-        per_view_dict[scene_dir][method] = {}
-        full_dict_polytopeonly[scene_dir][method] = {}
-        per_view_dict_polytopeonly[scene_dir][method] = {}
-
-        method_dir = test_dir / method
-        gt_dir = method_dir/ "gt"
-        renders_dir = method_dir / "renders"
-        renders, gts, image_names = readImages(renders_dir, gt_dir)
-
-        ssims = []
-        psnrs = []
-        lpipss = []
-
-        for idx in tqdm(range(len(renders)), desc="Metric evaluation progress"):
-            ssims.append(ssim(renders[idx], gts[idx]))
-            psnrs.append(psnr(renders[idx], gts[idx]))
-            lpipss.append(lpips_fn(renders[idx], gts[idx]).detach())
-        
-        # if wandb is not None:
-        #     wandb.log({"test_SSIMS":torch.stack(ssims).mean().item(), })
-        #     wandb.log({"test_PSNR_final":torch.stack(psnrs).mean().item(), })
-        #     wandb.log({"test_LPIPS":torch.stack(lpipss).mean().item(), })
-
-        logger.info(f"model_paths: \033[1;35m{model_paths}\033[0m")
-        logger.info("  SSIM : \033[1;35m{:>12.7f}\033[0m".format(torch.tensor(ssims).mean(), ".5"))
-        logger.info("  PSNR : \033[1;35m{:>12.7f}\033[0m".format(torch.tensor(psnrs).mean(), ".5"))
-        logger.info("  LPIPS: \033[1;35m{:>12.7f}\033[0m".format(torch.tensor(lpipss).mean(), ".5"))
-        print("")
-
-
-        if tb_writer:
-            tb_writer.add_scalar(f'{dataset_name}/SSIM', torch.tensor(ssims).mean().item(), 0)
-            tb_writer.add_scalar(f'{dataset_name}/PSNR', torch.tensor(psnrs).mean().item(), 0)
-            tb_writer.add_scalar(f'{dataset_name}/LPIPS', torch.tensor(lpipss).mean().item(), 0)
-            
-            tb_writer.add_scalar(f'{dataset_name}/VISIBLE_NUMS', _visible_count_value(visible_count), 0)
-        
-        full_dict[scene_dir][method].update({"SSIM": torch.tensor(ssims).mean().item(),
-                                                "PSNR": torch.tensor(psnrs).mean().item(),
-                                                "LPIPS": torch.tensor(lpipss).mean().item()})
-        per_view_dict[scene_dir][method].update({"SSIM": {name: ssim for ssim, name in zip(torch.tensor(ssims).tolist(), image_names)},
-                                                    "PSNR": {name: psnr for psnr, name in zip(torch.tensor(psnrs).tolist(), image_names)},
-                                                    "LPIPS": {name: lp for lp, name in zip(torch.tensor(lpipss).tolist(), image_names)},
-                                                    "VISIBLE_COUNT": _visible_count_per_view(visible_count, image_names)})
-
-    with open(scene_dir + "/results.json", 'w') as fp:
-        json.dump(full_dict[scene_dir], fp, indent=True)
-    with open(scene_dir + "/per_view.json", 'w') as fp:
-        json.dump(per_view_dict[scene_dir], fp, indent=True)
-    
 def get_logger(path):
-    import logging
-
-    logger = logging.getLogger()
-    logger.setLevel(logging.INFO) 
-    fileinfo = logging.FileHandler(os.path.join(path, "outputs.log"))
-    fileinfo.setLevel(logging.INFO) 
-    controlshow = logging.StreamHandler()
-    controlshow.setLevel(logging.INFO)
+    logger = logging.getLogger(f"ll-gaussian-v2:{os.path.abspath(path)}")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
     formatter = logging.Formatter("%(asctime)s - %(levelname)s: %(message)s")
-    fileinfo.setFormatter(formatter)
-    controlshow.setFormatter(formatter)
-
-    logger.addHandler(fileinfo)
-    logger.addHandler(controlshow)
-
+    for handler in (logging.FileHandler(os.path.join(path, "outputs.log")), logging.StreamHandler()):
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
     return logger
 
-if __name__ == "__main__":
-    # Set up command line argument parser
-    parser = ArgumentParser(description="Training script parameters")
-    lp = ModelParams(parser)
-    op = OptimizationParams(parser)
-    pp = PipelineParams(parser)
-    parser.add_argument('--ip', type=str, default="127.0.0.1")
-    parser.add_argument('--port', type=int, default=6009)
-    parser.add_argument('--debug_from', type=int, default=-1)
-    parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument('--warmup', action='store_true', default=False)
-    parser.add_argument('--use_wandb', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[5_000,10000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[8000,10_000])
-    parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
-    parser.add_argument("--start_checkpoint", type=str, default = None)
-    parser.add_argument("--gpu", type=str, default = '-1')
-    parser.add_argument("--optim_pose", action="store_true", default=True)
-    parser.add_argument("--config", type=str)
-    args = parser.parse_args(sys.argv[1:])
-    args.save_iterations.append(args.iterations)
-    if args.use_residual:
-        print("[deprecated] --use_residual is ignored; new training always uses the residual-free primary renderer.")
-    args.use_residual = False
-    args.use_dual_transient = False
 
-    
-    # enable logging
-    
-    model_path = args.model_path
-    os.makedirs(model_path, exist_ok=True)
-
-    logger = get_logger(model_path)
+def _project_path(path: str) -> str:
+    return path if os.path.isabs(path) else os.path.join(PROJECT_ROOT, path)
 
 
-    logger.info(f'args: {args}')
+def _stablesr_path(root: str, path: str) -> str:
+    if os.path.isabs(path):
+        return path
+    candidate = os.path.join(root, path)
+    return candidate if os.path.exists(candidate) else _project_path(path)
 
-    if args.gpu != '-1':
-        os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
-        os.system("echo $CUDA_VISIBLE_DEVICES")
-        logger.info(f'using GPU {args.gpu}')
 
-    
+def _default_enhancement_prior_directory(dataset, input_gain: float) -> str:
+    if dataset.enhancement_prior_backend == "cidnet":
+        return SCENE_ENHANCEMENT_PRIOR_DIRECTORY
+    # StableSR caches are scene-local and keyed by their explicit input gain.
+    return stablesr_prior_directory_name(input_gain)
 
-    try:
-        saveRuntimeCode(os.path.join(args.model_path, 'backup'))
-    except:
-        logger.info(f'save code failed~')
-        
-    dataset = os.path.basename(os.path.normpath(args.source_path))
-    # Use the experiment directory itself for WandB rather than its parent
-    # (which is commonly the uninformative literal "outputs").
-    exp_name = os.path.basename(os.path.normpath(args.model_path))
-    
-    if args.use_wandb:
-        wandb.login()
-        # import pdb;pdb.set_trace()
-        run = wandb.init(
-            # Set the project where this run will be logged
-            project=f"Scaffold-GS-{dataset}",
-            name=exp_name,
-            # Track hyperparameters and run metadata
-            settings=wandb.Settings(start_method="fork"),
-            # mode="online",
-            config=vars(args)
+
+def _run_prior_command(command: list[str], output: str, prior_name: str, logger) -> None:
+    logger.info("Generating fixed %s prior once at %s", prior_name, output)
+    subprocess.run(command, cwd=PROJECT_ROOT, check=True)
+    manifest = os.path.join(output, "manifest.json")
+    if not os.path.isfile(manifest):
+        raise RuntimeError(f"{prior_name} preprocessing completed without creating {manifest}")
+
+
+def _ensure_training_priors(dataset, logger) -> None:
+    """Reuse scene-local v2 priors or generate each missing cache exactly once.
+
+    Loading order follows the clean reference LL-Gaussian: the DepthAnything
+    prior is prepared first, the enhancement prior second, and an existing
+    cache is loaded without regenerating anything.
+    """
+    backend = dataset.enhancement_prior_backend.lower()
+    if backend not in ENHANCEMENT_PRIOR_BACKENDS:
+        raise ValueError(
+            f"enhancement_prior_backend must be one of {sorted(ENHANCEMENT_PRIOR_BACKENDS)}, "
+            f"got {dataset.enhancement_prior_backend!r}"
         )
-        wandb.define_metric("warmup_iteration")
-        wandb.define_metric("main_iteration")
-        wandb.define_metric(
-            "monitor/warmup/*",
-            step_metric="warmup_iteration",
+    dataset.enhancement_prior_backend = backend
+    dataset.depth_prior_path = os.path.abspath(
+        dataset.depth_prior_path
+        or os.path.join(dataset.source_path, SCENE_DEPTH_PRIOR_DIRECTORY)
+    )
+    input_gain = float(dataset.stablesr_input_gain)
+    if backend == "stablesr" and input_gain <= 0.0:
+        raise ValueError("--stablesr_input_gain must be explicitly greater than zero")
+    # Brightness is observed only for the clean-reference W&B display. It is
+    # deliberately not reused as a training target or StableSR input gain.
+    scene_brightness = _training_split_brightness(dataset)
+    dataset.scene_mean_brightness = scene_brightness
+    dataset.wandb_display_gain = _wandb_display_gain(scene_brightness)
+    if backend == "stablesr":
+        logger.info("[prior] StableSR input gain is explicit: %.4f", input_gain)
+    logger.info(
+        "[INFO] W&B-only clean-reference display: scene mean %.5f, gain %.1f",
+        scene_brightness,
+        dataset.wandb_display_gain,
+    )
+    dataset.enhancement_prior_path = os.path.abspath(
+        dataset.enhancement_prior_path
+        or os.path.join(
+            dataset.source_path,
+            _default_enhancement_prior_directory(dataset, input_gain),
         )
-        wandb.define_metric(
-            "monitor/main/*",
-            step_metric="main_iteration",
+    )
+    common = [
+        "--source_path",
+        dataset.source_path,
+        "--images",
+        dataset.images,
+        "--lod",
+        str(dataset.lod),
+    ]
+    if dataset.eval:
+        common.append("--eval")
+
+    if prior_generation_required(dataset.depth_prior_path, "DepthAnything"):
+        depth_root = _project_path(dataset.depth_anything_root)
+        checkpoint_name = os.path.basename(dataset.depth_anything_checkpoint)
+        depth_checkpoint = resolve_required_file(
+            [
+                _project_path(dataset.depth_anything_checkpoint),
+                os.path.join(depth_root, "checkpoints", checkpoint_name),
+                os.path.join(PROJECT_ROOT, "checkpoints", checkpoint_name),
+            ],
+            f"DepthAnything {dataset.depth_anything_encoder} checkpoint",
+            "--depth_anything_checkpoint",
+        )
+        logger.info("[prior 1/2] DepthAnything cache missing: loading model once")
+        _run_prior_command(
+            [
+                sys.executable,
+                os.path.join(PROJECT_ROOT, "scripts", "precompute_depth_prior.py"),
+                *common,
+                "--output",
+                dataset.depth_prior_path,
+                "--depth_anything_root",
+                depth_root,
+                "--encoder",
+                dataset.depth_anything_encoder,
+                "--checkpoint",
+                depth_checkpoint,
+                "--input_size",
+                str(dataset.depth_anything_input_size),
+                "--device",
+                "cuda",
+            ],
+            dataset.depth_prior_path,
+            "DepthAnything",
+            logger,
         )
     else:
-        wandb = None
-    
-    logger.info("Optimizing " + args.model_path)
+        logger.info(
+            "[prior 1/2] Reusing existing DepthAnything cache at %s",
+            dataset.depth_prior_path,
+        )
 
-    # Initialize system state (RNG)
+    enhancement_name = "CIDNet" if backend == "cidnet" else "StableSR"
+    if prior_generation_required(dataset.enhancement_prior_path, enhancement_name):
+        logger.info(
+            "[prior 2/2] %s cache missing: loading model once",
+            enhancement_name,
+        )
+        if backend == "cidnet":
+            cidnet_weights = resolve_required_file(
+                [
+                    _project_path(dataset.cidnet_weights),
+                    os.path.join(
+                        _project_path(dataset.cidnet_root),
+                        "weights",
+                        "LOLv2_real",
+                        os.path.basename(dataset.cidnet_weights),
+                    ),
+                ],
+                "CIDNet checkpoint",
+                "--cidnet_weights",
+            )
+            enhancement_command = [
+                sys.executable,
+                os.path.join(PROJECT_ROOT, "scripts", "precompute_cidnet_prior.py"),
+                *common,
+                "--output",
+                dataset.enhancement_prior_path,
+                "--cidnet_root",
+                _project_path(dataset.cidnet_root),
+                "--weights",
+                cidnet_weights,
+                "--device",
+                "cuda",
+            ]
+        else:
+            stablesr_root = _project_path(dataset.stablesr_root)
+            stablesr_checkpoint = resolve_required_file(
+                [
+                    _project_path(dataset.stablesr_checkpoint),
+                    os.path.join(
+                        PROJECT_ROOT,
+                        "checkpoints",
+                        os.path.basename(dataset.stablesr_checkpoint),
+                    ),
+                    os.path.join(
+                        stablesr_root,
+                        "checkpoints",
+                        os.path.basename(dataset.stablesr_checkpoint),
+                    ),
+                ],
+                "StableSR checkpoint",
+                "--stablesr_checkpoint",
+            )
+            stablesr_vqgan_checkpoint = resolve_required_file(
+                [
+                    _project_path(dataset.stablesr_vqgan_checkpoint),
+                    os.path.join(
+                        PROJECT_ROOT,
+                        "checkpoints",
+                        os.path.basename(dataset.stablesr_vqgan_checkpoint),
+                    ),
+                    os.path.join(
+                        stablesr_root,
+                        "checkpoints",
+                        os.path.basename(dataset.stablesr_vqgan_checkpoint),
+                    ),
+                ],
+                "StableSR VQGAN checkpoint",
+                "--stablesr_vqgan_checkpoint",
+            )
+            logger.info(
+                "[INFO] StableSR fixed-prior recipe: input_gain=%s, checkpoint=%s, vqgan=%s",
+                input_gain,
+                stablesr_checkpoint,
+                stablesr_vqgan_checkpoint,
+            )
+            enhancement_command = [
+                sys.executable,
+                os.path.join(PROJECT_ROOT, "scripts", "precompute_stablesr_prior.py"),
+                *common,
+                "--output",
+                dataset.enhancement_prior_path,
+                "--stablesr_root",
+                stablesr_root,
+                "--stablesr_python",
+                dataset.stablesr_python or sys.executable,
+                "--inference_script",
+                os.path.join(
+                    stablesr_root,
+                    "scripts",
+                    "sr_val_ddpm_text_T_vqganfin_oldcanvas_tile.py",
+                ),
+                "--config",
+                _stablesr_path(stablesr_root, dataset.stablesr_config),
+                "--checkpoint",
+                stablesr_checkpoint,
+                "--vqgan_checkpoint",
+                stablesr_vqgan_checkpoint,
+                "--input_gain",
+                str(input_gain),
+            ]
+        _run_prior_command(
+            enhancement_command,
+            dataset.enhancement_prior_path,
+            enhancement_name,
+            logger,
+        )
+    else:
+        logger.info(
+            "[prior 2/2] Reusing existing %s cache at %s",
+            enhancement_name,
+            dataset.enhancement_prior_path,
+        )
+
+
+def _checkpoint_payload(
+    gaussians: GaussianModel,
+    iteration: int,
+    use_warmup: bool,
+    warmup_iterations: int,
+) -> dict:
+    return {
+        "model_format_version": MODEL_FORMAT_VERSION,
+        "iteration": int(iteration),
+        "training_stage": training_stage_state(
+            iteration,
+            use_warmup,
+            warmup_iterations,
+        ),
+        "gaussians": gaussians.capture(),
+    }
+
+
+def _load_checkpoint(
+    path: str,
+    gaussians: GaussianModel,
+    optimization,
+    use_warmup: bool,
+) -> int:
+    state = torch.load(path, map_location="cuda")
+    expected = {
+        "model_format_version",
+        "iteration",
+        "training_stage",
+        "gaussians",
+    }
+    if not isinstance(state, dict) or state.get("model_format_version") != MODEL_FORMAT_VERSION:
+        raise RuntimeError(
+            f"Checkpoint must use MODEL_FORMAT_VERSION={MODEL_FORMAT_VERSION}; legacy tuples are unsupported"
+        )
+    if set(state) != expected:
+        raise ValueError(
+            f"Invalid v2 checkpoint fields; missing={sorted(expected - set(state))}, "
+            f"extra={sorted(set(state) - expected)}"
+        )
+    expected_stage = training_stage_state(
+        int(state["iteration"]),
+        use_warmup,
+        optimization.warmup_iterations,
+    )
+    if state["training_stage"] != expected_stage:
+        raise RuntimeError(
+            "Checkpoint warmup schedule does not match this training command: "
+            f"stored={state['training_stage']}, expected={expected_stage}. "
+            "Resume with the original --warmup and --warmup_iterations values."
+        )
+    gaussians.restore(state["gaussians"], optimization)
+    return int(state["iteration"])
+
+
+@torch.no_grad()
+def _evaluate(scene, pipeline, background, kernel_size, iteration, writer=None, wandb=None):
+    cameras = scene.getTestCameras()
+    if not cameras:
+        return
+    scene.gaussians.eval()
+    l1_value = 0.0
+    psnr_value = 0.0
+    for camera in cameras:
+        pose = get_tensor_from_camera(camera.world_view_transform.transpose(0, 1)).cuda()
+        visible = prefilter_voxel(
+            camera,
+            scene.gaussians,
+            pipeline,
+            background,
+            kernel_size,
+            camera_pose=pose,
+        )
+        prediction = render(
+            camera,
+            scene.gaussians,
+            pipeline,
+            background,
+            kernel_size,
+            visible_mask=visible,
+            camera_pose=pose,
+        )["render"].clamp(0.0, 1.0)
+        target = camera.original_image.cuda().clamp(0.0, 1.0)
+        l1_value += float(l1_loss(prediction, target))
+        psnr_value += float(psnr(prediction, target).mean())
+    l1_value /= len(cameras)
+    psnr_value /= len(cameras)
+    if writer:
+        writer.add_scalar("test/l1", l1_value, iteration)
+        writer.add_scalar("test/psnr", psnr_value, iteration)
+    if wandb:
+        wandb.log({"test/l1": l1_value, "test/psnr": psnr_value, "iteration": iteration})
+    scene.gaussians.train()
+
+
+def _log_densification(logger, wandb, stage, iteration, statistics):
+    logger.info("[%s densify %d] %s", stage, iteration, statistics)
+    if wandb:
+        values = {
+            f"{stage}_densify/{key}": value
+            for key, value in statistics.items()
+            if key != "added_by_level"
+        }
+        values.update(
+            {
+                f"{stage}_densify/added_level_{level}": value
+                for level, value in enumerate(statistics["added_by_level"])
+            }
+        )
+        values["iteration"] = iteration
+        wandb.log(values)
+
+
+def _select_monitor_camera(scene, requested_name: str, requested_split: str, logger):
+    """Select one deterministic train/test camera for compact W&B monitoring."""
+    cameras_by_split = {
+        "train": scene.getTrainCameras(),
+        "test": scene.getTestCameras(),
+    }
+    order = (requested_split, "train" if requested_split == "test" else "test")
+    for split in order:
+        for camera in cameras_by_split[split]:
+            if str(camera.image_name) == str(requested_name):
+                return camera, split
+    try:
+        requested_index = int(requested_name)
+    except ValueError:
+        requested_index = -1
+    for split in order:
+        ordered = sorted(cameras_by_split[split], key=lambda item: str(item.image_name))
+        if 0 <= requested_index < len(ordered):
+            return ordered[requested_index], split
+    for split in order:
+        if cameras_by_split[split]:
+            camera = sorted(cameras_by_split[split], key=lambda item: str(item.image_name))[0]
+            logger.warning(
+                "W&B monitor camera %s was not found; using %s camera %s",
+                requested_name,
+                split,
+                camera.image_name,
+            )
+            return camera, split
+    raise RuntimeError("No train or test camera is available for W&B monitoring")
+
+
+def _wandb_image(tensor: torch.Tensor, caption: str):
+    """Convert a render tensor into one finite W&B image."""
+    from wandb import Image as WandbImage
+
+    image = torch.nan_to_num(
+        tensor.detach(),
+        nan=0.0,
+        posinf=1.0,
+        neginf=0.0,
+    ).clamp(0.0, 1.0)
+    return WandbImage(to_pil_image(image.cpu()), caption=caption)
+
+
+@torch.no_grad()
+def _build_wandb_core_images(
+    scene,
+    camera,
+    split,
+    pipeline,
+    background,
+    kernel_size,
+    iteration,
+    display_gain,
+):
+    """Build only the five v2 decomposition images requested for supervision.
+
+    Dark maps (the low-light render and main illumination) use the clean
+    reference's display-only scene gain; bright maps stay untouched.
+    """
+    was_training = scene.gaussians.mlp_opacity.training
+    scene.gaussians.eval()
+    try:
+        pose = (
+            scene.gaussians.get_RT(camera.uid)
+            if split == "train"
+            else get_tensor_from_camera(camera.world_view_transform.transpose(0, 1)).cuda()
+        )
+        visible = prefilter_voxel(
+            camera,
+            scene.gaussians,
+            pipeline,
+            background,
+            kernel_size,
+            camera_pose=pose,
+        )
+        package = render(
+            camera,
+            scene.gaussians,
+            pipeline,
+            background,
+            kernel_size,
+            visible_mask=visible,
+            camera_pose=pose,
+        )
+        caption = f"{split}:{camera.image_name} iteration={iteration}"
+        brightened_fields = {"image", "illumination"}
+        images = {}
+        for name, field in WANDB_CORE_IMAGE_FIELDS.items():
+            tensor = package[field]
+            if name in brightened_fields:
+                tensor = torch.clamp(tensor * display_gain, 0.0, 1.0)
+            images[name] = _wandb_image(tensor, caption)
+        reflectance = torch.nan_to_num(package["render_reflectance"].detach())
+        illumination = torch.nan_to_num(package["render_illumination"].detach())
+        enhanced_illumination = torch.nan_to_num(
+            package["render_illumination_enhanced"].detach()
+        )
+        images.update(
+            {
+                "monitor/reflectance_mean": float(reflectance.mean()),
+                "monitor/reflectance_std": float(reflectance.std()),
+                "monitor/illumination_mean": float(illumination.mean()),
+                "monitor/illumination_enhanced_mean": float(
+                    enhanced_illumination.mean()
+                ),
+                "monitor/illumination_enhanced_p95": float(
+                    torch.quantile(enhanced_illumination.float(), 0.95)
+                ),
+                "monitor/illumination_enhanced_max": float(
+                    enhanced_illumination.max()
+                ),
+                "monitor/illumination_enhanced_fraction_gt_one": float(
+                    (enhanced_illumination > 1.0).float().mean()
+                ),
+            }
+        )
+        return images
+    finally:
+        if was_training:
+            scene.gaussians.train()
+
+
+def training(
+    dataset,
+    optimization,
+    pipeline,
+    testing_iterations,
+    saving_iterations,
+    checkpoint_iterations,
+    start_checkpoint,
+    debug_from,
+    use_warmup,
+    optimize_pose,
+    wandb_monitor_camera,
+    wandb_monitor_split,
+    wandb_monitor_interval,
+    wandb=None,
+    logger=None,
+):
+    writer = prepare_output_and_logger(dataset)
+    gaussians = create_gaussian_model(dataset)
+    scene = Scene(
+        dataset,
+        gaussians,
+        shuffle=False,
+        require_priors=True,
+    )
+    gaussians.training_setup(optimization)
+    first_iteration = 0
+    if start_checkpoint:
+        first_iteration = _load_checkpoint(
+            start_checkpoint,
+            gaussians,
+            optimization,
+            use_warmup,
+        )
+    previous_warmup = bool(
+        use_warmup
+        and optimization.warmup_iterations > 0
+        and first_iteration <= optimization.warmup_iterations
+    )
+    # Reference two-run budget: warmup first counts its own
+    # 1..warmup_iterations, then the main stage counts a fresh
+    # 1..optimization.iterations on top; wall-clock total is the sum.
+    warmup_total = (
+        optimization.warmup_iterations
+        if use_warmup and optimization.warmup_iterations > 0
+        else 0
+    )
+    logger.info(
+        "Training stages: warmup=%s warmup_iterations=%d + main_iterations=%d "
+        "= total_iterations=%d warmup_geometry_lr_scale=%g resume_iteration=%d",
+        bool(use_warmup),
+        warmup_total,
+        optimization.iterations,
+        optimization.iterations + warmup_total,
+        optimization.warmup_geometry_lr_scale,
+        first_iteration,
+    )
+    logger.info("=" * 80)
+    if warmup_total > 0 and first_iteration < warmup_total:
+        logger.info(
+            "[phase 1/2] Starting warmup: %d iterations; main starts afterward at 1/%d",
+            warmup_total,
+            optimization.iterations,
+        )
+    else:
+        logger.info(
+            "[phase] Starting main training: local iteration %d/%d",
+            max(first_iteration - warmup_total + 1, 1),
+            optimization.iterations,
+        )
+    logger.info("=" * 80)
+    train_cameras = scene.getTrainCameras().copy()
+    if not train_cameras:
+        raise RuntimeError("Training requires at least one camera")
+    monitor_camera = None
+    monitor_split = None
+    if wandb is not None and wandb_monitor_interval > 0:
+        monitor_camera, monitor_split = _select_monitor_camera(
+            scene,
+            wandb_monitor_camera,
+            wandb_monitor_split,
+            logger,
+        )
+        logger.info(
+            "W&B core-image monitor: split=%s camera=%s interval=%d",
+            monitor_split,
+            monitor_camera.image_name,
+            wandb_monitor_interval,
+        )
+    os.makedirs(os.path.join(scene.model_path, "pose"), exist_ok=True)
+    display_gain = float(getattr(dataset, "wandb_display_gain", 0.0) or 0.0)
+    if display_gain <= 0.0:
+        display_gain, scene_brightness = _scene_display_gain(train_cameras)
+    else:
+        scene_brightness = float(getattr(dataset, "scene_mean_brightness", 0.0) or 0.0)
+    logger.info(
+        "[INFO] W&B display gain %.1f (scene mean brightness %.5f); "
+        "this transform is excluded from all training targets and losses",
+        display_gain,
+        scene_brightness,
+    )
+    original_pose_path = os.path.join(scene.model_path, "pose", "pose_org.npy")
+    if not os.path.exists(original_pose_path):
+        save_pose(original_pose_path, gaussians.P, train_cameras)
+    gaussians.compute_3D_filter(train_cameras)
+    if not optimize_pose:
+        gaussians.P.requires_grad_(False)
+
+    background = torch.tensor(
+        [1.0, 1.0, 1.0] if dataset.white_background else [0.0, 0.0, 0.0],
+        device="cuda",
+    )
+    camera_stack = []
+    ema_loss = 0.0
+    total_iterations = optimization.iterations + warmup_total
+    warmup_display = bool(
+        warmup_total > 0 and first_iteration < optimization.warmup_iterations
+    )
+    progress = _start_training_progress(
+        "warmup" if warmup_display else "main",
+        first_iteration if warmup_display else max(first_iteration - warmup_total - 1, 0),
+        optimization.warmup_iterations if warmup_display else optimization.iterations,
+    )
+    gaussians.train()
+
+    for iteration in range(first_iteration + 1, total_iterations + 1):
+        warmup_phase = use_warmup and iteration <= optimization.warmup_iterations
+        phase_iteration = iteration if warmup_phase else iteration - warmup_total
+        densification_reset_event = 0.0
+        if previous_warmup and not warmup_phase:
+            progress.close()
+            progress = _start_training_progress(
+                "main", phase_iteration - 1, optimization.iterations
+            )
+            logger.info("=" * 80)
+            logger.info(
+                "[phase 2/2] Warmup finished! Switching to main training at global "
+                "iteration %d (main iteration %d / %d)",
+                iteration,
+                phase_iteration,
+                optimization.iterations,
+            )
+            logger.info("=" * 80)
+            reset_summary = gaussians.reset_densification_gradient_statistics()
+            densification_reset_event = 1.0
+            logger.info(
+                "[densification reset warmup->main at %d] "
+                "observed_offsets=%d observation_count=%g",
+                iteration,
+                reset_summary["observed_offsets"],
+                reset_summary["observation_count"],
+            )
+        previous_warmup = warmup_phase
+        geometry_lr_scale = (
+            optimization.warmup_geometry_lr_scale if warmup_phase else 1.0
+        )
+        stage_start_stat = (
+            optimization.warmup_start_stat if warmup_phase else optimization.start_stat
+        )
+        stage_update_from = (
+            optimization.warmup_update_from if warmup_phase else optimization.update_from
+        )
+        stage_update_until = (
+            optimization.warmup_update_until if warmup_phase else optimization.update_until
+        )
+        stage_update_interval = (
+            optimization.warmup_update_interval if warmup_phase else optimization.update_interval
+        )
+        densification_stat_collection_active = 0.0
+        densification_adjust_event = 0.0
+        gaussians.update_learning_rate(
+            phase_iteration,
+            geometry_lr_scale=geometry_lr_scale,
+        )
+
+        if not camera_stack:
+            camera_stack = train_cameras.copy()
+        viewpoint = camera_stack.pop(random.randrange(len(camera_stack)))
+        pose = gaussians.get_RT(viewpoint.uid)
+        if iteration - 1 == debug_from:
+            pipeline.debug = True
+        visible = prefilter_voxel(
+            viewpoint,
+            gaussians,
+            pipeline,
+            background,
+            dataset.kernel_size,
+            camera_pose=pose,
+        )
+        retain_grad = phase_iteration < stage_update_until
+        package = render(
+            viewpoint,
+            gaussians,
+            pipeline,
+            background,
+            dataset.kernel_size,
+            visible_mask=visible,
+            retain_grad=retain_grad,
+            camera_pose=pose,
+        )
+        low_target = viewpoint.original_image.cuda()
+        enhanced_prior = viewpoint.enhancement_prior
+        depth_prior = scene.depth_prior_dict[viewpoint.uid]
+        low_prediction = package["render"]
+        enhanced_prediction = package["render_enhanced"]
+        coverage = package["_training_coverage"]
+        enhanced_target = enhanced_prior.detach()
+
+        if FUSED_SSIM_AVAILABLE:
+            low_ssim = fused_ssim(low_prediction.unsqueeze(0), low_target.unsqueeze(0))
+            enhanced_ssim = fused_ssim(enhanced_prediction.unsqueeze(0), enhanced_target.unsqueeze(0))
+        else:
+            low_ssim = ssim(low_prediction, low_target)
+            enhanced_ssim = ssim(enhanced_prediction, enhanced_target)
+        low_photo = photo_loss(
+            low_prediction,
+            low_target,
+            optimization.lambda_dssim,
+            low_ssim,
+        )
+        max_rgb_target, reflectance_target = retinex_targets(low_target)
+        reflectance_reconstruction_prediction = coverage_masked_prediction(
+            package["render_reflectance"] * package["render_illumination"].detach(),
+            low_target,
+            coverage,
+        )
+        # Diagnostic rasterization has detached geometry and coverage; main L
+        # is detached here as well. Therefore this objective can update only
+        # explicit reflectance base/detail, never Gaussian geometry or ASG.
+        reflectance_reconstruction = photo_loss(
+            reflectance_reconstruction_prediction,
+            low_target,
+            optimization.lambda_dssim,
+        )
+        reflectance_objective = reflectance_reconstruction
+        illumination_target = max_rgb_target.expand_as(package["render_illumination"])
+        illumination_prediction = coverage_masked_prediction(
+            package["render_illumination"],
+            illumination_target,
+            coverage,
+        )
+        illumination_photo = photo_loss(
+            illumination_prediction,
+            illumination_target,
+            optimization.lambda_dssim,
+        )
+        illumination_edge_tv = edge_aware_illumination_tv_loss(
+            package["render_illumination"],
+            max_rgb_target,
+            coverage,
+        )
+        illumination_objective = illumination_photo + illumination_edge_tv
+        enhanced_photo = photo_loss(
+            enhanced_prediction,
+            enhanced_target,
+            optimization.lambda_dssim,
+            enhanced_ssim,
+        )
+        enhanced_diffuse_target, enhanced_fill_target = decompose_enhanced_prior(
+            enhanced_target.detach(),
+            reflectance_target,
+        )
+        enhanced_illumination_target = enhanced_diffuse_target + (
+            1.0 - enhanced_diffuse_target
+        ) * enhanced_fill_target
+        enhanced_illumination_prediction = coverage_masked_prediction(
+            package["render_illumination_enhanced"],
+            enhanced_illumination_target,
+            coverage,
+        )
+        enhanced_illumination_photo = photo_loss(
+            enhanced_illumination_prediction,
+            enhanced_illumination_target,
+            optimization.lambda_dssim,
+        )
+        enhanced_objective = enhanced_photo + enhanced_illumination_photo
+        depth_objective = inverse_depth_pearson_loss(
+            package["render_depth"],
+            depth_prior,
+            coverage,
+        )
+        scale = scaling_loss(package["scaling"])
+        loss = (
+            low_photo
+            + optimization.lambda_reflectance_reconstruction * reflectance_objective
+            + optimization.lambda_illumination * illumination_objective
+            + optimization.lambda_enhanced * enhanced_objective
+            + optimization.lambda_depth * depth_objective
+            + optimization.lambda_scaling * scale
+        )
+        if not torch.isfinite(loss):
+            raise FloatingPointError(f"Non-finite total loss at iteration {iteration}")
+        loss.backward()
+
+        with torch.no_grad():
+            if retain_grad and package["viewspace_points"].grad is not None:
+                if stage_start_stat < phase_iteration < stage_update_until:
+                    gaussians.training_statis(
+                        package["viewspace_points"],
+                        package["neural_opacity"],
+                        package["visibility_filter"],
+                        package["selection_mask"],
+                        visible,
+                    )
+                    densification_stat_collection_active = 1.0
+                    if (
+                        phase_iteration > stage_update_from
+                        and phase_iteration % stage_update_interval == 0
+                    ):
+                        statistics = gaussians.adjust_anchor(
+                            check_interval=stage_update_interval,
+                            success_threshold=(
+                                optimization.warmup_success_threshold
+                                if warmup_phase
+                                else optimization.success_threshold
+                            ),
+                            grad_threshold=(
+                                optimization.warmup_densify_grad_threshold
+                                if warmup_phase
+                                else optimization.densify_grad_threshold
+                            ),
+                            min_opacity=optimization.min_opacity,
+                            max_anchors=optimization.max_anchors,
+                            max_new_anchors=(
+                                optimization.warmup_max_new_anchors
+                                if warmup_phase
+                                else optimization.max_new_anchors_per_update
+                            ),
+                            level_caps=(
+                                optimization.warmup_level_caps
+                                if warmup_phase
+                                else optimization.densify_level_caps
+                            ),
+                            current_iteration=phase_iteration,
+                            prune_grace_iters=optimization.anchor_prune_grace_iters,
+                            prune_from_iter=optimization.prune_from_iter,
+                            max_pruned_anchors=optimization.max_pruned_anchors_per_update,
+                            allow_prune=not warmup_phase,
+                        )
+                        densification_adjust_event = 1.0
+                        _log_densification(
+                            logger,
+                            wandb,
+                            "warmup" if warmup_phase else "main",
+                            phase_iteration,
+                            statistics,
+                        )
+                        gaussians.compute_3D_filter(train_cameras)
+
+            gaussians.optimizer.step()
+            gaussians.optimizer.zero_grad(set_to_none=True)
+            ema_loss = 0.4 * float(loss) + 0.6 * ema_loss
+            if iteration % 10 == 0:
+                progress.set_postfix(
+                    loss=f"{ema_loss:.4f}",
+                    photo=f"{float(low_photo):.4f}",
+                    rrec=f"{float(reflectance_reconstruction):.4f}",
+                    enh=f"{float(enhanced_photo):.4f}",
+                    enhL=f"{float(enhanced_illumination_photo):.4f}",
+                    lphoto=f"{float(illumination_photo):.4f}",
+                    ltv=f"{float(illumination_edge_tv):.4f}",
+                    anchors=gaussians.get_anchor.shape[0],
+                )
+                progress.update(10)
+            scalars = {
+                "loss/total": float(loss),
+                "loss/photo_low": float(low_photo),
+                "loss/reflectance_reconstruction": float(reflectance_reconstruction),
+                "loss/illumination_photo": float(illumination_photo),
+                "loss/illumination_edge_tv": float(illumination_edge_tv),
+                "loss/illumination": float(illumination_objective),
+                "loss/photo_enhanced": float(enhanced_photo),
+                "loss/illumination_enhanced_photo": float(enhanced_illumination_photo),
+                "loss/enhanced": float(enhanced_objective),
+                "loss/depth": float(depth_objective),
+                "loss/scaling": float(scale),
+                "anchors": gaussians.get_anchor.shape[0],
+                "phase/is_warmup": float(warmup_phase),
+                "phase/iteration": float(phase_iteration),
+                "monitor/display_gain": float(display_gain),
+                "phase/geometry_lr_scale": float(geometry_lr_scale),
+                "densification/stat_collection_active": densification_stat_collection_active,
+                "densification/adjust_event": densification_adjust_event,
+                "densification/reset_event": densification_reset_event,
+                "densification/check_interval": stage_update_interval,
+                "densification/update_until": stage_update_until,
+                "iteration": iteration,
+            }
+            for group in gaussians.optimizer.param_groups:
+                scalars[f"lr/{group['name']}"] = float(group["lr"])
+            if writer:
+                for name, value in scalars.items():
+                    writer.add_scalar(name, value, iteration)
+            if wandb:
+                wandb_payload = dict(scalars)
+                if wandb_monitor_interval > 0 and iteration % wandb_monitor_interval == 0:
+                    wandb_payload.update(
+                        _build_wandb_core_images(
+                            scene,
+                            monitor_camera,
+                            monitor_split,
+                            pipeline,
+                            background,
+                            dataset.kernel_size,
+                            iteration,
+                            display_gain,
+                        )
+                    )
+                wandb.log(wandb_payload)
+            if phase_iteration in testing_iterations:
+                _evaluate(
+                    scene,
+                    pipeline,
+                    background,
+                    dataset.kernel_size,
+                    iteration,
+                    writer,
+                    wandb,
+                )
+            if phase_iteration in saving_iterations:
+                logger.info(
+                    "[global %d] Saving v2 model (%s iteration %d)",
+                    iteration,
+                    "warmup" if warmup_phase else "main",
+                    phase_iteration,
+                )
+                scene.save(phase_iteration)
+                save_pose(
+                    os.path.join(scene.model_path, "pose", f"pose_{phase_iteration}.npy"),
+                    gaussians.P,
+                    train_cameras,
+                )
+            if phase_iteration in checkpoint_iterations:
+                path = os.path.join(scene.model_path, f"chkpnt{phase_iteration}.pth")
+                torch.save(
+                    _checkpoint_payload(
+                        gaussians,
+                        iteration,
+                        use_warmup,
+                        optimization.warmup_iterations,
+                    ),
+                    path,
+                )
+    progress.close()
+    return scene
+
+
+def main() -> None:
+    parser = ArgumentParser(description="Explicit R/L Scaffold-GS training")
+    model = ModelParams(parser)
+    optimization = OptimizationParams(parser)
+    pipeline = PipelineParams(parser)
+    parser.add_argument("--debug_from", type=int, default=-1)
+    parser.add_argument("--detect_anomaly", action="store_true")
+    parser.add_argument("--warmup", action="store_true")
+    parser.add_argument("--use_wandb", action="store_true")
+    parser.add_argument("--wandb_monitor_camera", type=str, default="1")
+    parser.add_argument("--wandb_monitor_split", choices=("train", "test"), default="test")
+    parser.add_argument("--wandb_monitor_interval", type=int, default=300)
+    parser.add_argument("--disable_pose_optimization", action="store_true")
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[5_000, 10_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[8_000, 10_000])
+    parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
+    parser.add_argument("--start_checkpoint", type=str, default=None)
+    parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--gpu", type=str, default="-1")
+    args = parser.parse_args(sys.argv[1:])
+    if args.model_format_version != MODEL_FORMAT_VERSION:
+        raise RuntimeError(f"Training requires MODEL_FORMAT_VERSION={MODEL_FORMAT_VERSION}")
+    validate_training_schedule(args)
+    if args.gpu != "-1":
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu
+    args.save_iterations = sorted(set(args.save_iterations + [args.iterations]))
+    os.makedirs(args.model_path, exist_ok=True)
+    logger = get_logger(args.model_path)
+    dataset = model.extract(args)
+    _ensure_training_priors(dataset, logger)
+    args.enhancement_prior_backend = dataset.enhancement_prior_backend
+    args.enhancement_prior_path = dataset.enhancement_prior_path
+    args.depth_prior_path = dataset.depth_prior_path
+    logger.info("args: %s", args)
     safe_state(args.quiet)
-
-    # Start GUI server, configure and run training
-    network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
 
-    # training
+    wandb = None
+    if args.use_wandb:
+        import wandb as wandb_module
 
-    if args.warmup:
-        import copy
-        args_warmup = copy.deepcopy(args)
-        args_warmup.iterations = 2000
-        args_warmup.save_iterations.append(args_warmup.iterations)
-        # Initial geometry must be complete.  Any scene-specific prune_ratio
-        # is intentionally deferred; the main stage reloads this full warmup PLY.
-        args_warmup.prune_ratio = 1.0
-        print(args.warmup)
-        args_warmup.offset_lr_init = 0.0001
-        args_warmup.opacity_lr = 0.1
-        args_warmup.mlp_color_lr_init = 0.1
-        training(lp.extract(args_warmup), op.extract(args_warmup), pp.extract(args_warmup), dataset,  args_warmup.test_iterations, args_warmup.save_iterations, args_warmup.checkpoint_iterations, args_warmup.start_checkpoint, args_warmup.debug_from, wandb, logger, mode="warmup")
-        logger.info("\n Warmup finished! Reboot from last checkpoints")
-        new_ply_path = os.path.join(args.model_path, f'point_cloud/iteration_{args_warmup.iterations}', 'point_cloud.ply')
-        training(lp.extract(args), op.extract(args), pp.extract(args), dataset,  args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, wandb=wandb, logger=logger, ply_path=new_ply_path, mode="warmuped")
-
-    else:
-        training(lp.extract(args), op.extract(args), pp.extract(args), dataset,  args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, wandb, logger, mode="train")
-    # All done
-    logger.info("\nTraining complete.")
-
-    # rendering
-    logger.info(f'\nStarting Rendering~')
-    visible_count = render_sets(lp.extract(args), -1, pp.extract(args), wandb=wandb, logger=logger)
+        wandb = wandb_module.init(
+            project=f"Explicit-Scaffold-GS-{os.path.basename(os.path.normpath(args.source_path))}",
+            name=os.path.basename(os.path.normpath(args.model_path)),
+            config=vars(args),
+        )
+        wandb_module.define_metric("iteration")
+        for metric_name in (
+            "loss/*",
+            "phase/*",
+            "densification/*",
+            "lr/*",
+            "monitor/*",
+            "test/*",
+            "warmup_densify/*",
+            "main_densify/*",
+            "anchors",
+            *WANDB_CORE_IMAGE_FIELDS.keys(),
+        ):
+            wandb_module.define_metric(metric_name, step_metric="iteration")
+    training(
+        dataset,
+        optimization.extract(args),
+        pipeline.extract(args),
+        args.test_iterations,
+        args.save_iterations,
+        args.checkpoint_iterations,
+        args.start_checkpoint,
+        args.debug_from,
+        args.warmup,
+        not args.disable_pose_optimization,
+        args.wandb_monitor_camera,
+        args.wandb_monitor_split,
+        args.wandb_monitor_interval,
+        wandb,
+        logger,
+    )
+    logger.info("Training complete")
+    # Post-training render + evaluation, mirroring the clean reference
+    # pipeline: render every train/test view of the final saved checkpoint,
+    # then score renders and enhanced outputs against the captures.
+    logger.info("\nStarting Rendering~")
+    render_sets(
+        model.extract(args),
+        -1,
+        pipeline.extract(args),
+        wandb=wandb,
+        logger=logger,
+    )
     logger.info("\nRendering complete.")
 
-    # calc metrics
-    logger.info("\n Starting evaluation...")
-    evaluate(args.model_path, visible_count=visible_count, wandb=wandb, logger=logger)
-    logger.info("\nEvaluating complete.")
+
+if __name__ == "__main__":
+    main()

@@ -1,18 +1,13 @@
+#!/usr/bin/env bash
+# Example single-scene v2 run. Override paths through environment variables.
+set -euo pipefail
 
-voxel_size=0.001
-update_init_factor=16
-appearance_residual_dim=32
-prune_ratio=0.1
-gpu=1
-kernel_size=0.1
-warmup=False
-use_residual=True
-scene_names=( "chair" "stone" "path" "staircase"  "firehydrant" " pole")
-scene='./dataset/LLRS-sRGB'    
-exp_name='test'
+SCENE_NAME="${SCENE_NAME:-chair}"
+DATA_ROOT="${DATA_ROOT:-./dataset/LLRS-sRGB}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-./outputs}"
+GPU="${GPU:-0}"
 
-for scene_name in ${scene_names[@]}; do
-    scripts/train.sh -d ${scene}/${scene_name} -l ${scene_name}${exp_name} --gpu ${gpu} --warmup ${warmup} --use_residual ${use_residual} --voxel_size ${voxel_size} --update_init_factor ${update_init_factor} --appearance_residual_dim ${appearance_residual_dim} --prune_ratio ${prune_ratio} --kernel_size ${kernel_size} 
-done
-
-
+bash scripts/train.sh \
+    --data "${DATA_ROOT}/${SCENE_NAME}" \
+    --model "${OUTPUT_ROOT}/${SCENE_NAME}_explicit_v2" \
+    --gpu "$GPU" --iterations 8000 --warmup --wandb

@@ -1,349 +1,257 @@
-<h1 align='center'>LL-Gaussian: Low-Light Scene Reconstruction and Enhancement via Gaussian Splatting for Novel View Synthesis</h1>
-<div align='center'>
-    <a href='https://github.com/sunhao242/LL-Gaussian' target='_blank'>Hao Sun</a><sup>1,2</sup> 
-    <a href='https://fenggenyu.github.io/' target='_blank'>Fenggen Yu</a><sup>4</sup> 
-    <a href='https://github.com/sunhao242/LL-Gaussian' target='_blank'>Huiyao Xu</a><sup>3</sup> 
-    <a href='https://github.com/sunhao242/LL-Gaussian' target='_blank'>Tao Zhang</a><sup>5</sup> 
-    <a href='https://changqingzou.weebly.com/' target='_blank'>Changqing Zou†</a><sup>1,3</sup> 
-</div>
+# LL-Gaussian Explicit R/L v2
 
-<div align='center'>
-    <sup>1</sup>Zhejiang Lab  <sup>2</sup>University of Chinese Academy of Sciences  <sup>3</sup>State Key Lab of CAD&CG, Zhejiang University <sup>4</sup>Simon Fraser University <sup>5</sup>Hangzhou Dianzi University
-</div>
-<div align='center'>
-    †Corresponding Author
-</div>
-<div align="center">
-    <strong>ACM Multimedia 2025</strong>
-</div>
-<br>
-<div align="center">
+This branch keeps the Scaffold-GS anchor/offset geometry while replacing every appearance network with explicit parameters. `MODEL_FORMAT_VERSION=2` is an intentional format break: checkpoints and PLY files from earlier branches are rejected.
 
-[![Page](https://img.shields.io/badge/%F0%9F%8C%90%20Project%20Page-Demo-00bfff)](https://sunhao242.github.io/LL-Gaussian_web.github.io/)
-[![Paper](https://img.shields.io/static/v1?label=Paper&message=PDF&color=red&logo=acm)](https://dl.acm.org/doi/pdf/10.1145/3746027.3755375)
-[![Arxiv](https://img.shields.io/static/v1?label=Arxiv&message=PDF&color=red&logo=arxiv)](https://dl.acm.org/doi/pdf/10.1145/3746027.3755375)
-[![Dataset](https://img.shields.io/static/v1?label=%F0%9F%A4%97%20Dataset&message=GoogleDrive&color=green)](https://img.shields.io/static/v1?label=Dataset&message=GoogleDrive&color=yellow&logo=google)
+## Model boundary
 
+The only remaining MLPs are the Scaffold-GS geometry heads:
 
-</div>
-<p align="center">
-  <img src="assets/teaser.png"  height=400>
-</p>
+- `mlp_opacity`
+- `mlp_cov`
+- optional `mlp_feature_bank`
 
------
+Appearance is owned by `ExplicitAppearance` and contains no `Linear`, decoder, embedding, residual, noise, artifact, or runtime mode switch.
 
+For anchor `a` and offset `k`, reflectance is
 
-## 🔥 News
-
-+ [2026.04.19] 📢 Training code is released.
-+ [2026.04.13] 🔭 Inference code is released.
-+ [2025.10.22] 🎆 LLRS dataset is released.
-+ [2025.07.06] 🎉 LL-Gaussian is accepted by ACM Multimedia 2025!
-+ [2025.04.19] 🚀 Repo is created!
-
-🤗 If you find LL-Gaussian useful for your projects, a ⭐ would be greatly appreciated. Thanks! 🤗
-
-
-
-## 📌 TODO
-
-- [x] Release LLRS dataset.
-- [x] Release inference code.
-- [x] Release training code.
-
-## ✨ Key Features
-- 🌙 **Low-Light Gaussian Initialization**: Robust 3D Gaussian initialization without reliance on SfM tools like COLMAP.
-- 🔀 **Gaussian Decomposition**: Dual-branch modeling of intrinsic vs. transient scene components.
-- 🎥 **Novel View Synthesis in the Dark**: State-of-the-art rendering quality under low-light and nighttime conditions.
-
-
----
-
-## 📦 Installation
-
-
-### 1. Clone repository
-
-```bash
-git clone --recursive https://github.com/sunhao242/LL-Gaussian.git 
-cd LL-Gaussian
+```text
+centered_detail[a,k] = detail[a,k] - mean_k(detail[a,k])
+R[a,k] = sigmoid(base[a] + centered_detail[a,k])
 ```
 
-### 2. Create environment
+Main illumination is a single grayscale ASG with explicit axis, tangent, two-axis sharpness, energy, and ambient. Enhanced appearance combines bounded RGB diffuse illumination with an independent additive single RGB SG. Directions are normalized, ASG tangents are orthogonalized, and sharpness is `softplus(raw) + NUMERICAL_EPS`.
+
+The enhanced branch is bounded by construction:
+
+```text
+D           = sigmoid(diffuse_raw)
+S(v)        = sigmoid(energy_raw) * exp(softplus(sharpness_raw) * (dot(v, axis) - 1))
+B_enhanced  = stop_gradient(R) * D
+C_enhanced  = B_enhanced + (1 - B_enhanced) * S(v)
+L_enhanced  = D + (1 - D) * S(v)              # diagnostic response for R=1
+```
+
+Every enhanced quantity is in `[0,1]` without an output clamp. Initialization
+analytically splits the prior into the part no brighter than R and a remaining
+headroom fill; it never evaluates `enhancement_prior / R`. Early v2 artifacts
+with the unstable unbounded-gain layout are rejected by the explicit appearance
+layout marker rather than silently reinterpreted.
+
+The renderer composes colors in Gaussian space:
+
+```text
+low color       = R * L
+enhanced color  = B_enhanced + (1 - B_enhanced) * S(v)
+```
+
+Enhanced rendering detaches position, opacity, covariance, scale, and rotation, so its loss updates only the enhanced SG. Reflectance and illumination diagnostics also use detached Scaffold geometry. The diagnostic fields and W&B images are coverage-conditioned means rather than black-background, alpha-premultiplied accumulations:
+
+```text
+coverage       = sum_i w_i
+attribute_sum  = sum_i w_i * X_i
+render_X       = attribute_sum / (coverage + NUMERICAL_EPS)
+X in {R, L, L_enhanced}
+```
+
+Diagnostic geometry and coverage are detached, so this normalization does not alter gradient ownership. The low-light image is still rasterized once from Gaussian-space `R * L`; in general, the two diagnostic means are not expected to multiply back into that image when Gaussians overlap. `render_depth` is the geometry-connected expected depth `(sum_i w_i z_i) / (sum_i w_i + NUMERICAL_EPS)`, not alpha-premultiplied accumulated depth.
+
+## Installation
 
 ```bash
-conda create -n llgaussian python==3.10
+conda create -n llgaussian python=3.10
 conda activate llgaussian
 pip install -r requirements.txt
 ```
 
-## 📊 Dataset
+The residual rasterizer is not a dependency of v2. StableSR is an optional,
+offline enhancement-prior backend and never enters the training graph.
 
-- Download the LLRS-sRGB dataset and place it under:
+## Scene-local fixed priors
 
-```bash
-./dataset/LLRS-sRGB
-```
-
-👉 Download from [Link](https://drive.google.com/file/d/1Y5lhAEXFN0lZDN-ITPPVtjm42-jKk9JR/view?usp=sharing).
-
-
-
-## ⚡ Quick Inference 
-
-### 1. Download pretrained checkpoint
-
-Download checkpoint from [backup](https://drive.google.com/file/d/1Mf7pG5Lm5N3ybfpgNuvy9PMQgrdgaMVN/view?usp=drive_link).
-Place it under:
-
-```bash
-./backup
-```
-
-### 2. Run inference
-
-
-```bash
-python render.py -m ./backup/LLRS-sRGB/{scene_name}/{XXXX-XX-XX_XX:XX:XX} --dataset_path ./dataset/LLRS-sRGB/{scene_name} --skip_train
-```
-
-
-## 🏋️ Training
-
-Step 1: Download StableSR checkpoints
-
-```bash
-./checkpoints/
-  ├── vqgan_cfw_00011.ckpt
-  ├── stablesr_turbo.ckpt
-```
-
-  - Download autoencoder from [Huggingface](https://huggingface.co/Iceclear/StableSR/resolve/main/vqgan_cfw_00011.ckpt) 
-  - Download StableSR-Turbo from [Huggingface](https://huggingface.co/Iceclear/StableSR/resolve/main/stablesr_turbo.ckpt) 
-
-Step 2: Download the Depth Anything V2 
-
-Download [Depth-Anything-V2-Large](Depth-Anything-V2-Large) to:
-
-```bash
-./checkpoints/
-```
-
-Step 3: Start training
-
-```bash
-bash scripts/single_train.sh
-```
-
-### Reproducible Best Setting (LLRS-sRGB/chair, 8k)
-
-The following command is the current best-performing setting in this repo for
-`LLRS-sRGB/chair` under the dual-transient pipeline:
-
-```bash
-python train.py --eval \
-  -s /home/liuyuhao/ll_further/LL-Gaussian/dataset/LLRS-sRGB/chair \
-  -m outputs/chair_sg_dualtransient_v8 \
-  --gpu 1 \
-  --use_sg_illumination --illumination_mode sg \
-  --use_3D_filter --use_residual --use_wandb --warmup \
-  --use_dual_transient \
-  --iterations 8000 \
-  --save_iterations 8000 \
-  --test_iterations 5000 8000 \
-  --position_lr_max_steps 8000 \
-  --offset_lr_max_steps 8000 \
-  --update_from 1500 \
-  --update_until 4500 \
-  --start_stat 500 \
-  --mlp_opacity_lr_max_steps 8000 \
-  --mlp_cov_lr_max_steps 8000 \
-  --mlp_color_lr_max_steps 8000 \
-  --mlp_color_lr_init 0.008 \
-  --mlp_color_lr_final 0.00025 \
-  --offset_lr_init 0.001 \
-  --offset_lr_final 0.00001 \
-  --feat_dim 32 \
-  --reflectance_consistency_reg 2e-5 \
-  --reflectance_smooth_reg 0.0 \
-  --reflectance_edge_reg 2e-4 \
-  --reflectance_edge_uplift_reg 3e-3 \
-  --reflectance_contrast_reg 2e-3 \
-  --reflectance_highfreq_reg 3e-3 \
-  --highlight_reflectance_reg 1e-3 \
-  --residual_chroma_reg 5e-4 \
-  --reflectance_detail_reg 1e-6 \
-  --reflectance_decoder_reg 2e-5 \
-  --reflectance_offset_lr 0.008 \
-  --reflectance_decoder_lr 0.002 \
-  --sg_smooth_reg 5e-5 \
-  --b0_spatial_smooth_reg 0.0 \
-  --residual_start_iter 3000 \
-  --residual_ramp_iters 2500 \
-  --residual_higherror_percentile 0.9 \
-  --residual_highlight_percentile 0.92 \
-  --enhancement_reflectance_reg 0.06 \
-  --enhancement_degree_reg 0.2 \
-  --enhancement_degree_global_reg 0.05 \
-  --enhancement_smooth_reg 4e-4 \
-  --enhancement_diff_start_iter 2350 \
-  --enhancement_color_reg 0.06 \
-  --enhancement_color_std_reg 0.02 \
-  --enhancement_green_bias_reg 0.06 \
-  --noise_residual_reg 1.0 \
-  --artifact_residual_reg 0.35 \
-  --noise_zero_mean_reg 0.03 \
-  --noise_highfreq_reg 0.03 \
-  --noise_dark_weight_reg 0.03 \
-  --artifact_highlight_reg 0.0
-```
-
-Observed metrics (run date: 2026-05-18):
-
-- Train lowlight: `PSNR=41.3628`, `SSIM=0.9324`, `LPIPS=0.3133`
-- Train enhanced_gt: `PSNR=17.8513`, `SSIM=0.2632`, `LPIPS=0.6687`
-- Test lowlight: `PSNR=40.4566`, `SSIM=0.9256`, `LPIPS=0.3211`
-- Test enhanced_gt: `PSNR=17.8936`, `SSIM=0.2619`, `LPIPS=0.6757`
-
-
-## ⚙️ Inference Arguments
-| Argument            | Description                             |
-| ------------------- | --------------------------------------- |
-| `-m / --model_path` | Path to checkpoint                      |
-| `--dataset_path`    | Dataset root                            |
-| `--skip_train`      | Skip training split rendering           |
-| `--skip_test`       | Skip test split rendering               |
-| `--skip_optimize`   | Enable test-view rendering branch       |
-| `--iteration`       | Load specific iteration (`-1` = latest) |
-| `--infer_video`     | Export interpolated video               |
-
-
-
-
-## 📂 Output Structure
+By default, `train.py -s DATASET/SCENE` stores fixed priors inside that scene.
+The enhancement directory depends on `--enhancement_prior_backend`:
 
 ```text
-<model_path>/
-  test/
-    ours_<iter>/
-      renders/
-      render_reflectances/
-      render_illuminations/
-      render_enhanceds/
-      render_depths/
-      render_residuals/
-      errors/
-      gt/
-      per_view_count.json
+CIDNet:   DATASET/SCENE/cidnet_prior
+StableSR: DATASET/SCENE/diffusion_prior_<stablesr_input_gain>
+Depth:    DATASET/SCENE/depth_maps
 ```
 
+At startup, a cache with `manifest.json` is reused. A missing or empty cache is
+generated once by the standalone preprocessors before optimization begins. A
+nonempty directory without a v2 manifest is rejected and never overwritten.
+The training loop itself never refreshes or reruns either prior model. Explicit
+`--enhancement_prior_path` and `--depth_prior_path` arguments override these
+scene-local defaults.
 
-## 📖 Citation
+Startup is intentionally ordered and visible: DepthAnything is prepared or
+reused first, the selected enhancement backend second, then both manifests are
+loaded with per-image progress bars. Model inference runs only for a missing or
+empty cache; a valid manifest always takes the reuse path.
 
-If you find our work helpful, please consider citing:
+`--enhancement_prior_backend` accepts `cidnet` (default) or `stablesr`. Both
+produce the same strict `enhancement_rgb` interface, so the renderer and loss
+are backend-independent. StableSR follows the clean-project prior recipe:
+multiply the low-light input by an explicit `--stablesr_input_gain`, run the
+fixed StableSR-Turbo prior once, and supervise `render_enhanced` with the same
+photo loss used by CIDNet. No degree, color, smoothness, refresh, or controller
+loss is restored. The gain defaults to the explicit clean-recipe value `15.0`;
+override it explicitly for another recipe instead of deriving it from a hidden
+target-mean constant.
+StableSR code and config are resolved below `submodules/StableSR`, while
+`stablesr_turbo.ckpt` and `vqgan_cfw_00011.ckpt` are resolved from the
+project-level `checkpoints/` directory, matching the clean-project layout.
 
-```bibtex
-@inproceedings{sun2025ll,
-  title={Ll-gaussian: Low-light scene reconstruction and enhancement via gaussian splatting for novel view synthesis},
-  author={Sun, Hao and Yu, Fenggen and Xu, Huiyao and Zhang, Tao and Zou, Changqing},
-  booktitle={Proceedings of the 33rd ACM International Conference on Multimedia},
-  pages={4261--4270},
-  year={2025}
-}
-```
-## 📜 LICENSE
-
-Please follow the LICENSE of [3D-GS](https://github.com/graphdeco-inria/gaussian-splatting).
-
-## 🙏 Acknowledgement
-
-We thank all authors from [3D-GS](https://github.com/graphdeco-inria/gaussian-splatting), [Scaffold-GS](https://github.com/city-super/Scaffold-GS) for presenting such an excellent work.
-
-## Local Experiment Log: CIDNet Single Dense Chair 8k
-
-This setting uses the low-frequency refreshed CIDNet pseudo GT, single-head
-residual branch, and a denser initial/densification strategy. CIDNet refresh is
-triggered every `1500` 3DGS iterations after `update_from=800`.
+The same preprocessing can still be run manually. `--eval`, `--lod`, and
+`--llffhold` must match training so the manifest contains exactly the training
+`image_name` set.
 
 ```bash
-python train.py --eval \
-  -s datasets/chair \
-  -m outputs/chair_cidnet_v3_8k_single_dense \
-  --gpu 1 \
-  --use_sg_illumination --illumination_mode sg \
-  --use_3D_filter --use_residual --use_wandb --warmup \
-  --iterations 8000 \
-  --save_iterations 8000 \
-  --test_iterations 4000 6000 8000 \
-  --position_lr_max_steps 8000 \
-  --offset_lr_max_steps 8000 \
-  --voxel_size 0.0005 \
-  --prune_ratio 1.0 \
-  --start_stat 200 \
-  --update_from 800 \
-  --update_until 6000 \
-  --update_interval 50 \
-  --success_threshold 0.6 \
-  --densify_grad_threshold 0.0001 \
-  --min_opacity 0.002 \
-  --mlp_opacity_lr_max_steps 8000 \
-  --mlp_cov_lr_max_steps 8000 \
-  --mlp_color_lr_max_steps 8000 \
-  --mlp_color_lr_init 0.008 \
-  --mlp_color_lr_final 0.00025 \
-  --offset_lr_init 0.001 \
-  --offset_lr_final 0.00001 \
-  --feat_dim 32 \
-  --reflectance_consistency_reg 2e-5 \
-  --reflectance_smooth_reg 0.0 \
-  --reflectance_edge_reg 2e-4 \
-  --reflectance_edge_uplift_reg 3e-3 \
-  --reflectance_contrast_reg 2e-3 \
-  --reflectance_highfreq_reg 3e-3 \
-  --highlight_reflectance_reg 1e-3 \
-  --residual_chroma_reg 5e-4 \
-  --reflectance_detail_reg 1e-6 \
-  --reflectance_decoder_reg 2e-5 \
-  --reflectance_offset_lr 0.008 \
-  --reflectance_decoder_lr 0.002 \
-  --sg_smooth_reg 5e-5 \
-  --b0_spatial_smooth_reg 0.0 \
-  --residual_start_iter 3000 \
-  --residual_ramp_iters 2500 \
-  --enhancement_reflectance_reg 0.06 \
-  --enhancement_degree_reg 0.2 \
-  --enhancement_degree_global_reg 0.05 \
-  --enhancement_smooth_reg 4e-4 \
-  --enhancement_diff_start_iter 2350 \
-  --enhancement_color_reg 0.06 \
-  --enhancement_color_std_reg 0.02 \
-  --enhancement_green_bias_reg 0.06 \
-  --enhancement_prior cidnet \
-  --cidnet_conda_env CIDNet \
+python scripts/precompute_cidnet_prior.py \
+  --source_path ./dataset/LLRS-sRGB/chair \
+  --output ./dataset/LLRS-sRGB/chair/cidnet_prior \
   --cidnet_root ./submodules/HVI-CIDNet \
-  --cidnet_weights ./submodules/HVI-CIDNet/weights/LOLv2_real/w_perc.pth \
-  --cidnet_force_refresh \
-  --cidnet_refresh_interval 1500 \
-  --cidnet_mlp_steps 100 \
-  --cidnet_target_exposure 0.5 \
-  --cidnet_refresh_reg 0.5 \
-  --cidnet_color_reg 0.2 \
-  --cidnet_param_reg 0.1 \
-  --cidnet_mv_reg 0.5
+  --weights ./submodules/HVI-CIDNet/weights/LOLv2_real/w_perc.pth \
+  --eval
+
+python scripts/precompute_stablesr_prior.py \
+  --source_path ./dataset/LLRS-sRGB/chair \
+  --output ./dataset/LLRS-sRGB/chair/diffusion_prior_15 \
+  --stablesr_root ./submodules/StableSR \
+  --inference_script ./submodules/StableSR/scripts/sr_val_ddpm_text_T_vqganfin_oldcanvas_tile.py \
+  --config ./submodules/StableSR/configs/stableSRNew/v2-finetune_text_T_512.yaml \
+  --checkpoint ./checkpoints/stablesr_turbo.ckpt \
+  --vqgan_checkpoint ./checkpoints/vqgan_cfw_00011.ckpt \
+  --input_gain 15 --steps 4 --decoder_weight 0.75 --colorfix_type wavelet \
+  --eval
+
+python scripts/precompute_depth_prior.py \
+  --source_path ./dataset/LLRS-sRGB/chair \
+  --output ./dataset/LLRS-sRGB/chair/depth_maps \
+  --depth_anything_root ./submodules/Depth-Anything-V2 \
+  --encoder vitl \
+  --checkpoint ./checkpoints/depth_anything_v2_vitl.pth \
+  --eval
 ```
 
-Render:
+The enhancement cache contains lossless PNGs. The depth cache contains float32 relative-disparity `.npy` files. Both have a strict v2 `manifest.json`; missing, duplicate, extra, non-finite, wrong-size, or wrongly named entries fail immediately.
+
+## Training
+
+```bash
+bash scripts/train.sh \
+  --data ./dataset/LLRS-sRGB/chair \
+  --model ./outputs/chair_explicit_v2 \
+  --gpu 0 --iterations 8000 --warmup --wandb
+```
+
+The wrapper explicitly uses `--prune_ratio 1.0`, which retains the complete input point cloud, and stops main densification at three quarters of the requested iterations. The remaining quarter is a refinement tail for inherited explicit appearance parameters. Its 8k schedule uses a 30k anchor ceiling, at most 256 new anchors per main update, and at most 128 per warmup update; training-time pruning is disabled for the first diagnosis run. `prune_ratio` controls only the initial random point-cloud reduction; it is unrelated to training-time anchor pruning. A direct `train.py` invocation that has a nonzero growth budget must set `update_until < iterations`, otherwise startup fails instead of silently saving immediately after the last growth event. Set `max_new_anchors_per_update=0` for a no-growth smoke test. Training-time pruning is enabled only when `max_pruned_anchors_per_update` is positive.
+
+To select StableSR instead, add:
+
+```bash
+--enhancement-backend stablesr --stablesr-input-gain 15
+```
+
+If StableSR uses a separate compatible environment, pass its interpreter to
+`train.py` with `--stablesr_python /path/to/stablesr-env/bin/python`.
+
+When W&B is enabled, the optional `--wandb_monitor_camera` (an exact
+`image_name` or zero-based sorted index),
+`--wandb_monitor_split {train,test}`, and `--wandb_monitor_interval` arguments
+select one fixed monitoring view. Only `image`, `image_enhanced`, `reflectance`,
+`illumination`, and `illumination_enhanced` are logged as images; scalar loss and
+densification logs remain available. As in the clean project, only the dark
+`image` and grayscale `illumination` views receive a scene-level display gain;
+the gain is logged and never enters priors, rendered training targets, or loss.
+
+Warmup uses the same appearance computation and the same loss as main training. It only scales Scaffold geometry learning rates and changes the anchor densification window; the pose and appearance schedules remain unchanged.
+`warmup_geometry_lr_scale=0.1` is a named Scaffold-only multiplier; it never changes the shared explicit appearance LR. At the warmup-to-main boundary, only the interval-local offset gradient numerator/denominator are reset. Lifetime opacity, visibility, anchor birth, and optimizer state are preserved. W&B records the phase, the real learning rate of every optimizer group, statistics-collection/adjust/reset events, and the enhanced-illumination mean/p95/max without adding any images beyond the five core views.
+
+Checkpoints store the warmup enable flag, boundary, and whether the transition
+has completed. Resume must use the original `--warmup` and
+`--warmup_iterations` values; a mismatch fails before optimizer restoration.
+Thus a checkpoint saved at iteration 2000 resets the interval-local evidence
+once on iteration 2001, while a post-transition checkpoint never resets twice.
+The terminal uses separate `Training [warmup]` and `Training [main]` progress
+bars and prints a framed `[phase 2/2]` transition, so the 2k+8k split is not
+hidden inside a single ambiguous counter.
+
+Max-RGB multi-view initialization also performs a deterministic per-pixel depth
+test: among projected anchor-offset samples that round to the same pixel, only
+the nearest sample contributes. Unobserved offsets still use global robust
+statistics; hidden samples are no longer mixed into their R/L estimate.
+
+The complete objective is
+
+```text
+L = L_photo_low
+  + lambda_reflectance_reconstruction * L_photo(R * stopgrad(L), I_low)
+  + lambda_illumination * (L_photo(L, MaxRGB(I_low)) + L_edgeTV)
+  + lambda_enhanced * (L_photo_enhanced + L_photo(L_enhanced, H_target))
+  + lambda_depth                * L_depth
+  + lambda_scaling              * L_scale
+```
+
+Only six loss arguments are public:
+
+| Argument | Default |
+| --- | ---: |
+| `lambda_dssim` | `0.2` |
+| `lambda_scaling` | `0.01` |
+| `lambda_reflectance_reconstruction` | `1.0` |
+| `lambda_illumination` | `1.0` |
+| `lambda_enhanced` | `1.0` |
+| `lambda_depth` | `1.0` |
+
+All explicit appearance tensors share one schedule:
+
+| Argument | Default |
+| --- | ---: |
+| `explicit_appearance_lr_init` | `0.008` |
+| `explicit_appearance_lr_final` | `0.00005` |
+
+`NUMERICAL_EPS=1e-6` is used only for division, normalization, finite-value protection, and positive sharpness. Scaffold-GS geometry constants such as the visibility margin and filter footprint are separately named and documented in the geometry module.
+
+## Rendering and metrics
 
 ```bash
 python render.py \
-  -m outputs/chair_cidnet_v3_8k_single_dense \
-  --dataset_path datasets/chair \
-  --iteration 8000 \
-  --skip_train \
-  --skip_optimize
+  -m ./outputs/chair_explicit_v2 \
+  --dataset_path ./dataset/LLRS-sRGB/chair \
+  --iteration 8000 --skip_train --profile_render_timing
 ```
 
-Observed test metrics (run date: 2026-05-28):
+The renderer writes:
 
-- Test lowlight: `PSNR=46.3889`, `SSIM=0.9843`, `LPIPS=0.1285`
-- Test enhanced_gt: `PSNR=21.2126`, `SSIM=0.8095`, `LPIPS=0.3329`
+- `renders`
+- `render_enhanceds`
+- `render_reflectances`
+- `render_illuminations`
+- `render_illuminations_enhanced`
+- `render_depths`
+- `metrics_lowlight.json`
+- `metrics_enhanced_gt.json` when enhanced GT is available
+- `profile.json` with FPS, parameter count, and serialized model size when profiling is enabled
+
+The three R/L diagnostic directories contain coverage-conditioned covered means. `render_depths` contains expected depth; neither output is a raw alpha-premultiplied raster attribute.
+
+## Format v2
+
+- Training checkpoints are named dictionaries with model version, iteration, warmup-stage metadata, Scaffold tensors, explicit appearance, optimizer state, and densification state.
+- PLY stores a mandatory version property and the appearance-format-v2 bounded diffuse/additive-SG layout.
+- `save_mlp_checkpoints` and `load_mlp_checkpoints` serialize only opacity/covariance/optional feature-bank heads.
+- There is no legacy backfill or format guessing. Start a new v2 experiment.
+
+## Tests
+
+```bash
+python -m unittest discover -s tests -v
+python -m py_compile train.py render.py scene/explicit_appearance.py scene/gaussian_model_v2.py gaussian_renderer/__init__.py
+```
+
+CPU tests cover explicit R/ASG/SG behavior, finite gradients, robust initialization, coverage-conditioned losses, densification schedule rejection, grow/prune alignment, strict priors, AST boundaries, and v2 PLY/checkpoint round trips. CUDA tests additionally cover opacity-invariant normalized attributes/expected depth and rasterizer gradient isolation; train/render smoke tests run only in a configured CUDA environment.
+
+## License and upstream project
+
+This repository derives from LL-Gaussian and Scaffold-GS. Follow the licenses in [LICENSE.md](LICENSE.md) and the bundled submodules.

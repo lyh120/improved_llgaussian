@@ -25,12 +25,12 @@ from pathlib import Path
 from plyfile import PlyData, PlyElement
 import copy
 import torch
-try:
-    import laspy
-except:
-    print("No laspy")
 from utils.sh_utils import SH2RGB
 from scene.gaussian_model import BasicPointCloud
+
+
+# Original 3DGS/Scaffold-GS camera-extent padding used to scale spatial LRs.
+SCAFFOLD_CAMERA_EXTENT_PADDING = 1.1
 import cv2
 
 
@@ -70,7 +70,7 @@ def getNerfppNorm(cam_info):
         cam_centers.append(C2W[:3, 3:4])
 
     center, diagonal = get_center_and_diag(cam_centers)
-    radius = diagonal * 1.1
+    radius = diagonal * SCAFFOLD_CAMERA_EXTENT_PADDING
 
     translate = -center
 
@@ -142,7 +142,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         # print(f'FovX: {FovX}, FovY: {FovY}')
 
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
-        image_name = os.path.basename(image_path).split(".")[0]
+        image_name = Path(image_path).stem
         image = Image.open(image_path)
 
         # print(f'image: {image.size}')
