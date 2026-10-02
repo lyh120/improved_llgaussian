@@ -88,3 +88,99 @@ def L_Enhancement_Edge_Preserve(
     ).to(enhanced_grad.dtype)
     missing_edge = F.relu(target_ratio * teacher_grad - enhanced_grad)
     return (missing_edge * valid_mask).sum() / valid_mask.sum().clamp_min(1.0)
+
+
+def L_Enhancement_Target_Edge(enhanced_image, target_image, coverage=None):
+    """Match coherent CIDNet edges while ignoring most single-pixel low-light noise.
+
+    The target is smoothed before differentiation. Only its stronger edges
+    supervise the prediction, so flat noisy regions do not ask the 3D model
+    to reproduce frame-specific grain.
+    """
+    kernel_1d = enhanced_image.new_tensor(
+        [0.036633, 0.111281, 0.216745, 0.270682, 0.216745, 0.111281, 0.036633]
+    )
+    kernel = (kernel_1d[:, None] * kernel_1d[None, :]).view(1, 1, 7, 7)
+    sobel_x = enhanced_image.new_tensor(
+        [[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]]
+    ).view(1, 1, 3, 3) / 8.0
+    sobel_y = sobel_x.transpose(-1, -2)
+
+    def gradients(image):
+        gray = (0.2126 * image[0:1] + 0.7152 * image[1:2]
+                + 0.0722 * image[2:3]).unsqueeze(0)
+        smooth = F.conv2d(F.pad(gray, (3, 3, 3, 3), mode="reflect"), kernel)
+        smooth = F.pad(smooth, (1, 1, 1, 1), mode="reflect")
+        return F.conv2d(smooth, sobel_x), F.conv2d(smooth, sobel_y)
+
+    target_dx, target_dy = gradients(target_image.detach())
+    pred_dx, pred_dy = gradients(enhanced_image)
+    target_magnitude = torch.sqrt(target_dx.square() + target_dy.square() + 1e-8)
+    threshold = torch.maximum(
+        target_magnitude.new_tensor(0.015),
+        target_magnitude.mean() + target_magnitude.std(unbiased=False),
+    )
+    mask = (target_magnitude > threshold).detach().to(enhanced_image.dtype)
+    mask = mask * (_coverage_2d(coverage, target_magnitude.squeeze(0)) >= 0.95).unsqueeze(0).detach()
+    error = torch.abs(pred_dx - target_dx) + torch.abs(pred_dy - target_dy)
+    return (error * mask).sum() / mask.sum().clamp_min(1.0)
+
+
+def L_Reflectance_Target_Detail(reflectance_image, target_image, coverage=None):
+    """Transfer local structure from a 2D target into R without changing geometry.
+
+    Local log luminance removes most smooth exposure changes. The target is
+    gently blurred before comparison, and flat or saturated regions carry
+    little weight, so isolated sensor noise does not become material texture.
+    The caller supplies a geometry-detached reflectance raster.
+    """
+    def luminance(image):
+        return (0.2126 * image[0:1] + 0.7152 * image[1:2]
+                + 0.0722 * image[2:3]).unsqueeze(0)
+
+    target_gray = luminance(target_image.detach())
+    ref_gray = luminance(reflectance_image)
+    target_gray = F.avg_pool2d(
+        F.pad(target_gray, (1, 1, 1, 1), mode="reflect"), 3, stride=1
+    )
+
+    def local_log_detail(gray):
+        log_gray = torch.log(gray.clamp_min(0.02))
+        smooth = F.avg_pool2d(
+            F.pad(log_gray, (4, 4, 4, 4), mode="reflect"), 9, stride=1
+        )
+        return log_gray - smooth
+
+    target_detail = local_log_detail(target_gray).detach()
+    ref_detail = local_log_detail(ref_gray)
+    local_contrast = target_detail.abs()
+    mask = ((local_contrast > 0.035) & (target_gray < 0.97)).to(ref_detail.dtype)
+    mask = mask * (_coverage_2d(coverage, target_gray.squeeze(0)) >= 0.95).unsqueeze(0).detach()
+    error = F.smooth_l1_loss(ref_detail, target_detail, reduction="none", beta=0.05)
+    return (error * mask).sum() / mask.sum().clamp_min(1.0)
+
+
+def L_Reflectance_Target_Chroma(reflectance_image, target_image, coverage=None):
+    """Keep material color in R while ignoring overall exposure differences."""
+    target = target_image.detach()
+    target_mean = target.mean(dim=0, keepdim=True)
+    ref_mean = reflectance_image.mean(dim=0, keepdim=True)
+    target_chroma = target / target_mean.clamp_min(0.05)
+    ref_chroma = reflectance_image / ref_mean.clamp_min(0.05)
+    mask = ((target_mean > 0.08) & (target_mean < 0.95)).to(ref_chroma.dtype)
+    mask = mask * (_coverage_2d(coverage, ref_mean) >= 0.95).detach()
+    error = F.smooth_l1_loss(ref_chroma, target_chroma, reduction="none", beta=0.1)
+    return (error * mask).sum() / (3.0 * mask.sum().clamp_min(1.0))
+
+
+def L_Illumination_Chroma_Consistency(illumination_image, coverage=None):
+    """Make enhanced lighting spatially smooth in color, with room for a global tint."""
+    mean = illumination_image.mean(dim=0, keepdim=True)
+    chroma = illumination_image / mean.clamp_min(0.05)
+    mask = ((mean > 0.08) & (_coverage_2d(coverage, mean) >= 0.95)).to(chroma.dtype).detach()
+    denom = mask.sum().clamp_min(1.0)
+    global_chroma = (chroma * mask).sum(dim=(1, 2), keepdim=True) / denom
+    spatial = F.smooth_l1_loss(chroma, global_chroma.expand_as(chroma), reduction="none", beta=0.1)
+    spatial = (spatial * mask).sum() / (3.0 * denom)
+    neutral = (global_chroma - 1.0).square().mean()
+    return spatial + 0.2 * neutral

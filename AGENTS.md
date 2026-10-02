@@ -355,3 +355,51 @@ python render.py -m /home/liuyuhao/ll_further/LL-Gaussian-sg/outputs/chair_sg_ex
 - `train.py`：enhancement 第一项的衰减曲线从尾值 `0.3` 调低到 `0.1`，进一步减少 StableSR 伪 GT 对 reflectance 的长期拖软。
 - `scene/gaussian_model.py`：将 reflectance decoder refinement 缩放从 `0.25` 下调到 `0.15`，把 decoder 从大幅补偿器收紧为局部微调器，避免 decoder 饱和却不产出有效结构。
 - `arguments/__init__.py`：新增 `reflectance_highfreq_reg=3e-3`、`residual_higherror_percentile=0.8`、`residual_highlight_percentile=0.9`，并将 `reflectance_decoder_lr` 从 `0.004` 下调到 `0.002`、`reflectance_decoder_reg` 从 `1e-5` 上调到 `2e-5`，同步写入兼容回填默认值。
+
+### 2026-09-27 Wandb 冗余监控清理
+
+- `train.py`：删除两份主标量日志（warmup 分支与 residual 分支）中与 `enhancement_gain_smooth`、`enhancement_edge_preserve` 数值完全相同的 `*_weighted` 重复键。
+- `train.py`：`sg_energy`、`sg_lambda_mean` 改为仅在 `illumination_mode == "sg"` 时记录。更正（2026-09-28）：原记录称其恒为 0 有误——ASG 主路径下这两项与 `asg_energy`、`asg_lambda_mean` 是同值别名（`evaluate_anisotropic_spherical_gaussians` 同时返回两套键），属于重复监控。
+- `train.py`：删除 warmup/无 residual 分支日志中恒为 0 的 `residual_mix_weight`、`residual_chroma_boost`（该分支下 residual 不会激活）。
+- `train.py`：监控图像面板删除与主标量日志重复的 `gain_smooth_*`、`edge_preserve_*`、`{random}/coverage_low_ratio`、`{fixed}/anchor_count`、`{fixed}/enhancement_grad_norm_pre_clip`、两个 `iteration` 与 `camera_uid`（与 `camera_name` 一一对应）；保留 fixed 相机专属的 `enhancement_lr`、enhancement SG amplitude/sharpness 统计与 `render_error`。
+- `train.py`：修复两处主标量 `wandb.log` 缺少 `if wandb is not None` 守卫的问题；此前不加 `--use_wandb` 启动训练会在首个迭代因 `None.log` 崩溃。
+
+### 2026-09-28 增强监督组合方式统一
+
+- `utils/composition_utils.py`：`compose_decomposed_render` 新增 `detach_illumination` 与 `reflectance_key` 参数，并把 illumination 取值纳入函数内统一处理；docstring 明确所有 R×L 组合监督必须经该函数，共享同一套边界（双重 alpha）与饱和（clamp [0,1]）行为，仅允许梯度路由不同。
+- `train.py`：`L_diff_illumination` 改为直接复用 `image_enhanced_pred`（同一 compose 产物），不再手写未 clamp 的 `illumination_enhanced_image * reflectance_image.detach()` 图像空间乘积。
+- `train.py`：`L_diff_reflectance` 改为经 `compose_decomposed_render(enhanced=True, reflectance_key=..., detach_illumination=True)` 计算，`isolate_reflectance_grad` 为真时取 `render_reflectance_sharpen`；不再手写未 clamp 乘积。
+- `tests/test_composition_utils.py`：新增 `detach_illumination` 梯度路由测试与 `reflectance_key` 分支选择测试。
+- 说明：此前 L_diff 两项与相邻 color/green_bias/edge_preserve 损失对同一"增强预测"用了 clamp 与不 clamp 两种写法，边界像素会收到不一致的梯度；本次统一后梯度路由语义不变，仅消除该不一致。
+
+### 2026-09-28 Reflectance 梯度隔离（sharpen 分支）行为记录
+
+- `gaussian_renderer/__init__.py`：新增 `render_reflectance_sharpen` 独立光栅分支（几何输入全部 detach），edge_uplift/contrast/highfreq 与 `L_diff_reflectance` 经该分支只训练 B0/detail/decoder；enhanced 光栅分支改为 `means2D/opacity/scales/rotations` 全 detach（color-only），`get_enhanced_illumination` 对 `view_dirs` 做 detach。
+- 行为变化注意：densification 统计自此只来自主 R×L 光栅分支（enhanced 分支不再贡献 viewspace 梯度）；增强分支彻底不再塑造几何。与旧 checkpoint/旧日志的训练动力学不可比，新旧消融结论不能直接混用。
+- 开销注意：默认四个正则权重均 >0，隔离分支全程生效，每 iteration 额外一次光栅化与一次 decoder/MLP 前向（粗估 +15-25% 训练时间）；`isolate_reflectance_grad` 由权重推导，可用新参数 `--disable_reflectance_grad_isolation` 强制关闭（消融 A7 臂）。
+- 同轮修复：`isolate=False` 时不再把 `reflectance_sharpen` 冗余拼进 `concatenated_all`；`utils/sg_utils.py` ASG 多 lobe 合并由 mean 改为 sum（默认 `asg_lobes=1` 下数学等价，lobes>1 时各 lobe 按自身幅度叠加；SG 路径 mean 语义保持不变）；`tests/test_sg_utils.py`、`tests/test_arguments_backfill.py`（backfill 默认值表与参数组同步守卫）；`train.py` 训练结束输出 timing_stats（此前只累计不打印）。
+- 消融方案见 `supplementary_experiments/ablation_reflectance_sharpen_20260928.md`，运行脚本 `scripts/run_ablation_sharpen.sh` / `scripts/render_ablation_sharpen.sh`。
+
+### 2026-09-28 静态扫描错误修复
+
+- `utils/image_utils.py`：恢复被注释掉的 `fov2focal` 导入（改为绝对导入 `from utils.graphics_utils import fov2focal`）。此前 `Camera_Reprojection`、`Camera_Reprojection_inverse`、`map_pixels_between_views`、`fill_source_from_target` 四个函数共 9 处调用会在运行时抛 `NameError`。
+- `utils/loss_utils.py`：修复 `L_Feat_Smooth` 中未定义的 `padded_illumination`（应为 `padded_feature`，特征图梯度 ÷ 图像边缘权重 × 深度加权）。该函数当前无调用方，属死代码地雷修复，不影响训练。
+- `train.py`：移除 dual-transient 分支中 `dataset.artifact_highlight_reg * L_residual_chroma_boost` 的重复加权——`L_Residual_Chroma_Boost` 与 `residual_chroma_reg` 是文档记载的配对，且不存在独立的 artifact-highlight 损失，两权重相加（0.25 + 5e-4）属历史复制错误。行为影响：使用 `--use_dual_transient` 且未显式传 `--artifact_highlight_reg 0.0` 的 run，chroma boost 有效权重从 0.2505 回到 0.0005；README 最佳配置（`artifact_highlight_reg 0.0`）下数值不变。`artifact_highlight_reg` 参数保留（CLI 兼容）但现在不影响任何损失。
+- 说明：`utils/noise_edstimation.py` 存在多处未定义名（sys/cv2/gaussian_filter 等），但该模块无任何引用方，属死文件，未改动；`arguments` 的 `enhancement_from` 参数从未被消费，同为死参数，暂保留。
+
+### 2026-09-28 冗余代码与监控清理
+
+- `gaussian_renderer/__init__.py`：删除 30 处被注释掉的死代码块共约 246 行（旧光栅化调用、SVD 特征实验、旧 residual 光栅配置、pdb/ipdb 断点等），恢复被连带删除的 3 处分段头注释；文件从 1162 行降至约 980 行。
+- `train.py`：删除死变量 `weight_scheduler2`、`total_start_time`；删除未用 import（`L_Gray`/`L_Depth_Smooth`/`pearson_depth_loss`/`Camera_Reprojection*`/`visualize_heatmap`/`load_pose`）；主标量日志移除与 `monitor_step_key` 重复的 `iteration` 键；`enhancement_grad_norm_pre_clip` 改为仅在 `enhancement_grad_clip > 0` 时记录（默认 0 时原本恒为 0）。
+- `render.py`：删除未用 import `render_fast`、`from time import perf_counter` 与死变量 `t_list`/`visible_count_list`。
+- `utils/sg_utils.py`：删除无引用的 `sg_energy_regularization`/`sg_sharpness_regularization`/`assert_finite_tensor`；ASG stats 移除 7 个重复别名键（`illumination_*`×4、`sg_*`×3），仅保留 `asg_*`×4。
+- `utils/loss_utils.py`：`L_ASG_*` 由双层 fallback 链简化为单层 `.get`（保留兜底：sg/mlp 模式下 stats 无 `asg_*` 键时返回 0，避免 KeyError 回归）。
+- `tests/test_composition_utils.py`：移除 compose 不消费的假 fixture 键（`render`/`render_enhanced`）与 `reflectance_key` 测试中与首个用例重复的默认分支断言；5 个测试文件均对应活代码，无文件级删除。
+- 删除 `utils/noise_edstimation.py`（130 行，无任何引用方且自身存在多处未定义名）。
+- 保留未动：`L_Feat_Smooth`（上轮已修复的功能性损失）、`artifact_highlight_reg`/`enhancement_from` 死参数（CLI/旧 cfg 兼容）、`utils/StableSR_utlis.py` 的未用 import（ldm 侧 import 可能带注册副作用）。
+
+### 2026-09-28 Densification/Pruning 审查修复
+
+- 审查结论：densification（有界生长/去重/多层级阈值）、参数继承（B0 与 ASG/增强 SG 按 scatter_mean 继承、anchor_feat 按 scatter_max）、pruning（低 opacity + never-visible 宽限 + 预算）、optimizer 组名匹配、LR 调度覆盖、PLY/chkpnt 序列化链路均确认正确。
+- 更正（2026-09-28）：此前审查报告称"增强门控参数（enhancement_context_feat/illum/bias）不在 PLY 中、跨阶段丢失"系误报——`save_mlp_checkpoints` 已将其存入 `enhancement_context.pth`，`load_mlp_checkpoints` 完整恢复，warmup→主阶段（train.py Scene 只读 PLY 时 `only_ply=False`）与 render.py 推理均走该链路。
+- `scene/gaussian_model.py`：删除 `adjust_anchor` 中不可达的 warmup unvisibility 剪枝分支（warmup 调用恒 `allow_prune=False`，代码提前 return）及 `old_anchor_num`；删除 `training_statis` 中从未更新/读取的 `grad_variance`/`grad_mean`；删除 `max_radii2D` 的三处无效重置（该张量仅存于 chkpnt 兼容，从未被任何决策消费，定义处已注释说明）；`_prune_anchor_optimizer` 的 log-scale 0.05 安全阀补充量纲注释。

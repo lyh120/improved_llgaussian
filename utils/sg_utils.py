@@ -106,7 +106,10 @@ def evaluate_anisotropic_spherical_gaussians(
     dot_y = (view_dirs * y_axis).sum(dim=-1, keepdim=True)
     upper_hemi = torch.clamp(dot_z, min=0.0)
     lobes = amplitudes * upper_hemi * torch.exp(-lambda_x * dot_x.square() - lambda_y * dot_y.square())
-    asg_term = lobes.mean(dim=2)
+    # Sum over lobes so each lobe contributes its own amplitude.  With the
+    # default asg_lobes=1 this equals the previous mean; with multiple lobes
+    # a mean would dilute every lobe by 1/lobes.
+    asg_term = lobes.sum(dim=2)
 
     if use_distance:
         falloff = torch.exp(-F.softplus(dist_weight) * torch.log1p(view_dist.view(-1, 1, 1)))
@@ -117,33 +120,9 @@ def evaluate_anisotropic_spherical_gaussians(
 
     anisotropy = torch.maximum(lambda_x, lambda_y) / (torch.minimum(lambda_x, lambda_y) + 1e-6)
     stats = {
-        "illumination_energy": amplitudes.mean(),
-        "illumination_lambda_mean": bandwidth.mean(),
-        "illumination_lambda_max": bandwidth.max(),
-        "illumination_anisotropy": anisotropy.mean(),
         "asg_energy": amplitudes.mean(),
         "asg_lambda_mean": bandwidth.mean(),
         "asg_lambda_max": bandwidth.max(),
         "asg_anisotropy": anisotropy.mean(),
-        "sg_energy": amplitudes.mean(),
-        "sg_lambda_mean": bandwidth.mean(),
-        "sg_lambda_max": bandwidth.max(),
     }
     return illumination.reshape(-1, 1), illumination_feat, stats
-
-
-def sg_energy_regularization(stats: dict | None) -> torch.Tensor:
-    if not stats or "sg_energy" not in stats:
-        return torch.tensor(0.0, device="cuda")
-    return stats["sg_energy"]
-
-
-def sg_sharpness_regularization(stats: dict | None) -> torch.Tensor:
-    if not stats or "sg_lambda_mean" not in stats:
-        return torch.tensor(0.0, device="cuda")
-    return stats["sg_lambda_mean"]
-
-
-def assert_finite_tensor(name: str, tensor: torch.Tensor) -> None:
-    if torch.isnan(tensor).any() or torch.isinf(tensor).any():
-        raise FloatingPointError(f"{name} contains NaN or Inf values")

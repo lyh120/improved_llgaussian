@@ -415,13 +415,14 @@ def L_SG_Sharpness(sg_stats):
 def L_ASG_Energy(illumination_stats):
     if not illumination_stats:
         return torch.tensor(0.0, device="cuda")
-    return illumination_stats.get("asg_energy", illumination_stats.get("illumination_energy", torch.tensor(0.0, device="cuda")))
+    # sg/mlp illumination modes produce no asg_* keys; treat as zero there.
+    return illumination_stats.get("asg_energy", torch.tensor(0.0, device="cuda"))
 
 
 def L_ASG_Sharpness(illumination_stats):
     if not illumination_stats:
         return torch.tensor(0.0, device="cuda")
-    return illumination_stats.get("asg_lambda_mean", illumination_stats.get("illumination_lambda_mean", torch.tensor(0.0, device="cuda")))
+    return illumination_stats.get("asg_lambda_mean", torch.tensor(0.0, device="cuda"))
 
 
 def L_ASG_Anisotropy(illumination_stats):
@@ -454,9 +455,9 @@ def L_Feat_Smooth(feature_image, image, mask, depth_image):
     weight_x = torch.abs(padded_gray[:,:-1,:-1] - padded_gray[:,1:,:-1])
     weight_y = torch.abs(padded_gray[:,:-1,:-1] - padded_gray[:,:-1,1:])
 
-    grad_x = torch.abs((padded_illumination[:,:-1,:-1] - padded_illumination[:,1:,:-1]) ) / (weight_x + 1e-8)
+    grad_x = torch.abs((padded_feature[:,:-1,:-1] - padded_feature[:,1:,:-1]) ) / (weight_x + 1e-8)
     # 计算y方向的梯度
-    grad_y = torch.abs((padded_illumination[:,:-1,:-1] - padded_illumination[:,:-1,1:]) ) / (weight_y + 1e-8)
+    grad_y = torch.abs((padded_feature[:,:-1,:-1] - padded_feature[:,:-1,1:]) ) / (weight_y + 1e-8)
     # 计算梯度幅度
     grad_image = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-8)
 

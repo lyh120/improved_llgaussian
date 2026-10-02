@@ -36,7 +36,7 @@ from PIL import Image
 from scene import Scene
 import json
 import time
-from gaussian_renderer import render, prefilter_voxel,render_fast
+from gaussian_renderer import render, prefilter_voxel
 import torchvision
 from tqdm import tqdm
 from utils.general_utils import safe_state
@@ -55,7 +55,6 @@ from utils.pose_utils import get_tensor_from_camera
 from utils.camera_utils import visualizer, generate_interpolated_path
 from scene.dataset_readers import loadCameras
 import matplotlib.cm as cm
-from time import perf_counter
 from utils.loss_utils import l1_plus_loss, ssim
 from utils.image_utils import psnr
 import torchvision.transforms.functional as tf
@@ -447,24 +446,31 @@ def render_set(
     evaluate_metrics=False,
     profile_render_timing=False,
     profile_warmup_views=1,
+    gaussian_render_scale=1.0,
 ):
 
 
-    render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
-    render_path_enhanced = os.path.join(model_path, name, "ours_{}".format(iteration), "renders(enhanced)")
-    render_reflectance_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_reflectances")
-    render_illumination_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_illuminations")
-    render_illumination_path_enhanced = os.path.join(model_path, name, "ours_{}".format(iteration), "render_illuminations(enhanced)")
-    render_illumination_path_enhance = os.path.join(model_path, name, "ours_{}".format(iteration), "render_illuminations_enhance")
-    render_enhanced_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_enhanceds")
-    render_coverage_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_coverages")
-    render_depth_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_depths")
-    render_residual_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_residuals")
-    render_residual_path_fast = os.path.join(model_path, name, "ours_{}".format(iteration), "render_residuals(enhanced)")
-    render_noise_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_noises")
-    render_artifact_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_artifacts")
-    error_path = os.path.join(model_path, name, "ours_{}".format(iteration), "errors")
-    gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
+    render_name = "ours_{}".format(iteration)
+    if gaussian_render_scale != 1.0:
+        render_name += "_scale_{:g}".format(gaussian_render_scale)
+    enhancement_rgb_gain = getattr(gaussians, "enhancement_rgb_gain", (1.0, 1.0, 1.0))
+    if enhancement_rgb_gain != (1.0, 1.0, 1.0):
+        render_name += "_gain_" + "_".join(f"{value:g}" for value in enhancement_rgb_gain)
+    render_path = os.path.join(model_path, name, render_name, "renders")
+    render_path_enhanced = os.path.join(model_path, name, render_name, "renders(enhanced)")
+    render_reflectance_path = os.path.join(model_path, name, render_name, "render_reflectances")
+    render_illumination_path = os.path.join(model_path, name, render_name, "render_illuminations")
+    render_illumination_path_enhanced = os.path.join(model_path, name, render_name, "render_illuminations(enhanced)")
+    render_illumination_path_enhance = os.path.join(model_path, name, render_name, "render_illuminations_enhance")
+    render_enhanced_path = os.path.join(model_path, name, render_name, "render_enhanceds")
+    render_coverage_path = os.path.join(model_path, name, render_name, "render_coverages")
+    render_depth_path = os.path.join(model_path, name, render_name, "render_depths")
+    render_residual_path = os.path.join(model_path, name, render_name, "render_residuals")
+    render_residual_path_fast = os.path.join(model_path, name, render_name, "render_residuals(enhanced)")
+    render_noise_path = os.path.join(model_path, name, render_name, "render_noises")
+    render_artifact_path = os.path.join(model_path, name, render_name, "render_artifacts")
+    error_path = os.path.join(model_path, name, render_name, "errors")
+    gts_path = os.path.join(model_path, name, render_name, "gt")
     makedirs(render_path, exist_ok=True)
     makedirs(render_path_enhanced, exist_ok=True)
     makedirs(render_reflectance_path, exist_ok=True)
@@ -482,8 +488,6 @@ def render_set(
     makedirs(gts_path, exist_ok=True)
 
     depth_curve_fn = lambda x: -np.log(x + np.finfo(np.float32).eps)
-    t_list = []
-    visible_count_list = []
     name_list = []
     per_view_dict = {}
     illumination_stats_dict = {}
@@ -529,6 +533,7 @@ def render_set(
             camera_pose=pose,
             profile_timings=render_profile,
             return_coverage=True,
+            scaling_modifier=gaussian_render_scale,
         )
         if profile_render_timing:
             profile_render_end = _cuda_profile_now()
@@ -630,14 +635,14 @@ def render_set(
         stats_name = "asg_stats.json" if gaussians.illumination_mode == "asg" else "sg_stats.json"
         with open(os.path.join(model_path, name, "ours_{}".format(iteration), stats_name), 'w') as fp:
             json.dump(illumination_stats_dict, fp, indent=True)
-        with open(os.path.join(model_path, name, "ours_{}".format(iteration), "illumination_stats.json"), 'w') as fp:
+        with open(os.path.join(model_path, name, render_name, "illumination_stats.json"), 'w') as fp:
             json.dump(illumination_stats_dict, fp, indent=True)
     if coverage_metrics:
         coverage_summary = {
             key: float(np.mean([item[key] for item in coverage_metrics.values()]))
             for key in ("low_coverage_ratio", "mean_coverage")
         }
-        with open(os.path.join(model_path, name, "ours_{}".format(iteration), "coverage_stats.json"), 'w') as fp:
+        with open(os.path.join(model_path, name, render_name, "coverage_stats.json"), 'w') as fp:
             json.dump({"summary": coverage_summary, "per_view": coverage_metrics}, fp, indent=True)
     if artifact_diagnostics:
         artifact_report = {
@@ -652,7 +657,7 @@ def render_set(
         artifact_path = os.path.join(
             model_path,
             name,
-            "ours_{}".format(iteration),
+            render_name,
             "artifact_diagnostics.json",
         )
         with open(artifact_path, "w") as fp:
@@ -671,7 +676,7 @@ def render_set(
         detail_path = os.path.join(
             model_path,
             name,
-            "ours_{}".format(iteration),
+            render_name,
             "detail_diagnostics.json",
         )
         with open(detail_path, "w") as fp:
@@ -679,12 +684,12 @@ def render_set(
         print(f"[detail] saved diagnostic report to {detail_path}")
     if evaluate_metrics:
         _dump_metric_report(
-            os.path.join(model_path, name, "ours_{}".format(iteration), "metrics_lowlight.json"),
+            os.path.join(model_path, name, render_name, "metrics_lowlight.json"),
             lowlight_metrics,
             "lowlight",
         )
         _dump_metric_report(
-            os.path.join(model_path, name, "ours_{}".format(iteration), "metrics_enhanced_gt.json"),
+            os.path.join(model_path, name, render_name, "metrics_enhanced_gt.json"),
             enhanced_metrics,
             "enhanced_gt",
         )
@@ -699,7 +704,7 @@ def render_set(
             "summary": profile_summary,
             "views": profile_views,
         }
-        with open(os.path.join(model_path, name, "ours_{}".format(iteration), "render_timing_profile.json"), 'w') as fp:
+        with open(os.path.join(model_path, name, render_name, "render_timing_profile.json"), 'w') as fp:
             json.dump(profile_report, fp, indent=True)
      
 def render_sets(
@@ -714,6 +719,7 @@ def render_sets(
     eval_train_metrics: bool,
     profile_render_timing: bool,
     profile_warmup_views: int,
+    gaussian_render_scale: float = 1.0,
 ):
     with torch.no_grad():
         if include_residual_render:
@@ -765,6 +771,7 @@ def render_sets(
                 evaluate_metrics=eval_train_metrics,
                 profile_render_timing=profile_render_timing,
                 profile_warmup_views=profile_warmup_views,
+                gaussian_render_scale=gaussian_render_scale,
             )
 
     if not skip_test:
@@ -783,6 +790,7 @@ def render_sets(
                 evaluate_metrics=True,
                 profile_render_timing=profile_render_timing,
                 profile_warmup_views=profile_warmup_views,
+                gaussian_render_scale=gaussian_render_scale,
             )
         else:
             render_set_optimize(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, dataset.kernel_size)
@@ -806,6 +814,7 @@ def render_sets(
                 evaluate_metrics=False,
                 profile_render_timing=profile_render_timing,
                 profile_warmup_views=profile_warmup_views,
+                gaussian_render_scale=gaussian_render_scale,
             )
             image_folder = os.path.join(dataset.model_path, f'interp/ours_{scene.loaded_iter}/render_enhanceds')
             output_video_file = os.path.join(dataset.model_path, f'interp/ours_{scene.loaded_iter}/interp_enhanced_view.mp4')
@@ -830,13 +839,17 @@ if __name__ == "__main__":
     parser.add_argument("--eval_train_metrics", action="store_true")
     parser.add_argument("--profile_render_timing", action="store_true")
     parser.add_argument("--profile_warmup_views", default=1, type=int)
+    parser.add_argument("--gaussian_render_scale", default=1.0, type=float,
+                        help="Scale Gaussian covariances at render time; writes to a separate render directory")
 
     args = get_combined_args(parser)
+    if args.gaussian_render_scale <= 0:
+        parser.error("--gaussian_render_scale must be positive")
     if args.use_residual:
         print("[deprecated] checkpoint residual fields are ignored; rendering uses the residual-free primary path.")
     args.use_residual = False
     args.use_dual_transient = False
-    if args.dataset_path:
+    if args.dataset_path and args.dataset_path != 'None':
         args.source_path = args.dataset_path
     print("Rendering " + args.model_path)
     # Initialize system state (RNG)
@@ -854,4 +867,5 @@ if __name__ == "__main__":
         args.eval_train_metrics,
         args.profile_render_timing,
         args.profile_warmup_views,
+        args.gaussian_render_scale,
     )

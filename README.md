@@ -137,6 +137,8 @@ bash scripts/single_train.sh
 
 ### Reproducible Best Setting (LLRS-sRGB/chair, 8k)
 
+> **Note (2026-09-28)**: This section is a historical record from the SG-illumination era. Code defaults have since moved to `illumination_mode=asg` + `reflectance_mode=explicit`, so rerunning the command verbatim follows a different decomposition path. For the current ASG main-path configuration, see `COMMON_ARGS` + `ASG_ARGS` in `scripts/run_ablation_9.sh`.
+
 The following command is the current best-performing setting in this repo for
 `LLRS-sRGB/chair` under the dual-transient pipeline:
 
@@ -260,6 +262,8 @@ Please follow the LICENSE of [3D-GS](https://github.com/graphdeco-inria/gaussian
 We thank all authors from [3D-GS](https://github.com/graphdeco-inria/gaussian-splatting), [Scaffold-GS](https://github.com/city-super/Scaffold-GS) for presenting such an excellent work.
 
 ## Local Experiment Log: CIDNet Single Dense Chair 8k
+
+> **Note (2026-09-28)**: Historical SG-era log (same caveat as above); current defaults use ASG illumination.
 
 This setting uses the low-frequency refreshed CIDNet pseudo GT, single-head
 residual branch, and a denser initial/densification strategy. CIDNet refresh is

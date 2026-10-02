@@ -15,6 +15,7 @@ import json
 import importlib.util
 import sys
 import torch
+import numpy as np
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
@@ -47,6 +48,23 @@ class Scene:
         self.model_path = args.model_path
         self.loaded_iter = None
         self.gaussians = gaussians
+        self.gaussians.max_gaussian_anisotropy = getattr(args, "max_gaussian_anisotropy", 0.0)
+        self.gaussians.reflectance_init_floor = getattr(args, "reflectance_init_floor", 0.1)
+        self.gaussians.direct_composition = (
+            getattr(args, "direct_composition", False)
+            or getattr(args, "pure_explicit_rl", False)
+        )
+        self.gaussians.pure_explicit_rl = getattr(args, "pure_explicit_rl", False)
+        self.gaussians.explicit_feature_conditioning = getattr(
+            args, "explicit_feature_conditioning", False
+        )
+        gain = tuple(float(value) for value in getattr(args, "enhancement_rgb_gain", "1,1,1").split(","))
+        if len(gain) != 3 or any(value <= 0 for value in gain):
+            raise ValueError("enhancement_rgb_gain must contain three positive RGB values")
+        self.gaussians.enhancement_rgb_gain = gain
+        self.gaussians.reflectance_target_detail_reg = getattr(args, "reflectance_target_detail_reg", 0.0)
+        self.gaussians.reflectance_target_chroma_reg = getattr(args, "reflectance_target_chroma_reg", 0.0)
+        self.depth_prior_gamma = getattr(args, "depth_prior_gamma", 1.0)
         self.depth_piror_model = depth_piror_model
 
         if load_iteration:
@@ -146,6 +164,11 @@ class Scene:
             import glob
             gt_path = glob.glob(gt_path)[0]
             gt_image = cv2.imread(gt_path)
+            if self.depth_prior_gamma != 1.0:
+                gt_image = np.clip(
+                    (gt_image.astype(np.float32) / 255.0) ** self.depth_prior_gamma * 255.0,
+                    0.0, 255.0,
+                ).astype(np.uint8)
             depth_piror = self.depth_piror_model.infer_image(gt_image)
             if not isinstance(depth_piror, torch.Tensor):
                 depth_piror = torch.as_tensor(depth_piror, dtype=torch.float32)

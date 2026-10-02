@@ -133,7 +133,9 @@ class GaussianModel:
         self.sg_illumination_available = use_sg_illumination
         self.asg_illumination_available = use_asg_illumination
         self.legacy_compatibility_mode = illumination_mode == "legacy"
-        self.reflectance_detail_scale = 1.1
+        # Unit scale keeps the explicit log-detail parameter directly
+        # interpretable; experiments may still regularize its magnitude.
+        self.reflectance_detail_scale = 1.0
         self._last_reflectance_decoder_mean = torch.tensor(0.0, device="cuda")
         self.enhancement_sg_init_sharpness = 8.0
         self.enhancement_sg_amplitude_init = 0.05
@@ -167,6 +169,8 @@ class GaussianModel:
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
+        # Kept in capture()/restore() for chkpnt compatibility; never
+        # accumulated or consumed by densification/pruning.
         self.max_radii2D = torch.empty(0)
         
         self.offset_gradient_accum = torch.empty(0)
@@ -239,6 +243,14 @@ class GaussianModel:
             nn.ReLU(True),
             nn.Linear(feat_dim, 3),
         ).cuda()
+        # Feature-conditioned explicit mode: the stored R remains the base
+        # material parameter, while Scaffold-GS features provide a bounded
+        # local modulation. The legacy pure explicit path remains available.
+        self.mlp_explicit_reflectance = nn.Sequential(
+            nn.Linear(feat_dim + 3, feat_dim),
+            nn.ReLU(True),
+            nn.Linear(feat_dim, 3),
+        ).cuda()
         self.illumination_dist_dim = 1 if self.add_illumination_dist else 0 # take distant as input or not
         self.mlp_illumination= nn.Sequential(
             nn.Linear(feat_dim// 2+3+self.illumination_dist_dim, feat_dim // 2),
@@ -249,6 +261,12 @@ class GaussianModel:
             nn.Linear(feat_dim// 2+3+self.illumination_dist_dim, feat_dim // 2),
             nn.ReLU(True),
             nn.Linear(feat_dim // 2, self.n_offsets * self.sg_lobes * 5)
+        ).cuda()
+        self.enhancement_net = nn.Sequential(
+            nn.Linear(feat_dim + self.n_offsets, feat_dim // 2),
+            nn.ReLU(True),
+            nn.Linear(feat_dim // 2, 3 * self.n_offsets),
+            nn.Sigmoid(),
         ).cuda()
         if self.use_residual:
             self.residual_dist_dim = 1 if self.add_residual_dist else 0 # take distant as input or not
@@ -421,6 +439,9 @@ class GaussianModel:
             self.mlp_reflectance.eval()
         else:
             self.mlp_reflectance_decoder.eval()
+        if getattr(self, "explicit_feature_conditioning", False):
+            self.mlp_explicit_reflectance.eval()
+            self.enhancement_net.eval()
         if self.use_residual:
             if self.use_dual_transient:
                 self.noise_net.eval()
@@ -446,6 +467,9 @@ class GaussianModel:
             self.mlp_reflectance.train()
         else:
             self.mlp_reflectance_decoder.train()
+        if getattr(self, "explicit_feature_conditioning", False):
+            self.mlp_explicit_reflectance.train()
+            self.enhancement_net.train()
         if self.use_residual:
             if self.use_dual_transient:
                 self.noise_net.train()
@@ -879,13 +903,43 @@ class GaussianModel:
         detail = self.reflectance_detail_scale * torch.tanh(self._reflectance_offset_delta)
         return torch.exp(base.unsqueeze(1) + detail)
 
-    def get_reflectance_with_decoder(self, feat, offsets, visible_mask):
+    def get_reflectance_with_decoder(
+        self,
+        feat,
+        offsets,
+        visible_mask,
+        detach_conditioning=False,
+        record_decoder_stats=True,
+    ):
+        """Return explicit reflectance, optionally isolating decoder conditioning.
+
+        ``detach_conditioning`` is used by reflectance-only sharpening losses. It
+        keeps gradients for B0, offset detail, and decoder parameters while
+        preventing those losses from updating anchor features or Gaussian
+        offsets through the decoder inputs.
+        """
         reflectance = self.get_reflectance_with_detail[visible_mask]
+        if getattr(self, "pure_explicit_rl", False):
+            if getattr(self, "explicit_feature_conditioning", False):
+                feat_repeated = feat.unsqueeze(1).expand(-1, self.n_offsets, -1)
+                condition = torch.cat([feat_repeated, offsets], dim=-1).reshape(-1, self.feat_dim + 3)
+                condition = self.mlp_explicit_reflectance(condition).reshape(-1, self.n_offsets, 3)
+                reflectance = reflectance * torch.exp(torch.tanh(condition))
+                self._last_reflectance_decoder_mean = torch.abs(torch.tanh(condition)).mean()
+            else:
+                # R is stored per anchor and offset. The legacy decoder remains
+                # available for old checkpoints, but contributes no color here.
+                self._last_reflectance_decoder_mean = reflectance.new_zeros(())
+            return reflectance.clamp(1e-3, 1.0)
+        if detach_conditioning:
+            feat = feat.detach()
+            offsets = offsets.detach()
         feat_repeated = feat.unsqueeze(1).expand(-1, self.n_offsets, -1)
         decoder_input = torch.cat([feat_repeated, offsets], dim=-1).reshape(-1, self.feat_dim + 3)
         decoder_out = self.mlp_reflectance_decoder(decoder_input).reshape(-1, self.n_offsets, 3)
         decoder_refine = 1.0 + 0.15 * torch.tanh(decoder_out)
-        self._last_reflectance_decoder_mean = torch.abs(torch.tanh(decoder_out)).mean()
+        if record_decoder_stats:
+            self._last_reflectance_decoder_mean = torch.abs(torch.tanh(decoder_out)).mean()
         return torch.clamp(reflectance * decoder_refine, 1e-3, 1.0)
 
     def get_enhanced_illumination(self, feat, illumination_feat, view_dirs, visible_mask):
@@ -894,12 +948,21 @@ class GaussianModel:
         sharpness = F.softplus(self._enhancement_sg_sharpness[visible_mask])
         amplitude = torch.sigmoid(self._enhancement_sg_amplitude[visible_mask])
 
-        view_dirs = view_dirs.view(-1, 1, 3)
+        # Match the clean enhancement branch's detached conditioning: enhanced
+        # illumination may train its own parameters, but must not move anchors
+        # indirectly through view-direction gradients.
+        view_dirs = view_dirs.detach().view(-1, 1, 3)
         cosine = torch.sum(axis * view_dirs, dim=-1, keepdim=True).clamp(-1.0, 1.0)
         sg_term = amplitude * torch.exp(sharpness * (cosine - 1.0))
 
         illumination_context = torch.sigmoid(illumination_feat) if self.illumination_mode in {"mlp", "legacy"} else illumination_feat
         illumination_context = illumination_context.detach()
+        if getattr(self, "pure_explicit_rl", False):
+            if getattr(self, "explicit_feature_conditioning", False):
+                enhancement_input = torch.cat([feat.detach(), illumination_context.detach()], dim=1)
+                return self.enhancement_net(enhancement_input).reshape(-1, 3)
+            base = illumination_context.view(-1, self.n_offsets, 1)
+            return torch.clamp(base + sg_term, 0.0, 1.0).reshape(-1, 3)
         feat_gain = feat.detach().matmul(self._enhancement_feat_weight).view(-1, 1, 3)
         illum_gain = illumination_context.view(-1, self.n_offsets, 1) * self._enhancement_illum_weight.view(1, self.n_offsets, 3)
         context_gain = feat_gain + illum_gain
@@ -1056,7 +1119,10 @@ class GaussianModel:
         image = cam.original_image  # (3, H, W)
         H, W = image.shape[1], image.shape[2]
 
-        max_c_img = image.max(dim=0, keepdim=True)[0].clamp(min=1e-1)
+        # A fixed 0.1 floor collapses reflectance on scenes whose bright pixels
+        # are themselves below 0.1 (for example, LLNeRF shrub). Keep the
+        # historic floor as the default and let the scene set a lower one.
+        max_c_img = image.max(dim=0, keepdim=True)[0].clamp(min=getattr(self, "reflectance_init_floor", 0.1))
         reflectance_map = (image / max_c_img).clamp(1e-3, 1.0)
         reflectance_map_bchw = reflectance_map.unsqueeze(0)
         reflectance_map_blur = F.avg_pool2d(reflectance_map_bchw, kernel_size=5, stride=1, padding=2).squeeze(0)
@@ -1241,7 +1307,6 @@ class GaussianModel:
         self._scaling = nn.Parameter(scales.requires_grad_(True))
         self._rotation = nn.Parameter(rots.requires_grad_(False))
         self._opacity = nn.Parameter(opacities.requires_grad_(False))
-        self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
 
 
 
@@ -1352,6 +1417,10 @@ class GaussianModel:
         inactive_groups = set()
         if self.reflectance_mode == "mlp":
             inactive_groups.update({"base_log_reflectance", "reflectance_offset_delta", "mlp_reflectance_decoder"})
+        if getattr(self, "pure_explicit_rl", False):
+            if self.reflectance_mode != "explicit" or self.illumination_mode != "asg":
+                raise ValueError("pure_explicit_rl requires explicit reflectance and ASG illumination")
+            inactive_groups.update({"mlp_reflectance_decoder", "enhancement_context_feat", "enhancement_context_illum", "enhancement_context_bias"})
         if self.illumination_mode in {"mlp", "legacy"}:
             inactive_groups.update({"mlp_sg_illumination", "illum_asg_axis", "illum_asg_tangent", "illum_asg_sharpness", "illum_asg_amplitude", "illum_asg_bias", "illum_asg_dist_weight"})
         elif self.illumination_mode == "asg":
@@ -1364,6 +1433,9 @@ class GaussianModel:
             l.append({'params': self.mlp_reflectance.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_reflectance"})
         if self.illumination_mode in {"mlp", "legacy"}:
             l.append({'params': self.mlp_illumination.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_illumination"})
+        if getattr(self, "explicit_feature_conditioning", False):
+            l.append({'params': self.mlp_explicit_reflectance.parameters(), 'lr': training_args.mlp_color_lr_init, "name": "mlp_explicit_reflectance"})
+            l.append({'params': self.enhancement_net.parameters(), 'lr': training_args.mlp_enhance_lr_init, "name": "enhancement_net"})
         if self.use_residual:
             l.append({'params': [self._anchor_feat_residual], 'lr': training_args.feature_lr , "name": "anchor_feat_residual"})
             l.append({'params': [self._offset_residual], 'lr': training_args.offset_lr_init * self.spatial_lr_scale  , "name": "offset_residual"})
@@ -1512,6 +1584,12 @@ class GaussianModel:
                 param_group['lr'] = lr
             if param_group["name"] == "mlp_reflectance_decoder":
                 lr = self.reflectance_decoder_scheduler_args(iteration)
+                param_group['lr'] = lr
+            if param_group["name"] == "mlp_explicit_reflectance":
+                lr = self.mlp_reflectance_scheduler_args(iteration)
+                param_group['lr'] = lr
+            if param_group["name"] == "enhancement_net":
+                lr = self.enhancement_sg_scheduler_args(iteration)
                 param_group['lr'] = lr
             if self.use_feat_bank and param_group["name"] == "mlp_featurebank":
                 lr = self.mlp_featurebank_scheduler_args(iteration)
@@ -1833,6 +1911,7 @@ class GaussianModel:
                 'residual_net' in group['name'] or \
                 'embedding' in group['name'] or \
                 'enhancement_context' in group['name'] or \
+                'enhancement_net' in group['name'] or \
                 'pose' in group['name']:
                 continue
             assert len(group["params"]) == 1
@@ -1856,10 +1935,6 @@ class GaussianModel:
 
     # statis grad information to guide liftting. 
     def training_statis(self, viewspace_point_tensor, opacity, update_filter, offset_selection_mask, anchor_visible_mask):
-        if not hasattr(self, 'grad_variance'):
-            self.grad_variance = torch.zeros_like(self.offset_gradient_accum)
-            self.grad_mean = torch.zeros_like(self.offset_gradient_accum)
-
         # update opacity stats
         temp_opacity = opacity.clone().view(-1).detach() # [N * n_offsets, 1]
         temp_opacity[temp_opacity<0] = 0
@@ -1893,6 +1968,7 @@ class GaussianModel:
                 'artifact_net' in group['name'] or \
                 'residual_net' in group['name'] or \
                 'enhancement_context' in group['name'] or \
+                'enhancement_net' in group['name'] or \
                 'embedding' in group['name'] or \
                 'pose' in group['name']:
                 continue
@@ -1910,6 +1986,9 @@ class GaussianModel:
                 group["params"][0] = nn.Parameter((group["params"][0][mask].requires_grad_(True)))
                 self.optimizer.state[group['params'][0]] = stored_state
                 if group['name'] == "scaling":
+                    # Safety valve in log-scale space: exp(0.05) ~ 1.05 world
+                    # units; only bites if learning pushed the refined scale
+                    # past that between prune events.
                     scales = group["params"][0]
                     temp = scales[:,3:]
                     temp[temp>0.05] = 0.05
@@ -1918,6 +1997,9 @@ class GaussianModel:
             else:
                 group["params"][0] = nn.Parameter(group["params"][0][mask].requires_grad_(True))
                 if group['name'] == "scaling":
+                    # Safety valve in log-scale space: exp(0.05) ~ 1.05 world
+                    # units; only bites if learning pushed the refined scale
+                    # past that between prune events.
                     scales = group["params"][0]
                     temp = scales[:,3:]
                     temp[temp>0.05] = 0.05
@@ -2254,8 +2336,6 @@ class GaussianModel:
 
     def adjust_anchor(self, check_interval=100, success_threshold=0.8, grad_threshold=0.0002, min_opacity=0.005, mode="train", phi=0.5, max_anchors=60_000, max_new_anchors=512, level_caps=(256, 160, 96), current_iteration=0, prune_grace_iters=500, prune_from_iter=0, max_pruned_anchors=0, allow_prune=True):
         anchors_before = self.get_anchor.shape[0]
-        if mode =="warmup":
-            old_anchor_num = self.anchor_demon.shape[0]
         grads = self.offset_gradient_accum / self.offset_denom # [N*k, 1]
         grads[grads.isnan()] = 0.0
         grads_norm = torch.norm(grads, dim=-1)
@@ -2305,7 +2385,6 @@ class GaussianModel:
         # Warmup may add a small, bounded set of anchors to improve coverage,
         # but it must never discard original geometry before the main stage.
         if not allow_prune:
-            self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
             growth_stats.update(
                 {
                     "anchors_before": anchors_before,
@@ -2320,7 +2399,6 @@ class GaussianModel:
             return growth_stats
 
         if current_iteration < prune_from_iter:
-            self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
             growth_stats.update(
                 {
                     "anchors_before": anchors_before,
@@ -2333,7 +2411,7 @@ class GaussianModel:
                 }
             )
             return growth_stats
-        
+
         # Restore the original accumulated-opacity semantics.  Since
         # opacity_accum sums all offsets, this is equivalent to comparing the
         # mean per-offset opacity against min_opacity / n_offsets.
@@ -2406,15 +2484,6 @@ class GaussianModel:
                     ] = True
             prune_mask = limited_prune_mask
 
-        if mode == "warmup":
-            unvisibility_mask = (self.anchor_demon == 0).squeeze(dim=1) 
-            unvisibility_mask[old_anchor_num:] = False
-
-            print("removed unvisibility anchor: ", sum(unvisibility_mask))
-            prune_mask = torch.logical_or(prune_mask, unvisibility_mask)
-
-            
-        
         # update offset_denom
         offset_denom = self.offset_denom.view([-1, self.n_offsets])[~prune_mask]
         offset_denom = offset_denom.view([-1, 1])
@@ -2450,9 +2519,8 @@ class GaussianModel:
         )
         if pruned_count > 0:
             self.prune_anchor(prune_mask)
-        
-        
-        self.max_radii2D = torch.zeros((self.get_anchor.shape[0]), device="cuda")
+
+
         growth_stats.update(
             {
                 "anchors_before": anchors_before,
@@ -2503,16 +2571,32 @@ class GaussianModel:
                 illumination_mlp.save(os.path.join(path, 'illumination_mlp.pt'))
                 self.mlp_illumination.train()
 
-            self.mlp_reflectance_decoder.eval()
-            reflectance_decoder = torch.jit.trace(self.mlp_reflectance_decoder, (torch.rand(1, self.feat_dim + 3).cuda()))
-            reflectance_decoder.save(os.path.join(path, 'reflectance_decoder.pt'))
-            self.mlp_reflectance_decoder.train()
+            if not getattr(self, "pure_explicit_rl", False):
+                self.mlp_reflectance_decoder.eval()
+                reflectance_decoder = torch.jit.trace(self.mlp_reflectance_decoder, (torch.rand(1, self.feat_dim + 3).cuda()))
+                reflectance_decoder.save(os.path.join(path, 'reflectance_decoder.pt'))
+                self.mlp_reflectance_decoder.train()
 
-            torch.save({
-                'enhancement_feat_weight': self._enhancement_feat_weight.detach(),
-                'enhancement_illum_weight': self._enhancement_illum_weight.detach(),
-                'enhancement_context_bias': self._enhancement_context_bias.detach(),
-            }, os.path.join(path, 'enhancement_context.pth'))
+                torch.save({
+                    'enhancement_feat_weight': self._enhancement_feat_weight.detach(),
+                    'enhancement_illum_weight': self._enhancement_illum_weight.detach(),
+                    'enhancement_context_bias': self._enhancement_context_bias.detach(),
+                }, os.path.join(path, 'enhancement_context.pth'))
+            if getattr(self, "explicit_feature_conditioning", False):
+                self.mlp_explicit_reflectance.eval()
+                explicit_r = torch.jit.trace(
+                    self.mlp_explicit_reflectance,
+                    (torch.rand(1, self.feat_dim + 3).cuda(),),
+                )
+                explicit_r.save(os.path.join(path, 'explicit_reflectance_conditioner.pt'))
+                self.mlp_explicit_reflectance.train()
+                self.enhancement_net.eval()
+                enhancement = torch.jit.trace(
+                    self.enhancement_net,
+                    (torch.rand(1, self.feat_dim + self.n_offsets).cuda(),),
+                )
+                enhancement.save(os.path.join(path, 'enhancement_net.pt'))
+                self.enhancement_net.train()
 
             if self.use_residual:
                 residual_input = torch.rand(1, self.feat_dim+3+self.residual_dist_dim + self.appearance_residual_dim).cuda()
@@ -2674,6 +2758,14 @@ class GaussianModel:
                 self.mlp_reflectance = torch.jit.load(legacy_reflectance_path).cuda()
             if os.path.exists(reflectance_decoder_path):
                 self.mlp_reflectance_decoder = torch.jit.load(reflectance_decoder_path).cuda()
+            explicit_r_path = os.path.join(path, 'explicit_reflectance_conditioner.pt')
+            enhancement_net_path = os.path.join(path, 'enhancement_net.pt')
+            if os.path.exists(explicit_r_path):
+                self.mlp_explicit_reflectance = torch.jit.load(explicit_r_path).cuda()
+                self.explicit_feature_conditioning = True
+            if os.path.exists(enhancement_net_path):
+                self.enhancement_net = torch.jit.load(enhancement_net_path).cuda()
+                self.explicit_feature_conditioning = True
             if os.path.exists(enhancement_context_path):
                 enhancement_context = torch.load(enhancement_context_path)
                 self._enhancement_feat_weight = nn.Parameter(enhancement_context['enhancement_feat_weight'].cuda().requires_grad_(True))

@@ -54,6 +54,15 @@ class ModelParams(ParamGroup):
         self.update_init_factor = 16
         self.update_hierachy_factor = 4
         self.kernel_size = 0.1
+        self.max_gaussian_anisotropy = 0.0
+        self.reflectance_init_floor = 0.1
+        self.depth_prior_gamma = 1.0
+        self.direct_composition = False
+        self.pure_explicit_rl = False
+        # Condition explicit R and enhancement on Scaffold-GS features while
+        # keeping pure_explicit_rl available for legacy checkpoints.
+        self.explicit_feature_conditioning = False
+        self.enhancement_rgb_gain = "1,1,1"
 
 
         self.use_feat_bank = False
@@ -87,6 +96,7 @@ class ModelParams(ParamGroup):
         self.use_asg_illumination = True
         self.illumination_mode = "asg"
         self.reflectance_mode = "explicit"
+        self.disable_reflectance_grad_isolation = False
         self.sg_lobes = 4
         self.sg_lambda_min = 1.0
         self.sg_energy_reg = 1e-4
@@ -99,6 +109,9 @@ class ModelParams(ParamGroup):
         self.reflectance_consistency_reg = 2e-5
         self.reflectance_smooth_reg = 0.0
         self.reflectance_edge_reg = 2e-4
+        self.reflectance_target_detail_reg = 0.0
+        self.reflectance_target_chroma_reg = 0.0
+        self.enhancement_illumination_chroma_reg = 0.0
         self.reflectance_edge_uplift_reg = 3e-3
         self.reflectance_contrast_reg = 2e-3
         self.reflectance_highfreq_reg = 3e-3
@@ -118,6 +131,7 @@ class ModelParams(ParamGroup):
         self.enhancement_smooth_reg = 4e-4
         self.enhancement_gain_smooth_reg = 0.0
         self.enhancement_edge_preserve_reg = 0.0
+        self.enhancement_target_edge_reg = 0.0
         self.enhancement_guidance_final_weight = 0.3
         self.enhancement_guidance_ramp_iters = 0
         self.illumination_smooth_reg = 1e-4
@@ -285,6 +299,7 @@ def _backfill_model_compatibility(merged_dict):
         "use_asg_illumination": True,
         "illumination_mode": "asg",
         "reflectance_mode": "explicit",
+        "disable_reflectance_grad_isolation": False,
         "use_dual_transient": False,
         "sg_lobes": 4,
         "sg_lambda_min": 1.0,
@@ -317,6 +332,7 @@ def _backfill_model_compatibility(merged_dict):
         "enhancement_smooth_reg": 4e-4,
         "enhancement_gain_smooth_reg": 0.0,
         "enhancement_edge_preserve_reg": 0.0,
+        "enhancement_target_edge_reg": 0.0,
         "enhancement_guidance_final_weight": 0.3,
         "enhancement_guidance_ramp_iters": 0,
         "illumination_smooth_reg": 1e-4,
@@ -356,6 +372,16 @@ def _backfill_model_compatibility(merged_dict):
         "max_anchors": 60_000,
         "max_new_anchors_per_update": 512,
         "densify_level_caps": "256,160,96",
+        "max_gaussian_anisotropy": 0.0,
+        "direct_composition": False,
+        "pure_explicit_rl": False,
+        "explicit_feature_conditioning": False,
+        "enhancement_rgb_gain": "1,1,1",
+        "reflectance_target_detail_reg": 0.0,
+        "reflectance_target_chroma_reg": 0.0,
+        "enhancement_illumination_chroma_reg": 0.0,
+        "reflectance_init_floor": 0.1,
+        "depth_prior_gamma": 1.0,
         "anchor_prune_grace_iters": 500,
         "prune_from_iter": 0,
         "max_pruned_anchors_per_update": 0,

@@ -45,20 +45,20 @@ sys.path.append("./submodules/Depth-Anything-V2")
 # from lpipsPyTorch import lpips
 import lpips
 from random import randint
-from utils.enhancement_loss_utils import L_Enhancement_Gain_Smooth, L_Enhancement_Edge_Preserve
-from utils.loss_utils import l1_loss, ssim, l1_plus_loss, L_Smooth, L_Illu, L_Gray, L_Green_Bias, L_Depth_similarity, L_Reflectance_Smooth, L_Depth_Smooth, pearson_depth_loss, L_Reflectance_Consistency, L_Reflectance_Edge, L_Reflectance_Edge_Uplift, L_Reflectance_Highlight, L_Reflectance_LocalContrast, L_Reflectance_HighFreq, L_Residual_Chroma_Boost, L_Noise_Zero_Mean, L_Noise_Dark_Weighted, L_Noise_HighFreq, L_SG_Energy, L_SG_Sharpness, L_ASG_Energy, L_ASG_Sharpness, L_ASG_Anisotropy, L_B0_Spatial_Smooth, build_dual_transient_masks
+from utils.enhancement_loss_utils import L_Enhancement_Gain_Smooth, L_Enhancement_Edge_Preserve, L_Enhancement_Target_Edge, L_Reflectance_Target_Detail, L_Reflectance_Target_Chroma, L_Illumination_Chroma_Consistency
+from utils.loss_utils import l1_loss, ssim, l1_plus_loss, L_Smooth, L_Illu, L_Green_Bias, L_Depth_similarity, L_Reflectance_Smooth, L_Reflectance_Consistency, L_Reflectance_Edge, L_Reflectance_Edge_Uplift, L_Reflectance_Highlight, L_Reflectance_LocalContrast, L_Reflectance_HighFreq, L_Residual_Chroma_Boost, L_Noise_Zero_Mean, L_Noise_Dark_Weighted, L_Noise_HighFreq, L_SG_Energy, L_SG_Sharpness, L_ASG_Energy, L_ASG_Sharpness, L_ASG_Anisotropy, L_B0_Spatial_Smooth, build_dual_transient_masks
 from gaussian_renderer import prefilter_voxel, render, network_gui
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
 from utils.composition_utils import compose_decomposed_render
 import uuid
 from tqdm import tqdm
-from utils.image_utils import psnr, Camera_Reprojection, Camera_Reprojection_inverse
+from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
-from utils.visualize_utils import minmax_normalize, visualize_camera_trajectories, visualize_anchor_with_camera, visualize_heatmap, plot_point_cloud_projection, visualize_cmap
+from utils.visualize_utils import minmax_normalize, visualize_camera_trajectories, visualize_anchor_with_camera, plot_point_cloud_projection, visualize_cmap
 import numpy as np
 import cv2
-from utils.pose_utils import get_tensor_from_camera, save_pose, load_pose
+from utils.pose_utils import get_tensor_from_camera, save_pose
 import matplotlib.cm as cm
 
 try:
@@ -98,6 +98,7 @@ ENHANCEMENT_PARAM_GROUP_NAMES = {
     "enhancement_context_feat",
     "enhancement_context_illum",
     "enhancement_context_bias",
+    "enhancement_net",
 }
 
 
@@ -559,7 +560,6 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         gaussians.P.requires_grad_(False)
 
     weight_scheduler = LinearDecayWeight(initial_weight=2, final_weight=1.0,total_steps=opt.iterations)
-    weight_scheduler2 = LinearDecayWeight(initial_weight=5e-4, final_weight=1e-3,total_steps=opt.update_until)
 
     if mode == "warmup":
         gaussians.P.requires_grad_(False)
@@ -671,8 +671,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             wandb.log(densification_log)
           
     timing_stats = {}
-    total_start_time = time.time()
-    for iteration in range(first_iter, opt.iterations + 1):        
+    for iteration in range(first_iter, opt.iterations + 1):
         # network gui not available in scaffold-gs yet
         # if network_gui.conn == None:
         #     network_gui.try_connect()
@@ -737,6 +736,24 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         voxel_visible_mask = prefilter_voxel(viewpoint_cam, gaussians, pipe,background, dataset.kernel_size, camera_pose=pose)
         densify_until = opt.warmup_update_until if mode == "warmup" else opt.update_until
         retain_grad = (iteration < densify_until and iteration >= 0)
+        isolate_reflectance_grad = (
+            (
+                not dataset.disable_reflectance_grad_isolation
+                or (
+                    dataset.pure_explicit_rl
+                    and dataset.enhancement_reflectance_reg > 0.0
+                )
+            )
+            and any(
+                weight > 0.0
+                for weight in (
+                    dataset.reflectance_edge_uplift_reg,
+                    dataset.reflectance_contrast_reg,
+                    dataset.reflectance_highfreq_reg,
+                    dataset.enhancement_reflectance_reg,
+                )
+            )
+        )
         render_pkg = render(
             viewpoint_cam,
             gaussians,
@@ -747,11 +764,17 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             retain_grad=retain_grad,
             camera_pose=pose,
             return_coverage=(iteration % 100 == 0),
+            isolate_reflectance_grad=isolate_reflectance_grad,
         )
         timing_stats['render_time'] = timing_stats.get('render_time', 0) + (time.time() - t1)
 
         t1 = time.time()
         reflectance_image, illumination_image, illumination_enhanced_image, depth_image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity= render_pkg["render_reflectance"], render_pkg["render_illumination"], render_pkg["render_illumination_enhanced"], render_pkg["render_depth"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
+        reflectance_sharpen_image = (
+            render_pkg["render_reflectance_sharpen"]
+            if isolate_reflectance_grad
+            else reflectance_image
+        )
         
         
 
@@ -853,9 +876,12 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         L_asg_anisotropy = L_ASG_Anisotropy(illumination_stats)
         L_reflectance_consistency = L_Reflectance_Consistency(reflectance_image)
         L_reflectance_edge = L_Reflectance_Edge(reflectance_image, gt_image)
-        L_reflectance_edge_uplift = L_Reflectance_Edge_Uplift(reflectance_image, gt_image)
-        L_reflectance_contrast = L_Reflectance_LocalContrast(reflectance_image, gt_image)
-        L_reflectance_highfreq = L_Reflectance_HighFreq(reflectance_image, gt_image)
+        # The three sharpening losses use a reflectance-only raster branch.
+        # Its geometry inputs are detached in gaussian_renderer, so these
+        # losses train only B0/detail/decoder (explicit mode) or MLP-R.
+        L_reflectance_edge_uplift = L_Reflectance_Edge_Uplift(reflectance_sharpen_image, gt_image)
+        L_reflectance_contrast = L_Reflectance_LocalContrast(reflectance_sharpen_image, gt_image)
+        L_reflectance_highfreq = L_Reflectance_HighFreq(reflectance_sharpen_image, gt_image)
         L_reflectance_highlight = L_Reflectance_Highlight(reflectance_image)
         L_b0_spatial_smooth = L_B0_Spatial_Smooth(gaussians._base_log_reflectance, gaussians.get_anchor)
         L_reflectance_detail = torch.mean(torch.abs(torch.tanh(gaussians._reflectance_offset_delta)))
@@ -946,7 +972,11 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         * dataset.enhancement_smooth_reg
                     )
                 refined_target = get_refined_image(refined_image_dict, viewpoint_cam).cuda()
-                image_enhanced_pred = compose_decomposed_render(render_pkg, enhanced=True)
+                image_enhanced_pred = compose_decomposed_render(
+                    render_pkg,
+                    enhanced=True,
+                    detach_reflectance=True,
+                )
                 if dataset.enhancement_gain_smooth_reg > 0:
                     L_gain_smooth_enhancement_raw = L_Enhancement_Gain_Smooth(
                         illumination_enhanced_image,
@@ -986,13 +1016,27 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 )
 
                 if iteration >= dataset.enhancement_diff_start_iter:
+                    # Same composed quantity as image_enhanced_pred: identical
+                    # boundary and saturation behavior, only the gradient
+                    # routing differs (reflectance detached, enhanced
+                    # illumination live).
                     L_diff_illumination = torch.abs(
-                        illumination_enhanced_image * reflectance_image.detach() - refined_target
+                        image_enhanced_pred - refined_target
                     ).mean()
                     # Keep a smaller reflectance-side correction than the illumination-side guidance.
                     if dataset.enhancement_reflectance_reg > 0:
                         L_diff_reflectance = torch.abs(
-                            illumination_enhanced_image.detach() * reflectance_image - refined_target
+                            compose_decomposed_render(
+                                render_pkg,
+                                enhanced=True,
+                                reflectance_key=(
+                                    "render_reflectance_sharpen"
+                                    if isolate_reflectance_grad
+                                    else "render_reflectance"
+                                ),
+                                detach_illumination=True,
+                            )
+                            - refined_target
                         ).mean()
                     guidance_progress = min(
                         1.0,
@@ -1025,6 +1069,46 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     enhancement_guidance_weight *= guidance_ramp
                     L_diff = L_diff_illumination + dataset.enhancement_reflectance_reg * L_diff_reflectance
                     loss += enhancement_guidance_weight * L_diff
+                    if dataset.enhancement_target_edge_reg > 0:
+                        detail_pred = compose_decomposed_render(
+                            render_pkg,
+                            enhanced=True,
+                            detach_illumination=True,
+                        )
+                        loss += (
+                            enhancement_guidance_weight
+                            * dataset.enhancement_target_edge_reg
+                            * L_Enhancement_Target_Edge(detail_pred, refined_target, coverage_image)
+                        )
+                    if dataset.reflectance_target_detail_reg > 0:
+                        loss += (
+                            enhancement_guidance_weight
+                            * dataset.reflectance_target_detail_reg
+                            * L_Reflectance_Target_Detail(
+                                render_pkg["render_reflectance_detail"],
+                                refined_target,
+                                coverage_image,
+                            )
+                        )
+                    if dataset.reflectance_target_chroma_reg > 0:
+                        loss += (
+                            enhancement_guidance_weight
+                            * dataset.reflectance_target_chroma_reg
+                            * L_Reflectance_Target_Chroma(
+                                render_pkg["render_reflectance_detail"],
+                                refined_target,
+                                coverage_image,
+                            )
+                        )
+                    if dataset.enhancement_illumination_chroma_reg > 0:
+                        loss += (
+                            enhancement_guidance_weight
+                            * dataset.enhancement_illumination_chroma_reg
+                            * L_Illumination_Chroma_Consistency(
+                                illumination_enhanced_image,
+                                coverage_image,
+                            )
+                        )
             if dataset.use_residual and not dataset.use_dual_transient:
                 scaling_residual_reg = scaling_residual.prod(dim=1).mean()
                 artifact_image_for_loss = residual_image
@@ -1051,7 +1135,6 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                     + dataset.noise_zero_mean_reg * L_noise_zero_mean
                     + dataset.noise_dark_weight_reg * L_noise_dark_weighted
                     + dataset.noise_highfreq_reg * L_noise_highfreq
-                    + dataset.artifact_highlight_reg * L_residual_chroma_boost
                     + dataset.residual_chroma_reg * L_residual_chroma_boost
                     + 0.05 * scaling_residual_reg
                 )
@@ -1083,38 +1166,38 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         with torch.no_grad():
 
             if mode=="warmup" or not dataset.use_residual:
-                wandb.log({'loss':loss, 'iteration':iteration,
-                           monitor_step_key: iteration,
-                           'anchor_count': int(gaussians.get_anchor.shape[0]),
-                           'illumination_mean': illumination_image.mean(),
-                           'illumination_smooth': L_smooth,
-                           'enhancement_smooth': L_smooth_enhancement,
-                           'enhancement_gain_smooth': L_gain_smooth_enhancement,
-                           'enhancement_gain_smooth_raw': L_gain_smooth_enhancement_raw,
-                           'enhancement_gain_smooth_weighted': L_gain_smooth_enhancement,
-                           'enhancement_edge_preserve': L_enhancement_edge_preserve,
-                           'enhancement_edge_preserve_raw': L_enhancement_edge_preserve_raw,
-                           'enhancement_edge_preserve_weighted': L_enhancement_edge_preserve,
-                           'enhancement_grad_norm_pre_clip': enhancement_grad_norm,
-                           'sg_energy': L_sg_energy,
-                           'sg_lambda_mean': L_sg_sharpness,
-                           'asg_energy': L_asg_energy,
-                           'asg_lambda_mean': L_asg_sharpness,
-                           'asg_anisotropy': L_asg_anisotropy,
-                           'reflectance_consistency': L_reflectance_consistency,
-                           'reflectance_edge_mean': L_reflectance_edge,
-                           'reflectance_edge_uplift_mean': L_reflectance_edge_uplift,
-                           'reflectance_contrast_mean': L_reflectance_contrast,
-                           'reflectance_highfreq_mean': L_reflectance_highfreq,
-                           'reflectance_highlight_mean': L_reflectance_highlight,
-                           'reflectance_detail_mean': L_reflectance_detail,
-                           'reflectance_decoder_mean': L_reflectance_decoder,
-                           'coverage_low_ratio': coverage_low_ratio,
-                           'residual_mix_weight': residual_mix_weight,
-                           'residual_chroma_boost': L_residual_chroma_boost})
+                if wandb is not None:
+                    wandb.log({'loss':loss,
+                               monitor_step_key: iteration,
+                               'anchor_count': int(gaussians.get_anchor.shape[0]),
+                               'illumination_mean': illumination_image.mean(),
+                               'illumination_smooth': L_smooth,
+                               'enhancement_smooth': L_smooth_enhancement,
+                               'enhancement_gain_smooth': L_gain_smooth_enhancement,
+                               'enhancement_gain_smooth_raw': L_gain_smooth_enhancement_raw,
+                               'enhancement_edge_preserve': L_enhancement_edge_preserve,
+                               'enhancement_edge_preserve_raw': L_enhancement_edge_preserve_raw,
+                               **({'enhancement_grad_norm_pre_clip': enhancement_grad_norm}
+                                  if opt.enhancement_grad_clip > 0 else {}),
+                               # sg_* stats only exist in the sg illumination mode; in asg
+                               # mode they would log constant zeros.
+                               **({'sg_energy': L_sg_energy, 'sg_lambda_mean': L_sg_sharpness}
+                                  if gaussians.illumination_mode == "sg" else {}),
+                               'asg_energy': L_asg_energy,
+                               'asg_lambda_mean': L_asg_sharpness,
+                               'asg_anisotropy': L_asg_anisotropy,
+                               'reflectance_consistency': L_reflectance_consistency,
+                               'reflectance_edge_mean': L_reflectance_edge,
+                               'reflectance_edge_uplift_mean': L_reflectance_edge_uplift,
+                               'reflectance_contrast_mean': L_reflectance_contrast,
+                               'reflectance_highfreq_mean': L_reflectance_highfreq,
+                               'reflectance_highlight_mean': L_reflectance_highlight,
+                               'reflectance_detail_mean': L_reflectance_detail,
+                               'reflectance_decoder_mean': L_reflectance_decoder,
+                               'coverage_low_ratio': coverage_low_ratio})
             else:
                 residual_chroma_mean = torch.abs(residual_image_for_loss - residual_image_for_loss.mean(dim=0, keepdim=True)).mean()
-                residual_log = {'loss':loss, 'iteration':iteration,
+                residual_log = {'loss':loss,
                                 monitor_step_key: iteration,
                                 'anchor_count': int(gaussians.get_anchor.shape[0]),
                                 'illumination_mean': illumination_image.mean(),
@@ -1122,13 +1205,13 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                                 'enhancement_smooth': L_smooth_enhancement,
                                 'enhancement_gain_smooth': L_gain_smooth_enhancement,
                                 'enhancement_gain_smooth_raw': L_gain_smooth_enhancement_raw,
-                                'enhancement_gain_smooth_weighted': L_gain_smooth_enhancement,
                                 'enhancement_edge_preserve': L_enhancement_edge_preserve,
                                 'enhancement_edge_preserve_raw': L_enhancement_edge_preserve_raw,
-                                'enhancement_edge_preserve_weighted': L_enhancement_edge_preserve,
-                                 'enhancement_grad_norm_pre_clip': enhancement_grad_norm,
-                                'sg_energy': L_sg_energy,
-                                'sg_lambda_mean': L_sg_sharpness,
+                                 **({'enhancement_grad_norm_pre_clip': enhancement_grad_norm}
+                                    if opt.enhancement_grad_clip > 0 else {}),
+                                # sg_* stats only exist in the sg illumination mode.
+                                **({'sg_energy': L_sg_energy, 'sg_lambda_mean': L_sg_sharpness}
+                                   if gaussians.illumination_mode == "sg" else {}),
                                 'asg_energy': L_asg_energy,
                                 'asg_lambda_mean': L_asg_sharpness,
                                 'asg_anisotropy': L_asg_anisotropy,
@@ -1162,7 +1245,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         'artifact_chroma_mean': artifact_chroma_mean,
                         'residual_chroma_boost': L_residual_chroma_boost,
                     })
-                wandb.log(residual_log)
+                if wandb is not None:
+                    wandb.log(residual_log)
             monitor_interval = int(dataset.wandb_monitor_interval)
             if (
                 wandb is not None
@@ -1306,10 +1390,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
                 image_log = {
                     monitor_step_key: iteration,
-                    f"{random_prefix}/iteration": iteration,
                     f"{random_prefix}/camera_name": str(viewpoint_cam.image_name),
-                    f"{random_prefix}/camera_uid": int(viewpoint_cam.uid),
-                    f"{random_prefix}/coverage_low_ratio": coverage_low_ratio,
                     f"{random_prefix}/gt_lowlight": wandb_image(
                         gt_image,
                         random_caption,
@@ -1346,18 +1427,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         random_refined,
                         random_caption,
                     ),
-                    f"{random_prefix}/gain_smooth_raw": L_gain_smooth_enhancement_raw,
-                    f"{random_prefix}/gain_smooth_weighted": L_gain_smooth_enhancement,
-                    f"{random_prefix}/edge_preserve_raw": L_enhancement_edge_preserve_raw,
-                    f"{random_prefix}/edge_preserve_weighted": L_enhancement_edge_preserve,
-                    f"{fixed_prefix}/iteration": iteration,
                     f"{fixed_prefix}/camera_name": str(monitor_camera.image_name),
-                    f"{fixed_prefix}/camera_uid": int(monitor_camera.uid),
                     f"{fixed_prefix}/camera_split": monitor_camera_split,
                     f"{fixed_prefix}/render_error": fixed_monitor_error,
-                    f"{fixed_prefix}/anchor_count": int(gaussians.get_anchor.shape[0]),
                     f"{fixed_prefix}/coverage_low_ratio": fixed_coverage_low_ratio,
-                    f"{fixed_prefix}/enhancement_grad_norm_pre_clip": enhancement_grad_norm,
                     f"{fixed_prefix}/enhancement_lr": enhancement_lr,
                     f"{fixed_prefix}/enhancement_amplitude_mean": enhancement_amplitude_values.mean(),
                     f"{fixed_prefix}/enhancement_amplitude_max": enhancement_amplitude_values.max(),
@@ -1560,7 +1633,12 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
            
             timing_stats['total_time'] = timing_stats.get('total_time', 0) + (time.time() - t0)
 
-def prepare_output_and_logger(args):    
+    logger.info(
+        "Timing stats (seconds): %s",
+        {key: round(value, 1) for key, value in timing_stats.items()},
+    )
+
+def prepare_output_and_logger(args):
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
             unique_str=os.getenv('OAR_JOB_ID')
