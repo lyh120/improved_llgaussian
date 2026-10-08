@@ -54,6 +54,11 @@ class ModelParams(ParamGroup):
         self.update_init_factor = 16
         self.update_hierachy_factor = 4
         self.kernel_size = 0.1
+        self.gaussian_footprint_limit = 0.0
+        self.geometry_photo_kernel_size = 1
+        self.supervision_profile = "llgaussian"
+        self.rl_compat_stage = "stable"
+        self.rl_compat_scale = 1.0
 
 
         self.use_feat_bank = False
@@ -87,6 +92,17 @@ class ModelParams(ParamGroup):
         self.use_asg_illumination = True
         self.illumination_mode = "asg"
         self.reflectance_mode = "explicit"
+        # Maximum log-albedo detail and fractional decoder correction, respectively.
+        self.reflectance_detail_scale = 1.1
+        self.reflectance_decoder_scale = 0.15
+        # Thresholds are relative to mean structure response; ratios set the minimum retained structure.
+        self.reflectance_edge_threshold = 0.15
+        self.reflectance_edge_target_ratio = 0.85
+        self.reflectance_contrast_threshold = 0.1
+        self.reflectance_contrast_target_ratio = 0.8
+        self.reflectance_contrast_kernel_size = 5
+        self.reflectance_highfreq_threshold = 0.1
+        self.reflectance_highfreq_target_ratio = 0.85
         self.sg_lobes = 4
         self.sg_lambda_min = 1.0
         self.sg_energy_reg = 1e-4
@@ -128,7 +144,7 @@ class ModelParams(ParamGroup):
         self.enhancement_color_reg = 0.06
         self.enhancement_color_std_reg = 0.02
         self.enhancement_green_bias_reg = 0.05
-        self.enhancement_prior = "cidnet"
+        self.enhancement_prior = "stablesr"
         self.wandb_monitor_camera = "1"
         self.wandb_monitor_split = "test"
         self.wandb_monitor_interval = 600
@@ -285,6 +301,20 @@ def _backfill_model_compatibility(merged_dict):
         "use_asg_illumination": True,
         "illumination_mode": "asg",
         "reflectance_mode": "explicit",
+        "reflectance_detail_scale": 1.1,
+        "reflectance_decoder_scale": 0.15,
+        "gaussian_footprint_limit": 0.0,
+        "geometry_photo_kernel_size": 1,
+        "supervision_profile": "custom",
+        "rl_compat_stage": "stable",
+        "rl_compat_scale": 0.0,
+        "reflectance_edge_threshold": 0.15,
+        "reflectance_edge_target_ratio": 0.85,
+        "reflectance_contrast_threshold": 0.1,
+        "reflectance_contrast_target_ratio": 0.8,
+        "reflectance_contrast_kernel_size": 5,
+        "reflectance_highfreq_threshold": 0.1,
+        "reflectance_highfreq_target_ratio": 0.85,
         "use_dual_transient": False,
         "sg_lobes": 4,
         "sg_lambda_min": 1.0,

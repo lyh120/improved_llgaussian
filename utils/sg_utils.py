@@ -41,11 +41,16 @@ def evaluate_spherical_gaussians(
         "sg_energy": amplitudes.mean(),
         "sg_lambda_mean": lambdas.mean(),
         "sg_lambda_max": lambdas.max(),
+        "sg_lambda_tail": F.relu(lambdas / 64 - 1).square().mean(),
+        "sg_lambda_over_64_fraction": (lambdas > 64).float().mean(),
     }
     return illumination, stats
 
 
-def _orthonormalize_tangent(axis: torch.Tensor, tangent: torch.Tensor, eps: float = 1e-6) -> tuple[torch.Tensor, torch.Tensor]:
+def _orthonormalize_tangent(axis: torch.Tensor, tangent: torch.Tensor, eps: float = 1e-6) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    fallback_axis = torch.zeros_like(axis)
+    fallback_axis[..., 2] = 1.
+    axis = torch.where(axis.norm(dim=-1, keepdim=True) > eps, axis, fallback_axis)
     z_axis = normalize_sg_directions(axis, eps=eps)
     tangent = tangent - (tangent * z_axis).sum(dim=-1, keepdim=True) * z_axis
     tangent_norm = tangent.norm(dim=-1, keepdim=True)
@@ -60,7 +65,7 @@ def _orthonormalize_tangent(axis: torch.Tensor, tangent: torch.Tensor, eps: floa
 
     x_axis = normalize_sg_directions(tangent, eps=eps)
     y_axis = normalize_sg_directions(torch.cross(z_axis, x_axis, dim=-1), eps=eps)
-    return x_axis, y_axis
+    return x_axis, y_axis, z_axis
 
 
 def evaluate_anisotropic_spherical_gaussians(
@@ -93,8 +98,7 @@ def evaluate_anisotropic_spherical_gaussians(
         Illumination shaped (N * n_offsets, 1), per-offset illumination shaped
         (N, n_offsets), and scalar/stat tensors.
     """
-    z_axis = normalize_sg_directions(axis)
-    x_axis, y_axis = _orthonormalize_tangent(z_axis, tangent)
+    x_axis, y_axis, z_axis = _orthonormalize_tangent(axis, tangent)
     bandwidth = F.softplus(sharpness) + lambda_min
     lambda_x = bandwidth[..., :1]
     lambda_y = bandwidth[..., 1:2]

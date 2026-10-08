@@ -15,7 +15,6 @@ from torch.autograd import Variable
 from math import exp
 import math
 from utils.visualize_utils import minmax_normalize
-from audtorch.metrics.functional import pearsonr
 
 def l1_loss(network_output, gt):
     return (network_output - gt)
@@ -249,14 +248,14 @@ def _local_std(gray_image, kernel_size=5):
     return torch.sqrt(var + 1e-6).squeeze(0)
 
 
-def L_Reflectance_LocalContrast(reflectance_image, gt_image, threshold=0.1, target_ratio=0.8):
+def L_Reflectance_LocalContrast(reflectance_image, gt_image, threshold=0.1, target_ratio=0.8, kernel_size=5):
     """Encourage reflectance to recover local grayscale contrast without copying highlight colors."""
     gt_image = gt_image.detach()
     reflectance_gray = reflectance_image.mean(dim=0, keepdim=True)
     gt_gray = 0.299 * gt_image[0:1] + 0.587 * gt_image[1:2] + 0.114 * gt_image[2:3]
 
-    reflectance_std = _local_std(reflectance_gray)
-    gt_std = _local_std(gt_gray).detach()
+    reflectance_std = _local_std(reflectance_gray, kernel_size=kernel_size)
+    gt_std = _local_std(gt_gray, kernel_size=kernel_size).detach()
     reflectance_std_norm = reflectance_std / (reflectance_std.mean().detach() + 1e-6)
     gt_std_norm = gt_std / (gt_std.mean().detach() + 1e-6)
     texture_mask = torch.clamp(gt_std_norm - threshold, 0.0, 1.0).detach()

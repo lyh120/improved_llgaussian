@@ -65,7 +65,7 @@ if [ "$warmup" = "True" ]; then
         CUDA_VISIBLE_DEVICES=${gpu} python train.py --eval -s ${data} --lod ${lod} \
         --iterations ${iterations} \
         --gpu ${gpu} --voxel_size ${vsize} --update_init_factor ${update_init_factor}\
-        --use_asg_illumination --illumination_mode asg \
+        --use_asg_illumination --illumination_mode asg --asg_lobes 1 --supervision_profile llgaussian --enhancement_prior stablesr \
         --appearance_residual_dim ${appearance_residual_dim}  \
         --kernel_size ${kernel_size} --port $port -m outputs/${logdir}/$time --use_wandb --warmup  \
         --update_until ${update_until} --feat_dim ${feat_dim} \
@@ -84,7 +84,7 @@ if [ "$warmup" = "True" ]; then
         CUDA_VISIBLE_DEVICES=${gpu} python train.py --eval -s ${data} --lod ${lod} \
         --iterations ${iterations} \
         --gpu ${gpu} --voxel_size ${vsize} --update_init_factor ${update_init_factor}\
-        --use_asg_illumination --illumination_mode asg \
+        --use_asg_illumination --illumination_mode asg --asg_lobes 1 --supervision_profile llgaussian --enhancement_prior stablesr \
         --kernel_size ${kernel_size} --port $port -m outputs/${logdir}/$time --use_wandb  \
         --update_until ${update_until} --feat_dim ${feat_dim}  \
         --densify_grad_threshold ${densify_grad_threshold} --success_threshold ${success_threshold}\
@@ -105,7 +105,7 @@ else
         CUDA_VISIBLE_DEVICES=${gpu} python train.py --eval -s ${data} --lod ${lod} \
         --iterations ${iterations} \
         --gpu ${gpu} --voxel_size ${vsize} --update_init_factor ${update_init_factor}\
-        --use_asg_illumination --illumination_mode asg \
+        --use_asg_illumination --illumination_mode asg --asg_lobes 1 --supervision_profile llgaussian --enhancement_prior stablesr \
         --appearance_residual_dim ${appearance_residual_dim} \
         --kernel_size ${kernel_size} --port $port -m outputs/${logdir}/$time --use_wandb   \
         --update_until ${update_until} --feat_dim ${feat_dim} \
@@ -123,7 +123,7 @@ else
         CUDA_VISIBLE_DEVICES=${gpu} python train.py --eval -s ${data} --lod ${lod} \
         --iterations ${iterations} \
         --gpu ${gpu} --voxel_size ${vsize} --update_init_factor ${update_init_factor}\
-        --use_asg_illumination --illumination_mode asg \
+        --use_asg_illumination --illumination_mode asg --asg_lobes 1 --supervision_profile llgaussian --enhancement_prior stablesr \
         --appearance_residual_dim ${appearance_residual_dim} \
         --kernel_size ${kernel_size} --port $port -m outputs/${logdir}/$time --use_wandb  \
         --update_until ${update_until} --feat_dim ${feat_dim} \

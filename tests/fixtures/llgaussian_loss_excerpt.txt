@@ -1,0 +1,41 @@
+Ll1_value = l1_plus_loss(image_tmp, gt_image, phi=0.5/255)
+Ll1 = torch.abs(Ll1_value).mean()
+L_smooth =  L_Smooth(illumination_image, gt_image, kernel_size=9) * 1e-3
+L_illu = L_Illu(gt_image, illumination_image) 
+L_depth_similarity = (L_Depth_similarity(1 - minmax_normalize(depth_image).squeeze(0), depth_piror_norm.squeeze(0), 128, 0.5) ) * 0.15
+
+if FUSED_SSIM_AVAILABLE:
+    ssim_loss = fused_ssim((reflectance_image * illumination_image).unsqueeze(0), gt_image.unsqueeze(0))
+else:
+    ssim_loss = ssim(reflectance_image * illumination_image, gt_image)
+ssim_loss = 1.0 - ssim_loss
+scaling_reg = scaling.prod(dim=1).mean()
+
+if torch.isnan(scaling_reg) or torch.isinf(scaling_reg):
+    print("Warning: scaling_reg is nan or inf")
+    print("scaling_reg:", scaling_reg.item())
+
+if mode == "warmup":
+    loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + L_illu + 0.01 * scaling_reg 
+    if iteration >= opt.update_from:
+        loss += L_smooth * 0.1 +  L_depth_similarity 
+else:
+    loss = (1.0 - opt.lambda_dssim ) * Ll1 + opt.lambda_dssim *  ssim_loss + L_illu + 0.01 * scaling_reg  
+
+
+    if iteration >= opt.update_from:
+        loss +=  L_smooth + L_depth_similarity
+
+    L_diff = 0
+    if iteration >= opt.update_from:
+        L_degree = torch.abs((illumination_enhanced_image.mean(0) - torch.clamp(illumination_image.mean(0).detach() * enhance_ratio, 0, 1))).mean() * 0.2 + torch.abs(illumination_enhanced_image.mean() - illumination_image.mean().detach() * enhance_ratio) * 0.05
+        L_smooth_enhancement = L_Smooth(illumination_enhanced_image/enhance_ratio, gt_image, kernel_size=9) * 5e-4
+        loss += L_degree + L_smooth_enhancement
+    if iteration >= opt.update_from * 2:
+        L_diff =  torch.abs(illumination_enhanced_image * reflectance_image.detach() - refined_image_dict[viewpoint_cam.uid].cuda()).mean() + torch.abs(illumination_enhanced_image.detach() * reflectance_image - refined_image_dict[viewpoint_cam.uid].cuda()).mean() * 0.2
+        loss += L_diff
+    if dataset.use_residual:
+        scaling_residual_reg = scaling_residual.prod(dim=1).mean()
+        L_residual_reg = torch.mean(residual_image) * weight_scheduler(iteration)  
+        loss += L_residual_reg + 0.05 * scaling_residual_reg 
+

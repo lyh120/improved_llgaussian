@@ -10,6 +10,7 @@
 #
 
 import torch
+from utils.supervision_utils import is_reference_supervision
 import torch.nn.functional as F
 from functools import reduce
 import numpy as np
@@ -22,6 +23,7 @@ from utils.pose_utils import get_tensor_from_camera, get_camera_from_tensor
 from plyfile import PlyData, PlyElement
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
+from utils.reflectance_init_utils import estimate_initial_log_reflectance
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scene.embedding import Embedding
 from utils.graphics_utils import get_uniform_points_on_sphere_fibonacci
@@ -95,9 +97,15 @@ class GaussianModel:
                  sg_lambda_min: float = 1.0,
                  asg_lobes: int = 1,
                  asg_lambda_min: float = 1.0,
+                 reflectance_detail_scale: float = 1.1,
+                 reflectance_decoder_scale: float = 0.15,
+                 gaussian_footprint_limit: float = 0.0,
+                 supervision_profile: str = "custom",
                  ):
 
         self.feat_dim = feat_dim
+        self.gaussian_footprint_limit = gaussian_footprint_limit
+        self.supervision_profile = supervision_profile
         self.n_offsets = n_offsets
         self.voxel_size = voxel_size
         self.update_depth = update_depth
@@ -133,7 +141,11 @@ class GaussianModel:
         self.sg_illumination_available = use_sg_illumination
         self.asg_illumination_available = use_asg_illumination
         self.legacy_compatibility_mode = illumination_mode == "legacy"
-        self.reflectance_detail_scale = 1.1
+        # Log-detail radius and maximum relative decoder correction.
+        if reflectance_detail_scale < 0 or not 0 <= reflectance_decoder_scale < 1:
+            raise ValueError("Reflectance detail radius must be nonnegative and decoder correction must be in [0, 1).")
+        self.reflectance_detail_scale = reflectance_detail_scale
+        self.reflectance_decoder_scale = reflectance_decoder_scale
         self._last_reflectance_decoder_mean = torch.tensor(0.0, device="cuda")
         self.enhancement_sg_init_sharpness = 8.0
         self.enhancement_sg_amplitude_init = 0.05
@@ -274,6 +286,14 @@ class GaussianModel:
                     nn.Sigmoid()
             ).cuda()
 
+        if is_reference_supervision(self.supervision_profile):
+            self.enhancement_net = nn.Sequential(
+                nn.Linear(feat_dim + self.n_offsets, feat_dim // 2),
+                nn.ReLU(True),
+                nn.Linear(feat_dim // 2, 3 * self.n_offsets),
+                nn.Sigmoid(),
+            ).cuda()
+
     def _reset_noise_net(self):
         if not self.use_residual or not self.use_dual_transient:
             return
@@ -410,6 +430,9 @@ class GaussianModel:
         self._enhancement_sg_amplitude = nn.Parameter(amplitude.requires_grad_(True))
 
     def eval(self):
+        self.mlp_illumination.eval()
+        if is_reference_supervision(self.supervision_profile):
+            self.enhancement_net.eval()
         self.mlp_opacity.eval()
         self.mlp_cov.eval()
         # self.mlp_color.eval()
@@ -435,6 +458,9 @@ class GaussianModel:
             self.mlp_feature_bank.eval()
 
     def train(self):
+        self.mlp_illumination.train()
+        if is_reference_supervision(self.supervision_profile):
+            self.enhancement_net.train()
         self.mlp_opacity.train()
         self.mlp_cov.train()
         # self.mlp_color.train()
@@ -881,20 +907,23 @@ class GaussianModel:
 
     def get_reflectance_with_decoder(self, feat, offsets, visible_mask):
         reflectance = self.get_reflectance_with_detail[visible_mask]
-        feat_repeated = feat.unsqueeze(1).expand(-1, self.n_offsets, -1)
-        decoder_input = torch.cat([feat_repeated, offsets], dim=-1).reshape(-1, self.feat_dim + 3)
+        feat_repeated = feat.detach().unsqueeze(1).expand(-1, self.n_offsets, -1)
+        decoder_input = torch.cat([feat_repeated, offsets.detach()], dim=-1).reshape(-1, self.feat_dim + 3)
         decoder_out = self.mlp_reflectance_decoder(decoder_input).reshape(-1, self.n_offsets, 3)
-        decoder_refine = 1.0 + 0.15 * torch.tanh(decoder_out)
+        decoder_refine = 1.0 + self.reflectance_decoder_scale * torch.tanh(decoder_out)
         self._last_reflectance_decoder_mean = torch.abs(torch.tanh(decoder_out)).mean()
+        self._last_reflectance_decoder_squared = torch.tanh(decoder_out).square().mean()
         return torch.clamp(reflectance * decoder_refine, 1e-3, 1.0)
 
     def get_enhanced_illumination(self, feat, illumination_feat, view_dirs, visible_mask):
+        if is_reference_supervision(self.supervision_profile):
+            return self.enhancement_net(torch.cat([feat.detach(), illumination_feat.detach()], dim=1))
         self._ensure_enhancement_sg_params()
         axis = F.normalize(self._enhancement_sg_axis[visible_mask], dim=-1)
         sharpness = F.softplus(self._enhancement_sg_sharpness[visible_mask])
         amplitude = torch.sigmoid(self._enhancement_sg_amplitude[visible_mask])
 
-        view_dirs = view_dirs.view(-1, 1, 3)
+        view_dirs = view_dirs.detach().view(-1, 1, 3)
         cosine = torch.sum(axis * view_dirs, dim=-1, keepdim=True).clamp(-1.0, 1.0)
         sg_term = amplitude * torch.exp(sharpness * (cosine - 1.0))
 
@@ -1047,40 +1076,8 @@ class GaussianModel:
         return data
 
     def _estimate_initial_b0(self, anchors: torch.Tensor, cameras) -> torch.Tensor:
-        N = anchors.shape[0]
-        b0 = torch.zeros((N, 3), dtype=torch.float, device="cuda")
-        if cameras is None or len(cameras) == 0:
-            return b0
-
-        cam = cameras[0]
-        image = cam.original_image  # (3, H, W)
-        H, W = image.shape[1], image.shape[2]
-
-        max_c_img = image.max(dim=0, keepdim=True)[0].clamp(min=1e-1)
-        reflectance_map = (image / max_c_img).clamp(1e-3, 1.0)
-        reflectance_map_bchw = reflectance_map.unsqueeze(0)
-        reflectance_map_blur = F.avg_pool2d(reflectance_map_bchw, kernel_size=5, stride=1, padding=2).squeeze(0)
-        detail = reflectance_map - reflectance_map_blur
-        reflectance_map = (reflectance_map + 0.4 * detail).clamp(1e-3, 1.0)
-        log_reflectance_map = torch.log(reflectance_map)
-        global_mean_b0 = log_reflectance_map.mean(dim=(1, 2))
-
-        ones = torch.ones((N, 1), dtype=torch.float, device="cuda")
-        pts_h = torch.cat([anchors, ones], dim=1)  # (N, 4)
-        proj = cam.full_proj_transform  # (4, 4)
-        pts_clip = pts_h @ proj.T  # (N, 4)
-        w = pts_clip[:, 3:].clamp(min=1e-6)
-        pts_ndc = pts_clip[:, :3] / w  # (N, 3)
-
-        px = ((pts_ndc[:, 0] + 1.0) * 0.5 * (W - 1)).long().clamp(0, W - 1)
-        py = ((1.0 - pts_ndc[:, 1]) * 0.5 * (H - 1)).long().clamp(0, H - 1)
-
-        valid = (pts_ndc[:, 2] > -1.0) & (pts_ndc[:, 2] < 1.0)
-        if valid.any():
-            b0[valid] = log_reflectance_map[:, py[valid], px[valid]].T
-        if (~valid).any():
-            b0[~valid] = global_mean_b0
-        return b0
+        """Initialize B0 from exposure-normalized observations in valid views."""
+        return estimate_initial_log_reflectance(anchors, cameras)
 
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float, num_sky_gaussians=0, cameras=None, prune_ratio : float = 0.05,model_path=None, beta=1):
         self.spatial_lr_scale = spatial_lr_scale
@@ -1349,6 +1346,8 @@ class GaussianModel:
                 {'params': [self._enhancement_illum_weight], 'lr': training_args.mlp_enhance_lr_init, "name": "enhancement_context_illum"},
                 {'params': [self._enhancement_context_bias], 'lr': training_args.mlp_enhance_lr_init, "name": "enhancement_context_bias"},
             ]
+        if is_reference_supervision(self.supervision_profile):
+            l.append({'params': self.enhancement_net.parameters(), 'lr': training_args.mlp_enhance_lr_init, "name": "enhancement_net"})
         inactive_groups = set()
         if self.reflectance_mode == "mlp":
             inactive_groups.update({"base_log_reflectance", "reflectance_offset_delta", "mlp_reflectance_decoder"})
@@ -1501,7 +1500,7 @@ class GaussianModel:
             if param_group["name"] in {"illum_asg_axis", "illum_asg_tangent", "illum_asg_sharpness", "illum_asg_amplitude", "illum_asg_bias", "illum_asg_dist_weight"}:
                 lr = self.illum_asg_scheduler_args(iteration)
                 param_group['lr'] = lr
-            if param_group["name"] in {"enhancement_sg_axis", "enhancement_sg_sharpness", "enhancement_sg_amplitude", "enhancement_context_feat", "enhancement_context_illum", "enhancement_context_bias"}:
+            if param_group["name"] in {"enhancement_net", "enhancement_sg_axis", "enhancement_sg_sharpness", "enhancement_sg_amplitude", "enhancement_context_feat", "enhancement_context_illum", "enhancement_context_bias"}:
                 lr = self.enhancement_sg_scheduler_args(iteration)
                 param_group['lr'] = lr
             if param_group["name"] == "base_log_reflectance":
@@ -1833,6 +1832,7 @@ class GaussianModel:
                 'residual_net' in group['name'] or \
                 'embedding' in group['name'] or \
                 'enhancement_context' in group['name'] or \
+                'enhancement_net' in group['name'] or \
                 'pose' in group['name']:
                 continue
             assert len(group["params"]) == 1
@@ -1893,6 +1893,7 @@ class GaussianModel:
                 'artifact_net' in group['name'] or \
                 'residual_net' in group['name'] or \
                 'enhancement_context' in group['name'] or \
+                'enhancement_net' in group['name'] or \
                 'embedding' in group['name'] or \
                 'pose' in group['name']:
                 continue
@@ -1999,6 +2000,8 @@ class GaussianModel:
             # mask from grad threshold
             candidate_mask = (grads >= cur_threshold)
             candidate_mask = torch.logical_and(candidate_mask, offset_mask)
+            if is_reference_supervision(self.supervision_profile):
+                candidate_mask &= torch.rand_like(candidate_mask.float()) > (0.5 ** (i + 1))
             
             length_inc = self.get_anchor.shape[0]*self.n_offsets - init_length
             if length_inc == 0: # if increased anchor number is zero, skip to next turn
@@ -2043,41 +2046,42 @@ class GaussianModel:
             remove_duplicates = ~remove_duplicates
             growth_stats["candidates"] += int(remove_duplicates.sum().item())
 
-            available_global = min(
-                max(0, int(max_anchors) - self.get_anchor.shape[0]),
-                max(0, int(max_new_anchors) - total_added),
-            )
-            level_cap = level_caps[i] if i < len(level_caps) else level_caps[-1]
-            keep_count = min(int(remove_duplicates.sum().item()), int(level_cap), available_global)
-            if keep_count <= 0:
-                growth_stats["added_by_level"].append(0)
-                growth_stats["cap_hit"] = True
-                break
+            if not is_reference_supervision(self.supervision_profile):
+                available_global = min(
+                    max(0, int(max_anchors) - self.get_anchor.shape[0]),
+                    max(0, int(max_new_anchors) - total_added),
+                )
+                level_cap = level_caps[i] if i < len(level_caps) else level_caps[-1]
+                keep_count = min(int(remove_duplicates.sum().item()), int(level_cap), available_global)
+                if keep_count <= 0:
+                    growth_stats["added_by_level"].append(0)
+                    growth_stats["cap_hit"] = True
+                    break
 
-            source_mask = candidate_mask[:grads.shape[0]]
-            source_scores = grads[source_mask]
-            voxel_scores = scatter_max(source_scores, inverse_indices, dim=0)[0].view(-1)
-            new_voxel_indices = torch.nonzero(remove_duplicates, as_tuple=False).squeeze(1)
-            selected_scores, top_indices = torch.topk(
-                voxel_scores[new_voxel_indices],
-                k=keep_count,
-                largest=True,
-                sorted=False,
-            )
-            current_selected_min = float(selected_scores.min().detach().cpu())
-            selected_grad_min = (
-                current_selected_min
-                if selected_grad_min is None
-                else min(selected_grad_min, current_selected_min)
-            )
-            selected_unique_mask = torch.zeros_like(remove_duplicates)
-            selected_unique_mask[new_voxel_indices[top_indices]] = True
+                source_mask = candidate_mask[:grads.shape[0]]
+                source_scores = grads[source_mask]
+                voxel_scores = scatter_max(source_scores, inverse_indices, dim=0)[0].view(-1)
+                new_voxel_indices = torch.nonzero(remove_duplicates, as_tuple=False).squeeze(1)
+                selected_scores, top_indices = torch.topk(
+                    voxel_scores[new_voxel_indices],
+                    k=keep_count,
+                    largest=True,
+                    sorted=False,
+                )
+                current_selected_min = float(selected_scores.min().detach().cpu())
+                selected_grad_min = (
+                    current_selected_min
+                    if selected_grad_min is None
+                    else min(selected_grad_min, current_selected_min)
+                )
+                selected_unique_mask = torch.zeros_like(remove_duplicates)
+                selected_unique_mask[new_voxel_indices[top_indices]] = True
 
-            # Keep all original candidate offsets for scatter-based feature
-            # inheritance.  Only ``remove_duplicates`` selects the Top-K
-            # target voxels; replacing candidate_mask here would make its
-            # length disagree with inverse_indices.
-            remove_duplicates = selected_unique_mask
+                # Keep all original candidate offsets for scatter-based feature
+                # inheritance.  Only ``remove_duplicates`` selects the Top-K
+                # target voxels; replacing candidate_mask here would make its
+                # length disagree with inverse_indices.
+                remove_duplicates = selected_unique_mask
             candidate_anchor = selected_grid_coords_unique[remove_duplicates]*cur_size
 
             
@@ -2348,6 +2352,8 @@ class GaussianModel:
         )
         # Attribute every removed anchor to one exclusive cause so that the
         # two counters sum to the total prune count.
+        if is_reference_supervision(self.supervision_profile):
+            never_visible_mask = torch.zeros_like(never_visible_mask)
         never_visible_only_mask = torch.logical_and(never_visible_mask, ~low_opacity_mask)
         prune_mask = torch.logical_or(low_opacity_mask, never_visible_only_mask)
         pruned_candidates_low_opacity = int(low_opacity_mask.sum().item())
@@ -2471,7 +2477,14 @@ class GaussianModel:
 
     def save_mlp_checkpoints(self, path, mode = 'split'):#split or unite
         mkdir_p(os.path.dirname(path))
+        if is_reference_supervision(self.supervision_profile):
+            os.makedirs(path, exist_ok=True)
+            torch.save(self.enhancement_net.state_dict(), os.path.join(path, 'enhancement_net.pth'))
         if mode == 'split':
+            torch.save({
+                'reflectance_detail_scale': self.reflectance_detail_scale,
+                'reflectance_decoder_scale': self.reflectance_decoder_scale,
+            }, os.path.join(path, 'reflectance_config.pth'))
             self.mlp_opacity.eval()
             opacity_mlp = torch.jit.trace(self.mlp_opacity, (torch.rand(1, self.feat_dim+3+self.opacity_dist_dim).cuda()))
             opacity_mlp.save(os.path.join(path, 'opacity_mlp.pt'))
@@ -2569,6 +2582,8 @@ class GaussianModel:
                     'appearance': self.embedding_appearance.state_dict(),
                     'illumination_mode': self.illumination_mode,
                     'reflectance_mode': self.reflectance_mode,
+                    'reflectance_detail_scale': self.reflectance_detail_scale,
+                    'reflectance_decoder_scale': self.reflectance_decoder_scale,
                     }
                 if self.illumination_mode == "sg":
                     checkpoint['sg_illumination_mlp'] = self.mlp_sg_illumination.state_dict()
@@ -2598,6 +2613,8 @@ class GaussianModel:
                     'appearance': self.embedding_appearance.state_dict(),
                     'illumination_mode': self.illumination_mode,
                     'reflectance_mode': self.reflectance_mode,
+                    'reflectance_detail_scale': self.reflectance_detail_scale,
+                    'reflectance_decoder_scale': self.reflectance_decoder_scale,
                     }
                 if self.illumination_mode == "sg":
                     checkpoint['sg_illumination_mlp'] = self.mlp_sg_illumination.state_dict()
@@ -2626,6 +2643,8 @@ class GaussianModel:
                     },
                     'illumination_mode': self.illumination_mode,
                     'reflectance_mode': self.reflectance_mode,
+                    'reflectance_detail_scale': self.reflectance_detail_scale,
+                    'reflectance_decoder_scale': self.reflectance_decoder_scale,
                     }
                 if self.illumination_mode == "sg":
                     checkpoint['sg_illumination_mlp'] = self.mlp_sg_illumination.state_dict()
@@ -2647,7 +2666,14 @@ class GaussianModel:
 
 
     def load_mlp_checkpoints(self, path, mode = 'split'):#split or unite
+        if is_reference_supervision(self.supervision_profile):
+            self.enhancement_net.load_state_dict(torch.load(os.path.join(path, 'enhancement_net.pth')))
         if mode == 'split':
+            config_path = os.path.join(path, 'reflectance_config.pth')
+            if os.path.exists(config_path):
+                config = torch.load(config_path)
+                self.reflectance_detail_scale = config['reflectance_detail_scale']
+                self.reflectance_decoder_scale = config['reflectance_decoder_scale']
             self.mlp_opacity = torch.jit.load(os.path.join(path, 'opacity_mlp.pt')).cuda()
             self.mlp_cov = torch.jit.load(os.path.join(path, 'cov_mlp.pt')).cuda()
             sg_path = os.path.join(path, 'sg_illumination_mlp.pt')
@@ -2707,6 +2733,8 @@ class GaussianModel:
                 self.embedding_appearance = torch.jit.load(os.path.join(path, 'embedding_appearance.pt')).cuda()
         elif mode == 'unite':
             checkpoint = torch.load(os.path.join(path, 'checkpoints.pth'))
+            self.reflectance_detail_scale = checkpoint.get('reflectance_detail_scale', self.reflectance_detail_scale)
+            self.reflectance_decoder_scale = checkpoint.get('reflectance_decoder_scale', self.reflectance_decoder_scale)
             self.mlp_opacity.load_state_dict(checkpoint['opacity_mlp'])
             self.mlp_cov.load_state_dict(checkpoint['cov_mlp'])
             checkpoint_mode = checkpoint.get('illumination_mode', self.illumination_mode)

@@ -24,11 +24,9 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-cmd = 'nvidia-smi -q -d Memory |grep -A4 GPU|grep Used'
-result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).stdout.decode().split('\n')
-os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in result[:-1]]))
-
-os.system('echo $CUDA_VISIBLE_DEVICES')
+if "CUDA_VISIBLE_DEVICES" not in os.environ:
+    result = subprocess.check_output(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"], text=True)
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(np.argmin([int(value) for value in result.splitlines()]))
 
 import imageio.v2 as imageio
 import cv2
@@ -47,6 +45,7 @@ from utils.artifact_utils import (
     summarize_detail_diagnostics,
 )
 from utils.composition_utils import compose_decomposed_render
+from utils.evaluation_utils import evaluate_saved_test_set
 
 from argparse import ArgumentParser
 from gaussian_renderer import GaussianModel
@@ -317,6 +316,8 @@ def render_set_optimize(model_path, name, iteration, views, gaussians, pipeline,
     makedirs(render_artifact_path, exist_ok=True)
     makedirs(error_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
+    enhanced_l_path = os.path.join(model_path, name, "ours_{}".format(iteration), "render_illuminations_enhance")
+    makedirs(enhanced_l_path, exist_ok=True)
 
     depth_curve_fn = lambda x: -np.log(x + np.finfo(np.float32).eps)
 
@@ -420,6 +421,7 @@ def render_set_optimize(model_path, name, iteration, views, gaussians, pipeline,
             torchvision.utils.save_image(rendering_reflectance, os.path.join(render_reflectance_path, view.image_name + ".png"))
             torchvision.utils.save_image(rendering_illumination, os.path.join(render_illumination_path, view.image_name + ".png"))
             torchvision.utils.save_image(rendering_enhanced, os.path.join(render_enhanced_path, view.image_name + ".png"))
+            torchvision.utils.save_image(render_pkg_opt["render_illumination_enhanced"].clamp(0, 1), os.path.join(enhanced_l_path, view.image_name + ".png"))
             torchvision.utils.save_image(coverage, os.path.join(render_coverage_path, view.image_name + ".png"))
 
             torchvision.utils.save_image(rendering_depth, os.path.join(render_depth_path, view.image_name + ".png"))
@@ -679,12 +681,12 @@ def render_set(
         print(f"[detail] saved diagnostic report to {detail_path}")
     if evaluate_metrics:
         _dump_metric_report(
-            os.path.join(model_path, name, "ours_{}".format(iteration), "metrics_lowlight.json"),
+            os.path.join(model_path, name, "ours_{}".format(iteration), "metrics_lowlight_float.json"),
             lowlight_metrics,
             "lowlight",
         )
         _dump_metric_report(
-            os.path.join(model_path, name, "ours_{}".format(iteration), "metrics_enhanced_gt.json"),
+            os.path.join(model_path, name, "ours_{}".format(iteration), "metrics_enhanced_gt_raw_float.json"),
             enhanced_metrics,
             "enhanced_gt",
         )
@@ -731,7 +733,7 @@ def render_sets(
 
         gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
                               dataset.appearance_residual_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_reflectance_dist, dataset.add_illumination_dist, dataset.add_residual_dist, dataset.use_residual, dataset.use_dual_transient, dataset.use_3D_filter,
-                              use_sg_illumination=use_sg_illumination, use_asg_illumination=use_asg_illumination, illumination_mode=illumination_mode, reflectance_mode=reflectance_mode, sg_lobes=sg_lobes, sg_lambda_min=sg_lambda_min, asg_lobes=asg_lobes, asg_lambda_min=asg_lambda_min)
+                              use_sg_illumination=use_sg_illumination, use_asg_illumination=use_asg_illumination, illumination_mode=illumination_mode, reflectance_mode=reflectance_mode, sg_lobes=sg_lobes, sg_lambda_min=sg_lambda_min, asg_lobes=asg_lobes, asg_lambda_min=asg_lambda_min, reflectance_detail_scale=getattr(dataset, "reflectance_detail_scale", 1.1), reflectance_decoder_scale=getattr(dataset, "reflectance_decoder_scale", 0.15), gaussian_footprint_limit=getattr(dataset, "gaussian_footprint_limit", 0.0), supervision_profile=getattr(dataset, "supervision_profile", "custom"))
         scene = Scene(dataset, gaussians, depth_piror_model=None, load_iteration=iteration, shuffle=False)
         
         gaussians.eval()
@@ -786,6 +788,11 @@ def render_sets(
             )
         else:
             render_set_optimize(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, dataset.kernel_size)
+
+        evaluate_saved_test_set(
+            os.path.join(dataset.model_path, "test", f"ours_{scene.loaded_iter}"),
+            dataset.source_path,
+        )
 
     with torch.no_grad():
         if infer_video :
