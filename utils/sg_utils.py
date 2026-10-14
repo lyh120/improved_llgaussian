@@ -7,6 +7,26 @@ def normalize_sg_directions(directions: torch.Tensor, eps: float = 1e-6) -> torc
     return F.normalize(directions, dim=-1, eps=eps)
 
 
+def normalize_asg_axes(axis: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Use a deterministic +Z direction for degenerate explicit ASG axes."""
+    fallback = torch.zeros_like(axis)
+    fallback[..., 2] = 1.0
+    return normalize_sg_directions(
+        torch.where(axis.norm(dim=-1, keepdim=True) > eps, axis, fallback), eps,
+    )
+
+
+def asg_parameter_regularization(sharpness, amplitude, lambda_min: float) -> dict:
+    """Compute differentiable penalties over every explicit lobe, not a view subset."""
+    if sharpness.numel() == 0 or amplitude.numel() == 0:
+        zero = (sharpness.sum() + amplitude.sum()) * 0.0
+        return {"asg_energy": zero, "asg_lambda_mean": zero, "asg_anisotropy": zero}
+    bandwidth = F.softplus(sharpness) + lambda_min
+    anisotropy = bandwidth.max(dim=-1).values / (bandwidth.min(dim=-1).values + 1e-6)
+    return {"asg_energy": torch.sigmoid(amplitude).mean(),
+            "asg_lambda_mean": bandwidth.mean(), "asg_anisotropy": anisotropy.mean()}
+
+
 def evaluate_spherical_gaussians(
     raw_params: torch.Tensor,
     view_dirs: torch.Tensor,
@@ -46,7 +66,7 @@ def evaluate_spherical_gaussians(
 
 
 def _orthonormalize_tangent(axis: torch.Tensor, tangent: torch.Tensor, eps: float = 1e-6) -> tuple[torch.Tensor, torch.Tensor]:
-    z_axis = normalize_sg_directions(axis, eps=eps)
+    z_axis = normalize_asg_axes(axis, eps=eps)
     tangent = tangent - (tangent * z_axis).sum(dim=-1, keepdim=True) * z_axis
     tangent_norm = tangent.norm(dim=-1, keepdim=True)
 
@@ -93,7 +113,7 @@ def evaluate_anisotropic_spherical_gaussians(
         Illumination shaped (N * n_offsets, 1), per-offset illumination shaped
         (N, n_offsets), and scalar/stat tensors.
     """
-    z_axis = normalize_sg_directions(axis)
+    z_axis = normalize_asg_axes(axis)
     x_axis, y_axis = _orthonormalize_tangent(z_axis, tangent)
     bandwidth = F.softplus(sharpness) + lambda_min
     lambda_x = bandwidth[..., :1]

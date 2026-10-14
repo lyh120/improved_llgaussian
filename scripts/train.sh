@@ -25,6 +25,7 @@ mlp_color_lr_final=0.00025
 pose_lr_init=0.0001
 pose_lr_final=0.00001
 update_from=1000
+enhancement_prior=cidnet
 
 position_lr_max_steps=${iterations_static}
 offset_lr_max_steps=${iterations_static}
@@ -51,10 +52,16 @@ while [[ "$#" -gt 0 ]]; do
         --appearance_residual_dim) appearance_residual_dim="$2"; shift ;;
         --prune_ratio) prune_ratio="$2"; shift ;;
         --kernel_size) kernel_size="$2"; shift ;;
+        --enhancement_prior) enhancement_prior="$2"; shift ;;
         *) echo "Unknown parameter passed: $1"; exit 1 ;;
     esac
     shift
 done
+
+case "$enhancement_prior" in
+    cidnet|stablesr) ;;
+    *) echo "Invalid --enhancement_prior: $enhancement_prior (use cidnet or stablesr)"; exit 2 ;;
+esac
 
 time=$(date "+%Y-%m-%d_%H:%M:%S")
 mkdir -p outputs/${logdir}/$time
@@ -66,6 +73,7 @@ if [ "$warmup" = "True" ]; then
         --iterations ${iterations} \
         --gpu ${gpu} --voxel_size ${vsize} --update_init_factor ${update_init_factor}\
         --use_asg_illumination --illumination_mode asg \
+        --enhancement_prior "${enhancement_prior}" \
         --appearance_residual_dim ${appearance_residual_dim}  \
         --kernel_size ${kernel_size} --port $port -m outputs/${logdir}/$time --use_wandb --warmup  \
         --update_until ${update_until} --feat_dim ${feat_dim} \
@@ -85,6 +93,7 @@ if [ "$warmup" = "True" ]; then
         --iterations ${iterations} \
         --gpu ${gpu} --voxel_size ${vsize} --update_init_factor ${update_init_factor}\
         --use_asg_illumination --illumination_mode asg \
+        --enhancement_prior "${enhancement_prior}" \
         --kernel_size ${kernel_size} --port $port -m outputs/${logdir}/$time --use_wandb  \
         --update_until ${update_until} --feat_dim ${feat_dim}  \
         --densify_grad_threshold ${densify_grad_threshold} --success_threshold ${success_threshold}\
@@ -106,6 +115,7 @@ else
         --iterations ${iterations} \
         --gpu ${gpu} --voxel_size ${vsize} --update_init_factor ${update_init_factor}\
         --use_asg_illumination --illumination_mode asg \
+        --enhancement_prior "${enhancement_prior}" \
         --appearance_residual_dim ${appearance_residual_dim} \
         --kernel_size ${kernel_size} --port $port -m outputs/${logdir}/$time --use_wandb   \
         --update_until ${update_until} --feat_dim ${feat_dim} \
@@ -124,6 +134,7 @@ else
         --iterations ${iterations} \
         --gpu ${gpu} --voxel_size ${vsize} --update_init_factor ${update_init_factor}\
         --use_asg_illumination --illumination_mode asg \
+        --enhancement_prior "${enhancement_prior}" \
         --appearance_residual_dim ${appearance_residual_dim} \
         --kernel_size ${kernel_size} --port $port -m outputs/${logdir}/$time --use_wandb  \
         --update_until ${update_until} --feat_dim ${feat_dim} \

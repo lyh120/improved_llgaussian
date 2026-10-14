@@ -34,6 +34,9 @@ class ParamGroup:
             else:
                 if t == bool:
                     group.add_argument("--" + key, default=value, action="store_true")
+                elif key == "enhancement_prior":
+                    group.add_argument("--" + key, default=value, type=str,
+                                       choices=("cidnet", "stablesr"))
                 else:
                     group.add_argument("--" + key, default=value, type=t)
 
@@ -112,6 +115,7 @@ class ModelParams(ParamGroup):
         self.artifact_highlight_reg = 0.25
         self.reflectance_detail_reg = 1e-6
         self.reflectance_decoder_reg = 2e-5
+        self.aux_grad_audit_interval = 600
         self.enhancement_reflectance_reg = 0.06
         self.enhancement_degree_reg = 0.2
         self.enhancement_degree_global_reg = 0.05
@@ -231,6 +235,7 @@ class OptimizationParams(ParamGroup):
         self.percent_dense = 0.01
         self.lambda_dssim = 0.3
         self.b0_lr = 0.001
+        self.training_schedule = "custom"
         self.reflectance_offset_lr = 0.008
         self.reflectance_decoder_lr = 0.002
         
@@ -311,6 +316,7 @@ def _backfill_model_compatibility(merged_dict):
         "artifact_highlight_reg": 0.25,
         "reflectance_detail_reg": 1e-6,
         "reflectance_decoder_reg": 2e-5,
+        "aux_grad_audit_interval": 600,
         "enhancement_reflectance_reg": 0.06,
         "enhancement_degree_reg": 0.2,
         "enhancement_degree_global_reg": 0.05,

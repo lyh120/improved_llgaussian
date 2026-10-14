@@ -116,9 +116,11 @@ class Scene:
                                                            "iteration_" + str(self.loaded_iter)))
             if os.path.exists(os.path.join(self.model_path, "pose", f"pose_{self.loaded_iter}.npy")):
                 pose = load_pose(os.path.join(self.model_path, "pose", f"pose_{self.loaded_iter}.npy"))
-                self.gaussians.P = pose
+                self.gaussians.P = pose.detach().clone().requires_grad_(True)
+            else:
+                self.gaussians.init_RT_seq(self.train_cameras)
         else:
-            self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent, num_sky_gaussians=1000, cameras=self.getTestCameras(),model_path=self.model_path, prune_ratio=args.prune_ratio, beta=args.beta)
+            self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent, num_sky_gaussians=1000, cameras=self.getTrainCameras(),model_path=self.model_path, prune_ratio=args.prune_ratio, beta=args.beta)
             print(f'self.gaussians.get_anchor.shape: {self.gaussians.get_anchor.shape}')
         
 ####

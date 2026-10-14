@@ -882,7 +882,7 @@ class GaussianModel:
     def get_reflectance_with_decoder(self, feat, offsets, visible_mask):
         reflectance = self.get_reflectance_with_detail[visible_mask]
         feat_repeated = feat.unsqueeze(1).expand(-1, self.n_offsets, -1)
-        decoder_input = torch.cat([feat_repeated, offsets], dim=-1).reshape(-1, self.feat_dim + 3)
+        decoder_input = torch.cat([feat_repeated.detach(), offsets.detach()], dim=-1).reshape(-1, self.feat_dim + 3)
         decoder_out = self.mlp_reflectance_decoder(decoder_input).reshape(-1, self.n_offsets, 3)
         decoder_refine = 1.0 + 0.15 * torch.tanh(decoder_out)
         self._last_reflectance_decoder_mean = torch.abs(torch.tanh(decoder_out)).mean()
@@ -894,7 +894,7 @@ class GaussianModel:
         sharpness = F.softplus(self._enhancement_sg_sharpness[visible_mask])
         amplitude = torch.sigmoid(self._enhancement_sg_amplitude[visible_mask])
 
-        view_dirs = view_dirs.view(-1, 1, 3)
+        view_dirs = view_dirs.detach().view(-1, 1, 3)
         cosine = torch.sum(axis * view_dirs, dim=-1, keepdim=True).clamp(-1.0, 1.0)
         sg_term = amplitude * torch.exp(sharpness * (cosine - 1.0))
 

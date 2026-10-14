@@ -297,7 +297,7 @@ def _profile_add(profile_timings: dict | None, key: str, value: float) -> None:
         profile_timings[key] = profile_timings.get(key, 0.0) + value
 
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, kernel_size: float, scaling_modifier = 1.0, visible_mask=None, retain_grad=False, camera_pose=None, profile_timings=None, return_coverage=False):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, kernel_size: float, scaling_modifier = 1.0, visible_mask=None, retain_grad=False, camera_pose=None, profile_timings=None, return_coverage=False, return_reflectance_aux=False):
     """
     Render the scene. 
     
@@ -436,26 +436,40 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         rotations = gaussians_rot_trans,
         cov3D_precomp = None)
 
+    # Auxiliary R uses identical splat values with no geometry/pose/screen path.
+    rendered_reflectance_aux = None
+    if return_reflectance_aux:
+        rendered_reflectance_aux, _, _ = rasterizer(
+            means3D=means3D.detach(),
+            means2D=screenspace_points.detach(),
+            shs=None,
+            colors_precomp=reflectance,
+            opacities=opacity.detach(),
+            scales=scaling.detach(),
+            rotations=gaussians_rot_trans.detach(),
+            cov3D_precomp=None,
+        )
+
     rendered_illumination_enhanced, _, _= rasterizer(
         # means3D = xyz,
         means3D = means3D.detach(),
         # means2D = screenspace_points,
-        means2D = means2D,
+        means2D = means2D.detach(),
         shs = None,
         colors_precomp = illumination_enhanced,
-        opacities = opacity,
-        scales = scaling,
+        opacities = opacity.detach(),
+        scales = scaling.detach(),
         # rotations = rot,
-        rotations = gaussians_rot_trans,
+        rotations = gaussians_rot_trans.detach(),
         cov3D_precomp = None)
     rendered_enhanced, _, _ = rasterizer(
         means3D=means3D.detach(),
-        means2D=means2D,
+        means2D=means2D.detach(),
         shs=None,
         colors_precomp=reflectance.detach() * illumination_enhanced,
-        opacities=opacity,
-        scales=scaling,
-        rotations=gaussians_rot_trans,
+        opacities=opacity.detach(),
+        scales=scaling.detach(),
+        rotations=gaussians_rot_trans.detach(),
         cov3D_precomp=None,
     )
     rendered_coverage = None
@@ -621,6 +635,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                     "render_enhanced": rendered_enhanced,
                     "render_coverage": rendered_coverage,
                     "render_reflectance":rendered_reflectance,
+                    "render_reflectance_aux":rendered_reflectance_aux,
                     "render_illumination":rendered_illumination,
                     "render_illumination_enhanced":rendered_illumination_enhanced,
                     "render_depth":depth_map,
@@ -646,6 +661,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                     "render_enhanced": rendered_enhanced,
                     "render_coverage": rendered_coverage,
                     "render_reflectance":rendered_reflectance,
+                    "render_reflectance_aux":rendered_reflectance_aux,
                     "render_illumination":rendered_illumination,
                     "render_illumination_enhanced":rendered_illumination_enhanced,
                     "render_noise": rendered_noise * 0.1,
@@ -765,6 +781,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 "render_enhanced": rendered_enhanced,
                 "render_coverage": rendered_coverage,
                 "render_reflectance":rendered_reflectance,
+                    "render_reflectance_aux":rendered_reflectance_aux,
                 "render_illumination":rendered_illumination,
                 "render_illumination_enhanced":rendered_illumination_enhanced,
                 "render_depth":depth_map,
@@ -786,6 +803,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
                 "render_enhanced": rendered_enhanced,
                 "render_coverage": rendered_coverage,
                 "render_reflectance":rendered_reflectance,
+                    "render_reflectance_aux":rendered_reflectance_aux,
                 "render_illumination":rendered_illumination,
                 "render_illumination_enhanced":rendered_illumination_enhanced,
                 "render_depth":depth_map,

@@ -349,8 +349,8 @@ def render_set_optimize(model_path, name, iteration, views, gaussians, pipeline,
         # Add a learning rate scheduler
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(pose_optimizer, T_max=num_iter, eta_min=0.0001)
         with tqdm(total=num_iter, desc=f"Tracking Time Step: {idx+1}", leave=True) as progress_bar:
-            candidate_q = camera_tensor_q.clone().detach()
-            candidate_T = camera_tensor_T.clone().detach()
+            candidate_q = camera_tensor_q.detach().clone()
+            candidate_T = camera_tensor_T.detach().clone()
             current_min_loss = float(1e20)
             gt = view.original_image[0:3, :, :]
             initial_loss = None
@@ -363,18 +363,18 @@ def render_set_optimize(model_path, name, iteration, views, gaussians, pipeline,
                 black_hole_threshold = 0.0
                 mask = (rendering > black_hole_threshold).float()
                 loss = torch.abs(l1_plus_loss(rendering, gt) * mask).mean()
-                loss.backward()
+                loss.backward(inputs=[camera_tensor_q, camera_tensor_T])
                 with torch.no_grad():
-                    pose_optimizer.step()
-                    pose_optimizer.zero_grad(set_to_none=True)
 
                     if iteration == 0:
                         initial_loss = loss.item()  # Capture initial loss
 
-                    if loss < current_min_loss:
-                        current_min_loss = loss
-                        candidate_q = camera_tensor_q.clone().detach()
-                        candidate_T = camera_tensor_T.clone().detach()
+                    if loss.item() < current_min_loss:
+                        current_min_loss = loss.item()
+                        candidate_q = camera_tensor_q.detach().clone()
+                        candidate_T = camera_tensor_T.detach().clone()
+                    pose_optimizer.step()
+                    pose_optimizer.zero_grad(set_to_none=True)
 
                     progress_bar.update(1)
                     progress_bar.set_postfix(loss=loss.item(), initial_loss=initial_loss)
@@ -396,15 +396,15 @@ def render_set_optimize(model_path, name, iteration, views, gaussians, pipeline,
             rendering_illumination = torch.clamp(render_pkg_opt["render_illumination"] , 0.0, 1.0)
             rendering_enhanced = compose_decomposed_render(render_pkg_opt, enhanced=True)
             coverage = torch.clamp(render_pkg_opt["render_coverage"], 0.0, 1.0)
-            rendering_depth = 1 - minmax_normalize(render_pkg["render_depth"])
-            if 'render_residual' in render_pkg:
-                rendering_residual = torch.clamp(render_pkg["render_residual"], 0.0, 1.0)
+            rendering_depth = 1 - minmax_normalize(render_pkg_opt["render_depth"])
+            if 'render_residual' in render_pkg_opt:
+                rendering_residual = torch.clamp(render_pkg_opt["render_residual"], 0.0, 1.0)
                 torchvision.utils.save_image(rendering_residual, os.path.join(render_residual_path, view.image_name + ".png"))
-            if 'render_noise' in render_pkg:
-                rendering_noise = torch.clamp(render_pkg["render_noise"], 0.0, 1.0)
+            if 'render_noise' in render_pkg_opt:
+                rendering_noise = torch.clamp(render_pkg_opt["render_noise"], 0.0, 1.0)
                 torchvision.utils.save_image(rendering_noise, os.path.join(render_noise_path, view.image_name + ".png"))
-            if 'render_artifact' in render_pkg:
-                rendering_artifact = torch.clamp(render_pkg["render_artifact"], 0.0, 1.0)
+            if 'render_artifact' in render_pkg_opt:
+                rendering_artifact = torch.clamp(render_pkg_opt["render_artifact"], 0.0, 1.0)
                 torchvision.utils.save_image(rendering_artifact, os.path.join(render_artifact_path, view.image_name + ".png"))
 
 

@@ -400,34 +400,36 @@ def build_residual_hard_mask(
     return hard_mask, noise_cov, artifact_cov
 
 
+def _illumination_stat(stats, *keys):
+    """Return a live statistic without eagerly allocating a CUDA fallback."""
+    stats = stats or {}
+    for key in keys:
+        if key in stats:
+            return stats[key]
+    for value in stats.values():
+        if torch.is_tensor(value):
+            return value.new_zeros(())
+    return torch.tensor(0.0, device="cuda" if torch.cuda.is_available() else "cpu")
+
+
 def L_SG_Energy(sg_stats):
-    if not sg_stats or "sg_energy" not in sg_stats:
-        return torch.tensor(0.0, device="cuda")
-    return sg_stats["sg_energy"]
+    return _illumination_stat(sg_stats, "sg_energy")
 
 
 def L_SG_Sharpness(sg_stats):
-    if not sg_stats or "sg_lambda_mean" not in sg_stats:
-        return torch.tensor(0.0, device="cuda")
-    return sg_stats["sg_lambda_mean"]
+    return _illumination_stat(sg_stats, "sg_lambda_mean")
 
 
 def L_ASG_Energy(illumination_stats):
-    if not illumination_stats:
-        return torch.tensor(0.0, device="cuda")
-    return illumination_stats.get("asg_energy", illumination_stats.get("illumination_energy", torch.tensor(0.0, device="cuda")))
+    return _illumination_stat(illumination_stats, "asg_energy", "illumination_energy")
 
 
 def L_ASG_Sharpness(illumination_stats):
-    if not illumination_stats:
-        return torch.tensor(0.0, device="cuda")
-    return illumination_stats.get("asg_lambda_mean", illumination_stats.get("illumination_lambda_mean", torch.tensor(0.0, device="cuda")))
+    return _illumination_stat(illumination_stats, "asg_lambda_mean", "illumination_lambda_mean")
 
 
 def L_ASG_Anisotropy(illumination_stats):
-    if not illumination_stats:
-        return torch.tensor(0.0, device="cuda")
-    return illumination_stats.get("asg_anisotropy", torch.tensor(0.0, device="cuda"))
+    return _illumination_stat(illumination_stats, "asg_anisotropy", "illumination_anisotropy")
 
 def L_Feat_Smooth(feature_image, image, mask, depth_image):
     image = image.detach()
