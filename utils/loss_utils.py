@@ -15,7 +15,7 @@ from torch.autograd import Variable
 from math import exp
 import math
 from utils.visualize_utils import minmax_normalize
-from audtorch.metrics.functional import pearsonr
+from utils.depth_utils import local_depth_similarity, pearson_depth_loss
 
 def l1_loss(network_output, gt):
     return (network_output - gt)
@@ -249,14 +249,14 @@ def _local_std(gray_image, kernel_size=5):
     return torch.sqrt(var + 1e-6).squeeze(0)
 
 
-def L_Reflectance_LocalContrast(reflectance_image, gt_image, threshold=0.1, target_ratio=0.8):
+def L_Reflectance_LocalContrast(reflectance_image, gt_image, threshold=0.1, target_ratio=0.8, kernel_size=5):
     """Encourage reflectance to recover local grayscale contrast without copying highlight colors."""
     gt_image = gt_image.detach()
     reflectance_gray = reflectance_image.mean(dim=0, keepdim=True)
     gt_gray = 0.299 * gt_image[0:1] + 0.587 * gt_image[1:2] + 0.114 * gt_image[2:3]
 
-    reflectance_std = _local_std(reflectance_gray)
-    gt_std = _local_std(gt_gray).detach()
+    reflectance_std = _local_std(reflectance_gray, kernel_size)
+    gt_std = _local_std(gt_gray, kernel_size).detach()
     reflectance_std_norm = reflectance_std / (reflectance_std.mean().detach() + 1e-6)
     gt_std_norm = gt_std / (gt_std.mean().detach() + 1e-6)
     texture_mask = torch.clamp(gt_std_norm - threshold, 0.0, 1.0).detach()
@@ -497,48 +497,10 @@ def L_Illu(gt_image, illumination_image, phi=0.1/255):
     return torch.abs(gt_image - illumination_image).mean()
 
 
-def pearson_depth_loss(depth_src, depth_target, eps=1e-6):
-    src = depth_src - depth_src.mean()
-    target = depth_target - depth_target.mean()
-    src_std = torch.sqrt(torch.mean(src ** 2) + eps)
-    target_std = torch.sqrt(torch.mean(target ** 2) + eps)  
-    src = src / src_std
-    target = target / target_std
-    co = (src * target).mean()
+def L_Depth_similarity(depth_src, depth_target, box_p, p_corr, valid_mask=None):
+    """Compatibility wrapper for robust local relative-depth correlation."""
+    return local_depth_similarity(depth_src, depth_target, box_p, p_corr, valid_mask)
 
-    return torch.clamp(1 - co , min=0.0, max=1.0)
-
-# def pearson_depth_loss(depth_src, depth_target):
-#     # 中心化
-#     x = depth_src - depth_src.mean()
-#     y = depth_target - depth_target.mean()
-    
-#     # 直接计算相关系数
-#     r = torch.sum(x * y) / (torch.sqrt(torch.sum(x * x) * torch.sum(y * y)) + 1e-6)
-    
-#     return 1 - torch.clamp(r, min=-1.0, max=1.0)
-
-def L_Depth_similarity(depth_src, depth_target, box_p, p_corr):
-    num_box_h = depth_src.shape[0] // box_p
-    num_box_w = depth_src.shape[1] // box_p
-    max_h = depth_src.shape[0] - box_p
-    max_w = depth_src.shape[1] - box_p
-    n_corr = int(p_corr * num_box_h * num_box_w)
-
-    x_0 = torch.randint(0, max_h, (n_corr,), device='cuda')
-    y_0 = torch.randint(0, max_w, (n_corr,), device='cuda')
-    x_1 = x_0 + box_p
-    y_1 = y_0 + box_p
-
-    _loss = sum(
-        pearson_depth_loss(
-            depth_src[x0:x1, y0:y1].reshape(-1),
-            depth_target[x0:x1, y0:y1].reshape(-1)
-        )
-        for x0, x1, y0, y1 in zip(x_0, x_1, y_0, y_1)
-    )
-
-    return _loss / n_corr
 
 def constancy_loss(x):
     Consis_rg = torch.pow(x[0]-x[1], 2)

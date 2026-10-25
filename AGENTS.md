@@ -355,3 +355,14 @@ python render.py -m /home/liuyuhao/ll_further/LL-Gaussian-sg/outputs/chair_sg_ex
 - `train.py`：enhancement 第一项的衰减曲线从尾值 `0.3` 调低到 `0.1`，进一步减少 StableSR 伪 GT 对 reflectance 的长期拖软。
 - `scene/gaussian_model.py`：将 reflectance decoder refinement 缩放从 `0.25` 下调到 `0.15`，把 decoder 从大幅补偿器收紧为局部微调器，避免 decoder 饱和却不产出有效结构。
 - `arguments/__init__.py`：新增 `reflectance_highfreq_reg=3e-3`、`residual_higherror_percentile=0.8`、`residual_highlight_percentile=0.9`，并将 `reflectance_decoder_lr` 从 `0.004` 下调到 `0.002`、`reflectance_decoder_reg` 从 `1e-5` 上调到 `2e-5`，同步写入兼容回填默认值。
+
+
+### 2026-10-22 ASG 训练权限与 Prior 兼容修正
+
+- 三项 R 锐化（补边、局部对比度、高频）使用 `render_reflectance_aux`；几何、共享特征和可选距离输入停止梯度，仅更新 B0/detail/decoder 或 MLP-R。其他 R 正则及 LL-Gaussian 增强监督权限保持原行为。
+- B0 初始化只取训练相机，投影与 CUDA 矩阵布局、像素方向一致，排除无效投影与零信号观测。
+- StableSR/CIDNet 继续通过 `--enhancement_prior` 切换；StableSR 修复项目相对路径和 VQ 配置，只补缓存缺失视角；公共 RGB 目标统一尺寸、范围和冻结状态。
+- depth prior 统一训练图入口，兼容 numpy/Tensor；保留原相对深度公式，修复尺寸、采样及退化窗口，并以辅助 RGB 累积补齐直接深度梯度，不修改 CUDA 扩展。
+- 新训练 checkpoint 保存网络、反射率参数、位姿、统计和 prior 轮次；PLY/split/unite 保存反射率参数元信息，旧产物回填历史默认值。
+- 普通与 fast 渲染统一使用图像空间分量乘积；fast 改为两次分量光栅化，旧单次渲染耗时不能直接用于新版本。
+- `ASG_TRAINING_METHOD_CN.md` 记录模型公式、梯度权限、参数作用、实验数值和验证边界。未启动完整训练，真实 CUDA 测试在本机条件跳过。

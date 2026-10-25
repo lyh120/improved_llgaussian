@@ -12,6 +12,7 @@
 from argparse import ArgumentParser, Namespace
 import sys
 import os
+from utils.decomposition_config import REPRESENTATION_DEFAULTS, SUPERVISION_DEFAULTS
 
 class GroupParams:
     pass
@@ -151,6 +152,8 @@ class ModelParams(ParamGroup):
         self.b0_spatial_smooth_reg = 0.0
         self.prune_ratio = 0.05
         self.beta = 1.0
+        for key, value in {**REPRESENTATION_DEFAULTS, **SUPERVISION_DEFAULTS}.items():
+            setattr(self, key, value)
         
         
         super().__init__(parser, "Loading Parameters", sentinel)
@@ -370,6 +373,8 @@ def _backfill_model_compatibility(merged_dict):
         "warmup_success_threshold": 0.8,
     }
     for key, value in defaults.items():
+        merged_dict.setdefault(key, value)
+    for key, value in {**REPRESENTATION_DEFAULTS, **SUPERVISION_DEFAULTS}.items():
         merged_dict.setdefault(key, value)
 
     return merged_dict

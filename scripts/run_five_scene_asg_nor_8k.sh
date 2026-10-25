@@ -9,6 +9,7 @@ DATA_ROOT="datasets"
 EXPERIMENT_ROOT="experiments"
 RUN_TAG="asg_nor_8k_v1"
 SKIP_EXISTING=false
+ENHANCEMENT_PRIOR="cidnet"
 
 usage() {
     cat <<'EOF'
@@ -21,6 +22,7 @@ Options:
   --experiment-root PATH  Root directory for named experiment folders (default: experiments)
   --run-tag NAME          Suffix used in each experiment/WandB name (default: asg_nor_8k_v1)
   --skip-existing         Skip a scene when its iteration_8000 PLY already exists
+  --enhancement-prior P   cidnet|stablesr (default: cidnet)
   -h, --help              Show this help message
 EOF
 }
@@ -33,12 +35,14 @@ while [[ $# -gt 0 ]]; do
         --experiment-root) EXPERIMENT_ROOT="$2"; shift 2 ;;
         --run-tag) RUN_TAG="$2"; shift 2 ;;
         --skip-existing) SKIP_EXISTING=true; shift ;;
+        --enhancement-prior) ENHANCEMENT_PRIOR="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage; exit 2 ;;
     esac
 done
 
 case "$SCENE_FILTER" in all|buu|sofa|chair|bike|shrub) ;; *) echo "Invalid scene: $SCENE_FILTER" >&2; exit 2 ;; esac
+case "$ENHANCEMENT_PRIOR" in cidnet|stablesr) ;; *) echo "Invalid enhancement prior: $ENHANCEMENT_PRIOR" >&2; exit 2 ;; esac
 
 COMMON_ARGS=(
     --eval --gpu "$GPU" --use_wandb --warmup --use_3D_filter
@@ -65,7 +69,7 @@ COMMON_ARGS=(
     --enhancement_degree_global_reg 0.05 --enhancement_smooth_reg 4e-4
     --enhancement_diff_start_iter 2350 --enhancement_color_reg 0.06
     --enhancement_color_std_reg 0.02 --enhancement_green_bias_reg 0.06
-    --enhancement_prior cidnet --cidnet_conda_env CIDNet
+    --enhancement_prior "$ENHANCEMENT_PRIOR" --cidnet_conda_env CIDNet
     --cidnet_root ./submodules/HVI-CIDNet
     --cidnet_weights ./submodules/HVI-CIDNet/weights/LOLv2_real/w_perc.pth
     --cidnet_refresh_interval 0 --cidnet_mlp_steps 100 --cidnet_target_exposure 0.5

@@ -25,6 +25,7 @@ mlp_color_lr_final=0.00025
 pose_lr_init=0.0001
 pose_lr_final=0.00001
 update_from=1000
+enhancement_prior=cidnet
 
 position_lr_max_steps=${iterations_static}
 offset_lr_max_steps=${iterations_static}
@@ -51,10 +52,13 @@ while [[ "$#" -gt 0 ]]; do
         --appearance_residual_dim) appearance_residual_dim="$2"; shift ;;
         --prune_ratio) prune_ratio="$2"; shift ;;
         --kernel_size) kernel_size="$2"; shift ;;
+        --enhancement_prior|--enhancement-prior) enhancement_prior="$2"; shift ;;
         *) echo "Unknown parameter passed: $1"; exit 1 ;;
     esac
     shift
 done
+
+case "$enhancement_prior" in cidnet|stablesr) ;; *) echo "Invalid enhancement prior: $enhancement_prior"; exit 2 ;; esac
 
 time=$(date "+%Y-%m-%d_%H:%M:%S")
 mkdir -p outputs/${logdir}/$time
@@ -62,7 +66,7 @@ if [ "$warmup" = "True" ]; then
     echo "warmup"
     if [ "$use_residual" = "True" ]; then
         echo "use_residual"
-        CUDA_VISIBLE_DEVICES=${gpu} python train.py --eval -s ${data} --lod ${lod} \
+        CUDA_VISIBLE_DEVICES=${gpu} python train.py --enhancement_prior "${enhancement_prior}" --eval -s ${data} --lod ${lod} \
         --iterations ${iterations} \
         --gpu ${gpu} --voxel_size ${vsize} --update_init_factor ${update_init_factor}\
         --use_asg_illumination --illumination_mode asg \
@@ -81,7 +85,7 @@ if [ "$warmup" = "True" ]; then
         # >outputs/${logdir}/$time/${logdir}.log 2>&1 
         wait
     else
-        CUDA_VISIBLE_DEVICES=${gpu} python train.py --eval -s ${data} --lod ${lod} \
+        CUDA_VISIBLE_DEVICES=${gpu} python train.py --enhancement_prior "${enhancement_prior}" --eval -s ${data} --lod ${lod} \
         --iterations ${iterations} \
         --gpu ${gpu} --voxel_size ${vsize} --update_init_factor ${update_init_factor}\
         --use_asg_illumination --illumination_mode asg \
@@ -102,7 +106,7 @@ else
     
     if [ "$use_residual" = "True" ]; then
         echo "use_residual"
-        CUDA_VISIBLE_DEVICES=${gpu} python train.py --eval -s ${data} --lod ${lod} \
+        CUDA_VISIBLE_DEVICES=${gpu} python train.py --enhancement_prior "${enhancement_prior}" --eval -s ${data} --lod ${lod} \
         --iterations ${iterations} \
         --gpu ${gpu} --voxel_size ${vsize} --update_init_factor ${update_init_factor}\
         --use_asg_illumination --illumination_mode asg \
@@ -120,7 +124,7 @@ else
         --appearance_lr_max_steps ${appearance_lr_max_steps}  --use_residual --use_3D_filter --prune_ratio ${prune_ratio}\
         # >outputs/${logdir}/$time/${logdir}.log 2>&1
     else
-        CUDA_VISIBLE_DEVICES=${gpu} python train.py --eval -s ${data} --lod ${lod} \
+        CUDA_VISIBLE_DEVICES=${gpu} python train.py --enhancement_prior "${enhancement_prior}" --eval -s ${data} --lod ${lod} \
         --iterations ${iterations} \
         --gpu ${gpu} --voxel_size ${vsize} --update_init_factor ${update_init_factor}\
         --use_asg_illumination --illumination_mode asg \

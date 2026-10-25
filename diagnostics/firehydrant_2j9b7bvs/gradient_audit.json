@@ -1,0 +1,198 @@
+[
+  {
+    "iteration": 2000,
+    "pose_requires_grad": false,
+    "max_train_pose_matrix_delta_from_colmap": 2.421438694000244e-07,
+    "max_test_eval_wrong_pose_matrix_delta": 9.696170806884766,
+    "gradient_table": {
+      "photometric": {
+        "loss": 0.31598371267318726,
+        "norms": {
+          "offset": 0.02608452612850935,
+          "scaling": 0.0044783051188023735,
+          "features": 0.004695118717209977,
+          "B0": 0.016076781736593403,
+          "ASG_bias": 0.010394185581484226,
+          "mlp_cov": 0.017684807529567356,
+          "mlp_opacity": 0.026730862806423963,
+          "screen": 0.08634123195641405
+        }
+      },
+      "depth": {
+        "loss": 0.006089948583394289,
+        "norms": {
+          "offset": 0.01831993815867212,
+          "scaling": 0.006094870703545562,
+          "features": 0.004088815877671985,
+          "B0": 0.0,
+          "ASG_bias": 0.0,
+          "mlp_cov": 0.018585664255772086,
+          "mlp_opacity": 0.016628340204415785,
+          "screen": 0.028126654642493604,
+          "geometry_cosine_with_photo": -0.1487623651836965
+        }
+      },
+      "illumination": {
+        "loss": 0.004962597042322159,
+        "norms": {
+          "offset": 0.005175495006241658,
+          "scaling": 0.0014407323639493894,
+          "features": 0.0007619296782542157,
+          "B0": 0.0,
+          "ASG_bias": 0.0005186071045996954,
+          "mlp_cov": 0.0047554788770941235,
+          "mlp_opacity": 0.011506301851671353,
+          "screen": 0.005013485745743845,
+          "geometry_cosine_with_photo": -0.20701761879854794
+        }
+      },
+      "scale_reg": {
+        "loss": 0.00018530433590058237,
+        "norms": {
+          "offset": 0.0,
+          "scaling": 6.683997534486248e-05,
+          "features": 4.963867337679748e-05,
+          "B0": 0.0,
+          "ASG_bias": 0.0,
+          "mlp_cov": 0.00022072479203878622,
+          "mlp_opacity": 0.0,
+          "screen": 0.0,
+          "geometry_cosine_with_photo": 0.0023592393011849172
+        }
+      },
+      "R_sharpen": {
+        "loss": 0.003281895536929369,
+        "norms": {
+          "offset": 0.0,
+          "scaling": 0.0,
+          "features": 0.0,
+          "B0": 0.00010739175794435423,
+          "ASG_bias": 0.0,
+          "mlp_cov": 0.0,
+          "mlp_opacity": 0.0,
+          "screen": 0.0,
+          "geometry_cosine_with_photo": 0.0
+        }
+      }
+    },
+    "depth_quantiles": [
+      2.6046817302703857,
+      2.852375030517578,
+      5.235605239868164,
+      23.29483413696289,
+      24.243026733398438
+    ]
+  },
+  {
+    "iteration": 6000,
+    "pose_requires_grad": false,
+    "max_train_pose_matrix_delta_from_colmap": 4.172325134277344e-07,
+    "max_test_eval_wrong_pose_matrix_delta": 9.696170806884766,
+    "gradient_table": {
+      "photometric": {
+        "loss": 0.32066452503204346,
+        "norms": {
+          "offset": 0.030717540799813682,
+          "scaling": 0.005889454019851576,
+          "features": 0.0021147742481076185,
+          "B0": 0.003376484961011898,
+          "ASG_bias": 0.003963105586038577,
+          "mlp_cov": 0.016715623267409267,
+          "mlp_opacity": 0.01492361418748751,
+          "screen": 0.08309085282607954
+        }
+      },
+      "depth": {
+        "loss": 0.005382335279136896,
+        "norms": {
+          "offset": 0.034854796857149706,
+          "scaling": 0.004855573569150936,
+          "features": 0.002510272886814191,
+          "B0": 0.0,
+          "ASG_bias": 0.0,
+          "mlp_cov": 0.011263701873621775,
+          "mlp_opacity": 0.029713634119744654,
+          "screen": 0.03255369937382137,
+          "geometry_cosine_with_photo": 0.04897685202132054
+        }
+      },
+      "illumination": {
+        "loss": 0.004100245423614979,
+        "norms": {
+          "offset": 0.0030508917831419033,
+          "scaling": 0.0005012942405733377,
+          "features": 0.00022498260132543303,
+          "B0": 0.0,
+          "ASG_bias": 0.00018382800098036672,
+          "mlp_cov": 0.000984555418616026,
+          "mlp_opacity": 0.00204671992851931,
+          "screen": 0.0048805760685964195,
+          "geometry_cosine_with_photo": -0.1581882727994145
+        }
+      },
+      "scale_reg": {
+        "loss": 2.0201076040393673e-05,
+        "norms": {
+          "offset": 0.0,
+          "scaling": 3.919878411656695e-06,
+          "features": 9.017558181614498e-07,
+          "B0": 0.0,
+          "ASG_bias": 0.0,
+          "mlp_cov": 2.0924708535916745e-05,
+          "mlp_opacity": 0.0,
+          "screen": 0.0,
+          "geometry_cosine_with_photo": 0.009545883851642185
+        }
+      },
+      "R_sharpen": {
+        "loss": 0.003170029493048787,
+        "norms": {
+          "offset": 0.0,
+          "scaling": 0.0,
+          "features": 0.0,
+          "B0": 8.486871033302733e-05,
+          "ASG_bias": 0.0,
+          "mlp_cov": 0.0,
+          "mlp_opacity": 0.0,
+          "screen": 0.0,
+          "geometry_cosine_with_photo": 0.0
+        }
+      },
+      "enhancement_guidance": {
+        "loss": 0.08602418750524521,
+        "norms": {
+          "offset": 0.0,
+          "scaling": 0.0018279529914578354,
+          "features": 0.0012374364334248238,
+          "B0": 0.0,
+          "ASG_bias": 0.0,
+          "mlp_cov": 0.009844466226191714,
+          "mlp_opacity": 0.01321878801978254,
+          "screen": 0.015017795523682211,
+          "geometry_cosine_with_photo": 0.025687162379556545
+        }
+      },
+      "enhancement_degree": {
+        "loss": 0.007600910495966673,
+        "norms": {
+          "offset": 0.0,
+          "scaling": 0.0014403707572532547,
+          "features": 0.0010833903411354969,
+          "B0": 0.0,
+          "ASG_bias": 0.0,
+          "mlp_cov": 0.004516593986058646,
+          "mlp_opacity": 0.014175996557381273,
+          "screen": 0.008295109858986467,
+          "geometry_cosine_with_photo": -0.01978912232959278
+        }
+      }
+    },
+    "depth_quantiles": [
+      2.1835873126983643,
+      2.3038456439971924,
+      5.165674686431885,
+      25.601499557495117,
+      26.815494537353516
+    ]
+  }
+]

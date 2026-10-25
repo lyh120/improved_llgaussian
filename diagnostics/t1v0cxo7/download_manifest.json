@@ -1,0 +1,23 @@
+{
+  "main_fixed_base_brightened.png": "/home/liuyuhao/ll_further/LL-Gaussian-sg/wandb/run-20261022_132241-t1v0cxo7/files/media/images/monitor/main/fixed/base_brightened_8126_ee8028cc8e3e796f3f60.png",
+  "main_fixed_enhanced.png": "/home/liuyuhao/ll_further/LL-Gaussian-sg/wandb/run-20261022_132241-t1v0cxo7/files/media/images/monitor/main/fixed/enhanced_8126_80ee2780e46ad4a878e4.png",
+  "main_fixed_reflectance.png": "/home/liuyuhao/ll_further/LL-Gaussian-sg/wandb/run-20261022_132241-t1v0cxo7/files/media/images/monitor/main/fixed/reflectance_8126_55a85c4914a84c043268.png",
+  "main_fixed_illumination_enhanced.png": "/home/liuyuhao/ll_further/LL-Gaussian-sg/wandb/run-20261022_132241-t1v0cxo7/files/media/images/monitor/main/fixed/illumination_enhanced_8126_ba866be33b4e2c376ccb.png",
+  "main_fixed_coverage.png": "/home/liuyuhao/ll_further/LL-Gaussian-sg/wandb/run-20261022_132241-t1v0cxo7/files/media/images/monitor/main/fixed/coverage_8126_ee7d3fb1e202702092a2.png",
+  "main_fixed_gt_lowlight.png": "/home/liuyuhao/ll_further/LL-Gaussian-sg/wandb/run-20261022_132241-t1v0cxo7/files/media/images/monitor/main/fixed/gt_lowlight_8126_b90fbf64a91d2315cd09.png",
+  "main_random_base_brightened.png": "/home/liuyuhao/ll_further/LL-Gaussian-sg/wandb/run-20261022_132241-t1v0cxo7/files/media/images/monitor/main/random/base_brightened_8126_d8316f0ca76be20b8b0a.png",
+  "main_random_enhanced.png": "/home/liuyuhao/ll_further/LL-Gaussian-sg/wandb/run-20261022_132241-t1v0cxo7/files/media/images/monitor/main/random/enhanced_8126_b7cbe4c317610e2aeb62.png",
+  "main_random_reflectance.png": "/home/liuyuhao/ll_further/LL-Gaussian-sg/wandb/run-20261022_132241-t1v0cxo7/files/media/images/monitor/main/random/reflectance_8126_32423fde367aab5a01b6.png",
+  "main_random_illumination_enhanced.png": "/home/liuyuhao/ll_further/LL-Gaussian-sg/wandb/run-20261022_132241-t1v0cxo7/files/media/images/monitor/main/random/illumination_enhanced_8126_5e3968c413b31b848310.png",
+  "main_random_cidnet_target.png": "/home/liuyuhao/ll_further/LL-Gaussian-sg/wandb/run-20261022_132241-t1v0cxo7/files/media/images/monitor/main/random/cidnet_target_8126_67a8413ecb4301ced988.png",
+  "main_random_coverage.png": "/home/liuyuhao/ll_further/LL-Gaussian-sg/wandb/run-20261022_132241-t1v0cxo7/files/media/images/monitor/main/random/coverage_8126_0cb29589b36575fb1bfc.png",
+  "warmup_fixed_base_brightened.png": "/home/liuyuhao/ll_further/LL-Gaussian-sg/wandb/run-20261022_132241-t1v0cxo7/files/media/images/monitor/warmup/fixed/base_brightened_1816_72e46221cec87ed2f0a4.png",
+  "warmup_fixed_reflectance.png": "/home/liuyuhao/ll_further/LL-Gaussian-sg/wandb/run-20261022_132241-t1v0cxo7/files/media/images/monitor/warmup/fixed/reflectance_1816_1538d971fc30b7305a28.png",
+  "warmup_fixed_coverage.png": "/home/liuyuhao/ll_further/LL-Gaussian-sg/wandb/run-20261022_132241-t1v0cxo7/files/media/images/monitor/warmup/fixed/coverage_1816_93da1e65e1026e87a74f.png",
+  "high_IMG_1.png": "/home/liuyuhao/ll_further/LL-Gaussian-sg/datasets/LLRS2/chair/high/IMG_1.png",
+  "high_IMG_23.png": "/home/liuyuhao/ll_further/LL-Gaussian-sg/datasets/LLRS2/chair/high/IMG_23.png",
+  "old_LLRS_render_enhanceds.png": "/home/liuyuhao/ll_further/LL-Gaussian-sg/experiments/chair_asg_stablesr_residual_6k_20261022_113448/test/ours_6000/render_enhanceds/IMG_1.png",
+  "old_LLRS_render_reflectances.png": "/home/liuyuhao/ll_further/LL-Gaussian-sg/experiments/chair_asg_stablesr_residual_6k_20261022_113448/test/ours_6000/render_reflectances/IMG_1.png",
+  "old_LLRS_renders.png": "/home/liuyuhao/ll_further/LL-Gaussian-sg/experiments/chair_asg_stablesr_residual_6k_20261022_113448/test/ours_6000/renders/IMG_1.png",
+  "old_LLRS_render_illuminations.png": "/home/liuyuhao/ll_further/LL-Gaussian-sg/experiments/chair_asg_stablesr_residual_6k_20261022_113448/test/ours_6000/render_illuminations/IMG_1.png"
+}

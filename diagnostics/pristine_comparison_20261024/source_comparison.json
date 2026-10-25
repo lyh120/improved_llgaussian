@@ -1,0 +1,158 @@
+{
+  "date": "2026-10-24",
+  "original_root": "E:\\NTIRE\\LL-Gaussian",
+  "current_root": "E:\\NTIRE\\LL-Gaussian-ref-sgs",
+  "original_head": "eb803b716a4edf79629bce86cd5f71252e58829d",
+  "current_head": "83d62cea72c50d1f42de7bdb0e05f8cbac589e57",
+  "current_branch": "asgplus2",
+  "original_status": "",
+  "files": [
+    {
+      "path": "train.py",
+      "original_lines": 1035,
+      "current_lines": 2084,
+      "added": 1224,
+      "removed": 175,
+      "equal": false
+    },
+    {
+      "path": "render.py",
+      "original_lines": 408,
+      "current_lines": 858,
+      "added": 481,
+      "removed": 31,
+      "equal": false
+    },
+    {
+      "path": "arguments/__init__.py",
+      "original_lines": 200,
+      "current_lines": 403,
+      "added": 203,
+      "removed": 0,
+      "equal": false
+    },
+    {
+      "path": "gaussian_renderer/__init__.py",
+      "original_lines": 920,
+      "current_lines": 1160,
+      "added": 313,
+      "removed": 73,
+      "equal": false
+    },
+    {
+      "path": "scene/gaussian_model.py",
+      "original_lines": 1425,
+      "current_lines": 2802,
+      "added": 1529,
+      "removed": 152,
+      "equal": false
+    },
+    {
+      "path": "scene/__init__.py",
+      "original_lines": 139,
+      "current_lines": 144,
+      "added": 23,
+      "removed": 18,
+      "equal": false
+    },
+    {
+      "path": "scene/dataset_readers.py",
+      "original_lines": 369,
+      "current_lines": 387,
+      "added": 32,
+      "removed": 14,
+      "equal": false
+    },
+    {
+      "path": "scene/cameras.py",
+      "original_lines": 76,
+      "current_lines": 76,
+      "added": 0,
+      "removed": 0,
+      "equal": true
+    },
+    {
+      "path": "utils/camera_utils.py",
+      "original_lines": 273,
+      "current_lines": 273,
+      "added": 0,
+      "removed": 0,
+      "equal": true
+    },
+    {
+      "path": "utils/pose_utils.py",
+      "original_lines": 631,
+      "current_lines": 631,
+      "added": 0,
+      "removed": 0,
+      "equal": true
+    },
+    {
+      "path": "utils/graphics_utils.py",
+      "original_lines": 96,
+      "current_lines": 96,
+      "added": 0,
+      "removed": 0,
+      "equal": true
+    },
+    {
+      "path": "utils/loss_utils.py",
+      "original_lines": 332,
+      "current_lines": 582,
+      "added": 292,
+      "removed": 42,
+      "equal": false
+    },
+    {
+      "path": "utils/StableSR_utlis.py",
+      "original_lines": 315,
+      "current_lines": 328,
+      "added": 17,
+      "removed": 4,
+      "equal": false
+    },
+    {
+      "path": "configs/config.gin",
+      "original_lines": 17,
+      "current_lines": 17,
+      "added": 0,
+      "removed": 0,
+      "equal": true
+    }
+  ],
+  "extensions": [
+    {
+      "directory": "submodules/diff-gaussian-rasterization",
+      "original_count": 14,
+      "current_count": 14,
+      "changed": [],
+      "only_original": [],
+      "only_current": []
+    },
+    {
+      "directory": "submodules/diff-gaussian-rasterization-fast",
+      "original_count": 14,
+      "current_count": 14,
+      "changed": [],
+      "only_original": [],
+      "only_current": []
+    },
+    {
+      "directory": "submodules/diff-gaussian-rasterization-residual",
+      "original_count": 16,
+      "current_count": 16,
+      "changed": [],
+      "only_original": [],
+      "only_current": []
+    },
+    {
+      "directory": "submodules/simple-knn",
+      "original_count": 7,
+      "current_count": 7,
+      "changed": [],
+      "only_original": [],
+      "only_current": []
+    }
+  ],
+  "scope": "Disk source comparison; no training or compiled-extension validation"
+}

@@ -40,7 +40,7 @@ import torchvision.transforms.functional as tf
 
 sys.modules['torchvision.transforms.functional_tensor'] = tf
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.append("./submodules/Depth-Anything-V2")
+sys.path.append(os.path.join(PROJECT_ROOT, "submodules", "Depth-Anything-V2"))
 
 # from lpipsPyTorch import lpips
 import lpips
@@ -51,6 +51,10 @@ from gaussian_renderer import prefilter_voxel, render, network_gui
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
 from utils.composition_utils import compose_decomposed_render
+from utils.depth_utils import relative_depth_supervision
+from utils.prior_utils import find_source_image, load_rgb_prior, prepare_stablesr_prior, resolve_cached_prior
+from utils.reflectance_utils import reflectance_config
+from utils.training_policy import prepare_warmup_args, residual_stage_state, validate_training_args
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr, Camera_Reprojection, Camera_Reprojection_inverse
@@ -74,7 +78,6 @@ except ImportError:
     PipelineParams = arguments_module.PipelineParams
     OptimizationParams = arguments_module.OptimizationParams
 
-from depth_anything_v2.dpt import DepthAnythingV2
 lpips_fn = lpips.LPIPS(net='vgg').to('cuda')
 
 try:
@@ -101,30 +104,22 @@ ENHANCEMENT_PARAM_GROUP_NAMES = {
 }
 
 
-def depth_piror_Model():
+def depth_piror_Model(dataset):
+    from depth_anything_v2.dpt import DepthAnythingV2
+
     model_configs = {
         'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
         'vitb': {'encoder': 'vitb', 'features': 128, 'out_channels': [96, 192, 384, 768]},
         'vitl': {'encoder': 'vitl', 'features': 256, 'out_channels': [256, 512, 1024, 1024]},
         'vitg': {'encoder': 'vitg', 'features': 384, 'out_channels': [1536, 1536, 1536, 1536]}
     }
-    model_encoder = 'vitl'
+    model_encoder = dataset.depth_prior_encoder
     depth_anything = DepthAnythingV2(**model_configs[model_encoder])
-    depth_anything.load_state_dict(torch.load(f'./checkpoints/depth_anything_v2_{model_encoder}.pth', map_location='cpu'))
-    depth_anything = depth_anything.to('cuda').eval()
+    depth_anything.load_state_dict(torch.load(_resolve_project_path(dataset.depth_prior_checkpoint), map_location="cpu", weights_only=False))
+    depth_anything = depth_anything.to('cuda').eval().requires_grad_(False)
     return depth_anything
 
 
-
-def depth_piror_generator(model, scene):
-    depth_piror_dict = dict()
-    for camera in scene.getTrainCameras().copy():
-        gt_path = os.path.join(args.source_path,'images',camera.image_name+'.png')
-        gt_image = cv2.imread(gt_path)
-        depth_piror = model.infer_image(gt_image).unsqueeze(0)
-        idx = camera.uid
-        depth_piror_dict[idx] = depth_piror
-    return depth_piror_dict
 
 def saveRuntimeCode(dst: str) -> None:
     additionalIgnorePatterns = ['.git', '.gitignore']
@@ -230,11 +225,7 @@ def _resolve_project_path(path):
 
 
 def _find_source_image(images_dir, image_name):
-    for suffix in (".png", ".jpg", ".jpeg", ".JPG", ".bmp"):
-        candidate = os.path.join(images_dir, image_name + suffix)
-        if os.path.exists(candidate):
-            return os.path.basename(candidate)
-    raise FileNotFoundError(f"Could not find source image for {image_name} in {images_dir}")
+    return find_source_image(images_dir, ".", image_name).name
 
 
 def _write_cidnet_manifest(dataset, cameras, prior_root):
@@ -272,26 +263,11 @@ def _cidnet_round_complete(round_dir, cameras):
         return False
     if not os.path.exists(os.path.join(round_dir, "params.json")):
         return False
-    return all(os.path.exists(os.path.join(image_dir, camera.image_name + ".png")) for camera in cameras)
+    return all(resolve_cached_prior(image_dir, camera, name_first=True) is not None for camera in cameras)
 
 
 def load_cidnet_prior_round(round_dir, cameras):
-    image_dir = os.path.join(round_dir, "images")
-    refined_images = {}
-    missing = []
-    for camera in cameras:
-        candidates = [
-            os.path.join(image_dir, camera.image_name + ".png"),
-            os.path.join(image_dir, f"{camera.uid}.png"),
-        ]
-        image_path = next((path for path in candidates if os.path.exists(path)), None)
-        if image_path is None:
-            missing.append(camera.image_name)
-            continue
-        refined_images[camera.uid] = tf.to_tensor(Image.open(image_path).convert("RGB"))
-    if missing:
-        raise FileNotFoundError(f"CIDNet prior round is missing images: {missing[:5]} from {image_dir}")
-    return refined_images
+    return load_rgb_prior(os.path.join(round_dir, "images"), cameras, name_first=True)
 
 
 def _stablesr_prior_dir(dataset, enhance_ratio):
@@ -299,62 +275,15 @@ def _stablesr_prior_dir(dataset, enhance_ratio):
 
 
 def _stablesr_round_complete(prior_dir, cameras):
-    if not os.path.isdir(prior_dir):
-        return False
-    return all(os.path.exists(os.path.join(prior_dir, f"{camera.uid}.png")) for camera in cameras)
+    return all(resolve_cached_prior(prior_dir, camera) is not None for camera in cameras)
 
 
 def load_stablesr_prior(prior_dir, cameras):
-    refined_images = {}
-    missing = []
-    for camera in cameras:
-        candidates = [
-            os.path.join(prior_dir, f"{camera.uid}.png"),
-            os.path.join(prior_dir, camera.image_name + ".png"),
-        ]
-        image_path = next((path for path in candidates if os.path.exists(path)), None)
-        if image_path is None:
-            missing.append(camera.image_name)
-            continue
-        refined_images[camera.uid] = tf.to_tensor(Image.open(image_path).convert("RGB"))
-    if missing:
-        raise FileNotFoundError(f"StableSR prior is missing images: {missing[:5]} from {prior_dir}")
-    return refined_images
+    return load_rgb_prior(prior_dir, cameras)
 
 
 def build_or_load_stablesr_prior(dataset, cameras, enhance_ratio, logger=None):
-    prior_dir = _stablesr_prior_dir(dataset, enhance_ratio)
-    os.makedirs(prior_dir, exist_ok=True)
-    if _stablesr_round_complete(prior_dir, cameras):
-        if logger is not None:
-            logger.info(f"[INFO] Loading existing StableSR prior images from {prior_dir}")
-        return load_stablesr_prior(prior_dir, cameras)
-
-    if logger is not None:
-        logger.info(f"[INFO] Generating StableSR prior images in {prior_dir}")
-
-    stablesr_root = os.path.join(PROJECT_ROOT, "submodules", "StableSR")
-    if stablesr_root not in sys.path:
-        sys.path.append(stablesr_root)
-    from utils.StableSR_utlis import SD_refine, get_SRModel
-
-    sd_model, vq_model, sd_opt = get_SRModel()
-    refined_images = {}
-    try:
-        for camera in tqdm(cameras, desc="StableSR prior"):
-            input_image = torch.clamp(camera.original_image.cuda() * enhance_ratio, 0.0, 1.0)
-            refined = SD_refine(sd_model, vq_model, input_image.unsqueeze(0), sd_opt)
-            refined = torch.clamp(refined.detach().cpu(), 0.0, 1.0)
-            refined_images[camera.uid] = refined
-            torchvision.utils.save_image(refined, os.path.join(prior_dir, f"{camera.uid}.png"))
-    finally:
-        sd_model.cpu()
-        vq_model.cpu()
-        del sd_model
-        del vq_model
-        torch.cuda.empty_cache()
-
-    return refined_images
+    return prepare_stablesr_prior(dataset, cameras, enhance_ratio, logger)
 
 
 def log_cidnet_round_stats(round_dir, logger=None):
@@ -520,21 +449,25 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
 
     gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
                               dataset.appearance_residual_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_reflectance_dist, dataset.add_illumination_dist, dataset.add_residual_dist, dataset.use_residual, dataset.use_dual_transient, dataset.use_3D_filter,
-                              use_sg_illumination=dataset.use_sg_illumination, use_asg_illumination=dataset.use_asg_illumination, illumination_mode=dataset.illumination_mode, reflectance_mode=dataset.reflectance_mode, sg_lobes=dataset.sg_lobes, sg_lambda_min=dataset.sg_lambda_min, asg_lobes=dataset.asg_lobes, asg_lambda_min=dataset.asg_lambda_min)
-    depth_piror_model = depth_piror_Model()
+                              use_sg_illumination=dataset.use_sg_illumination, use_asg_illumination=dataset.use_asg_illumination, illumination_mode=dataset.illumination_mode, reflectance_mode=dataset.reflectance_mode, sg_lobes=dataset.sg_lobes, sg_lambda_min=dataset.sg_lambda_min, asg_lobes=dataset.asg_lobes, asg_lambda_min=dataset.asg_lambda_min, reflectance_settings=reflectance_config(dataset))
+    depth_piror_model = depth_piror_Model(dataset)
     if mode == "warmuped":
         scene = Scene(dataset, gaussians, depth_piror_model, ply_path=ply_path, shuffle=False, load_iteration=-1, only_ply=False)
         gaussians.train()
     elif mode == "train" or mode == "warmup":
         scene = Scene(dataset, gaussians, depth_piror_model, ply_path=ply_path, shuffle=False)
     depth_piror_dict = scene.depth_piror_dict
+    depth_piror_model.cpu()
+    scene.depth_piror_model = None
+    del depth_piror_model
+    torch.cuda.empty_cache()
     gaussians.training_setup(opt)
 
     train_cams_init = scene.getTrainCameras().copy()
     os.makedirs(scene.model_path + '/pose', exist_ok=True)
     save_pose(scene.model_path + '/pose' + "/pose_org.npy", gaussians.P, train_cams_init)
     if checkpoint:
-        (model_params, first_iter) = torch.load(checkpoint)
+        (model_params, first_iter) = torch.load(checkpoint, weights_only=False)
         gaussians.restore(model_params, opt)
 
     iter_start = torch.cuda.Event(enable_timing = True)
@@ -558,7 +491,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     if mode=="warmup":
         gaussians.P.requires_grad_(False)
 
-    weight_scheduler = LinearDecayWeight(initial_weight=2, final_weight=1.0,total_steps=opt.iterations)
+    weight_scheduler = LinearDecayWeight(
+        initial_weight=dataset.residual_reg_initial_weight,
+        final_weight=dataset.residual_reg_final_weight, total_steps=opt.iterations,
+    )
     weight_scheduler2 = LinearDecayWeight(initial_weight=5e-4, final_weight=1e-3,total_steps=opt.update_until)
 
     if mode == "warmup":
@@ -607,19 +543,23 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
     for cam in cams:
         means += cam.original_image.mean(dim=(1,2))
     mean = (means / len(cams)).mean()
-    enhance_ratio = max(1, int(0.45 / mean))
+    enhance_ratio = max(1, int(dataset.enhancement_target_mean / mean.clamp_min(torch.finfo(mean.dtype).eps)))
     first_iter += 1
     # Statistics are reinitialized after loading a warmup checkpoint, so the
     # prune grace period starts at the current training stage rather than at
     # global iteration zero.
-    gaussians.anchor_birth_iteration.fill_(first_iter)
+    if not checkpoint:
+        gaussians.anchor_birth_iteration.fill_(first_iter)
 
     cidnet_prior_root = os.path.join(dataset.source_path, "cidnet_prior")
     cidnet_manifest_path = None
     cidnet_images_dir = None
-    cidnet_round_idx = 0
+    prior_state = getattr(gaussians, "training_prior_state", {})
+    if prior_state.get("provider") != dataset.enhancement_prior or dataset.cidnet_force_refresh:
+        prior_state = {}
+    cidnet_round_idx = prior_state.get("cidnet_round_idx", 0)
     cidnet_round_dir = _cidnet_round_dir(cidnet_prior_root, cidnet_round_idx)
-    last_cidnet_refresh_iter = first_iter - 1
+    last_cidnet_refresh_iter = prior_state.get("last_cidnet_refresh_iter", first_iter - 1)
     if mode != "warmup":
         if dataset.enhancement_prior == "cidnet":
             if dataset.cidnet_force_refresh and os.path.isdir(cidnet_prior_root):
@@ -747,6 +687,13 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             retain_grad=retain_grad,
             camera_pose=pose,
             return_coverage=(iteration % 100 == 0),
+            return_reflectance_aux=any(weight > 0 for weight in (
+                dataset.reflectance_edge_uplift_reg, dataset.reflectance_contrast_reg,
+                dataset.reflectance_highfreq_reg,
+            )),
+            return_training_depth=(dataset.depth_loss_weight > 0 and iteration >= (
+                opt.warmup_update_from if mode == "warmup" else opt.update_from
+            )),
         )
         timing_stats['render_time'] = timing_stats.get('render_time', 0) + (time.time() - t1)
 
@@ -765,11 +712,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             else torch.tensor(0.0, device=gt_image.device)
         )
 
-        residual_active = dataset.use_residual and mode != "warmup" and iteration >= opt.residual_start_iter
-        residual_mix_weight = 0.0
-        if residual_active:
-            ramp_iters = max(1, opt.residual_ramp_iters)
-            residual_mix_weight = min(1.0, float(iteration - opt.residual_start_iter + 1) / float(ramp_iters))
+        residual_active, residual_mix_weight = residual_stage_state(
+            dataset.use_residual, dataset.use_dual_transient, mode, iteration,
+            opt.residual_start_iter, opt.residual_ramp_iters,
+        )
         noise_mask = torch.zeros_like(gt_image[:1])
         artifact_mask = torch.zeros_like(gt_image[:1])
         noise_mask_coverage = torch.tensor(0.0, device=gt_image.device)
@@ -837,7 +783,13 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         ) * illumination_smooth_reg
         L_illu = L_Illu(gt_image, illumination_image) 
         L_reflectance_smooth = L_Reflectance_Smooth(reflectance_image, illumination_image) * dataset.reflectance_smooth_reg
-        L_depth_similarity = (L_Depth_similarity(1 - minmax_normalize(depth_image).squeeze(0), depth_piror_norm.squeeze(0), 128, 0.5) ) * 0.15
+        L_depth_similarity = depth_image.sum() * 0.0
+        if render_pkg["render_depth_for_loss"] is not None:
+            L_depth_similarity = dataset.depth_loss_weight * relative_depth_supervision(
+                render_pkg["render_depth_for_loss"], depth_piror_norm,
+                render_pkg["render_depth_coverage"], dataset.depth_patch_size,
+                dataset.depth_sample_fraction,
+            )
         
         if FUSED_SSIM_AVAILABLE:
             ssim_loss = fused_ssim(image_tmp.unsqueeze(0), gt_image.unsqueeze(0))
@@ -853,9 +805,23 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         L_asg_anisotropy = L_ASG_Anisotropy(illumination_stats)
         L_reflectance_consistency = L_Reflectance_Consistency(reflectance_image)
         L_reflectance_edge = L_Reflectance_Edge(reflectance_image, gt_image)
-        L_reflectance_edge_uplift = L_Reflectance_Edge_Uplift(reflectance_image, gt_image)
-        L_reflectance_contrast = L_Reflectance_LocalContrast(reflectance_image, gt_image)
-        L_reflectance_highfreq = L_Reflectance_HighFreq(reflectance_image, gt_image)
+        reflectance_aux_image = render_pkg["render_reflectance_aux"]
+        L_reflectance_edge_uplift = reflectance_image.new_zeros(())
+        L_reflectance_contrast = reflectance_image.new_zeros(())
+        L_reflectance_highfreq = reflectance_image.new_zeros(())
+        if reflectance_aux_image is not None:
+            L_reflectance_edge_uplift = L_Reflectance_Edge_Uplift(
+                reflectance_aux_image, gt_image, dataset.reflectance_edge_uplift_threshold,
+                dataset.reflectance_edge_uplift_target_ratio,
+            )
+            L_reflectance_contrast = L_Reflectance_LocalContrast(
+                reflectance_aux_image, gt_image, dataset.reflectance_contrast_threshold,
+                dataset.reflectance_contrast_target_ratio, dataset.reflectance_contrast_window_size,
+            )
+            L_reflectance_highfreq = L_Reflectance_HighFreq(
+                reflectance_aux_image, gt_image, dataset.reflectance_highfreq_threshold,
+                dataset.reflectance_highfreq_target_ratio,
+            )
         L_reflectance_highlight = L_Reflectance_Highlight(reflectance_image)
         L_b0_spatial_smooth = L_B0_Spatial_Smooth(gaussians._base_log_reflectance, gaussians.get_anchor)
         L_reflectance_detail = torch.mean(torch.abs(torch.tanh(gaussians._reflectance_offset_delta)))
@@ -941,7 +907,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                         L_Smooth(
                             illumination_enhanced_image / enhance_ratio,
                             gt_image,
-                            kernel_size=dataset.illumination_smooth_kernel_size,
+                            kernel_size=(dataset.enhancement_smooth_kernel_size
+                                         or dataset.illumination_smooth_kernel_size),
                         )
                         * dataset.enhancement_smooth_reg
                     )
@@ -1556,6 +1523,11 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
                 gaussians.optimizer.zero_grad(set_to_none = True)
             if (iteration in checkpoint_iterations):
                 logger.info("\n[ITER {}] Saving Checkpoint".format(iteration))
+                gaussians.training_prior_state = {
+                    "provider": dataset.enhancement_prior,
+                    "cidnet_round_idx": cidnet_round_idx,
+                    "last_cidnet_refresh_iter": last_cidnet_refresh_iter,
+                }
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
            
             timing_stats['total_time'] = timing_stats.get('total_time', 0) + (time.time() - t0)
@@ -1870,8 +1842,8 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
 def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train=False, skip_test=False, wandb=None, tb_writer=None, dataset_name=None, logger=None):
     gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
-                              dataset.appearance_residual_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_reflectance_dist, dataset.add_illumination_dist, dataset.add_residual_dist, dataset.use_residual, dataset.use_dual_transient, dataset.use_3D_filter,
-                              use_sg_illumination=dataset.use_sg_illumination, use_asg_illumination=dataset.use_asg_illumination, illumination_mode=dataset.illumination_mode, reflectance_mode=dataset.reflectance_mode, sg_lobes=dataset.sg_lobes, sg_lambda_min=dataset.sg_lambda_min, asg_lobes=dataset.asg_lobes, asg_lambda_min=dataset.asg_lambda_min)
+                              dataset.appearance_residual_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_reflectance_dist, dataset.add_illumination_dist, dataset.add_residual_dist, False, False, dataset.use_3D_filter,
+                              use_sg_illumination=dataset.use_sg_illumination, use_asg_illumination=dataset.use_asg_illumination, illumination_mode=dataset.illumination_mode, reflectance_mode=dataset.reflectance_mode, sg_lobes=dataset.sg_lobes, sg_lambda_min=dataset.sg_lambda_min, asg_lobes=dataset.asg_lobes, asg_lambda_min=dataset.asg_lambda_min, reflectance_settings=reflectance_config(dataset))
     scene = Scene(dataset, gaussians, depth_piror_model=None, load_iteration=iteration, shuffle=False)
     gaussians.eval()
 
@@ -2020,10 +1992,9 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str)
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
-    if args.use_residual:
-        print("[deprecated] --use_residual is ignored; new training always uses the residual-free primary renderer.")
-    args.use_residual = False
-    args.use_dual_transient = False
+    validate_training_args(args)
+    print("Training residual mode:", "dual transient" if args.use_dual_transient else
+          "LL-Gaussian single residual" if args.use_residual else "disabled")
 
     
     # enable logging
@@ -2090,17 +2061,8 @@ if __name__ == "__main__":
     # training
 
     if args.warmup:
-        import copy
-        args_warmup = copy.deepcopy(args)
-        args_warmup.iterations = 2000
-        args_warmup.save_iterations.append(args_warmup.iterations)
-        # Initial geometry must be complete.  Any scene-specific prune_ratio
-        # is intentionally deferred; the main stage reloads this full warmup PLY.
-        args_warmup.prune_ratio = 1.0
+        args_warmup = prepare_warmup_args(args)
         print(args.warmup)
-        args_warmup.offset_lr_init = 0.0001
-        args_warmup.opacity_lr = 0.1
-        args_warmup.mlp_color_lr_init = 0.1
         training(lp.extract(args_warmup), op.extract(args_warmup), pp.extract(args_warmup), dataset,  args_warmup.test_iterations, args_warmup.save_iterations, args_warmup.checkpoint_iterations, args_warmup.start_checkpoint, args_warmup.debug_from, wandb, logger, mode="warmup")
         logger.info("\n Warmup finished! Reboot from last checkpoints")
         new_ply_path = os.path.join(args.model_path, f'point_cloud/iteration_{args_warmup.iterations}', 'point_cloud.ply')

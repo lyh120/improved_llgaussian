@@ -22,6 +22,7 @@ from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
 import cv2
 from utils.visualize_utils import minmax_normalize, visualize_anchor
 from utils.pose_utils import load_pose
+from utils.depth_utils import generate_depth_priors
 
 
 try:
@@ -118,14 +119,14 @@ class Scene:
                 pose = load_pose(os.path.join(self.model_path, "pose", f"pose_{self.loaded_iter}.npy"))
                 self.gaussians.P = pose
         else:
-            self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent, num_sky_gaussians=1000, cameras=self.getTestCameras(),model_path=self.model_path, prune_ratio=args.prune_ratio, beta=args.beta)
+            self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent, num_sky_gaussians=1000, cameras=self.getTrainCameras(),model_path=self.model_path, prune_ratio=args.prune_ratio, beta=args.beta)
             print(f'self.gaussians.get_anchor.shape: {self.gaussians.get_anchor.shape}')
         
 ####
             self.gaussians.init_RT_seq(self.train_cameras)
 ####
         if self.depth_piror_model:
-            self.depth_piror_dict = self.depth_piror_generator(args.source_path)
+            self.depth_piror_dict = self.depth_piror_generator(args.source_path, args.images)
 
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
@@ -138,24 +139,6 @@ class Scene:
     def getTestCameras(self, scale=1.0):
         return self.test_cameras[scale]
     
-    def depth_piror_generator(self, source_path):
-        depth_piror_dict = dict()
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        for camera in self.getTrainCameras().copy():
-            gt_path = os.path.join(source_path, 'images', camera.image_name + '.*')
-            import glob
-            gt_path = glob.glob(gt_path)[0]
-            gt_image = cv2.imread(gt_path)
-            depth_piror = self.depth_piror_model.infer_image(gt_image)
-            if not isinstance(depth_piror, torch.Tensor):
-                depth_piror = torch.as_tensor(depth_piror, dtype=torch.float32)
-            else:
-                depth_piror = depth_piror.float()
-            if depth_piror.ndim == 2:
-                depth_piror = depth_piror.unsqueeze(0)
-            depth_piror = depth_piror.to(device)
-            idx = camera.uid
-            depth_piror_dict[idx] = minmax_normalize(depth_piror)
-        return depth_piror_dict
-    
-
+    def depth_piror_generator(self, source_path, images="images"):
+        """Build detached, camera-aligned priors from training images only."""
+        return generate_depth_priors(self.depth_piror_model, self.getTrainCameras(), source_path, images)

@@ -47,6 +47,7 @@ from utils.artifact_utils import (
     summarize_detail_diagnostics,
 )
 from utils.composition_utils import compose_decomposed_render
+from utils.reflectance_utils import reflectance_config
 
 from argparse import ArgumentParser
 from gaussian_renderer import GaussianModel
@@ -731,7 +732,7 @@ def render_sets(
 
         gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
                               dataset.appearance_residual_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_reflectance_dist, dataset.add_illumination_dist, dataset.add_residual_dist, dataset.use_residual, dataset.use_dual_transient, dataset.use_3D_filter,
-                              use_sg_illumination=use_sg_illumination, use_asg_illumination=use_asg_illumination, illumination_mode=illumination_mode, reflectance_mode=reflectance_mode, sg_lobes=sg_lobes, sg_lambda_min=sg_lambda_min, asg_lobes=asg_lobes, asg_lambda_min=asg_lambda_min)
+                              use_sg_illumination=use_sg_illumination, use_asg_illumination=use_asg_illumination, illumination_mode=illumination_mode, reflectance_mode=reflectance_mode, sg_lobes=sg_lobes, sg_lambda_min=sg_lambda_min, asg_lobes=asg_lobes, asg_lambda_min=asg_lambda_min, reflectance_settings=reflectance_config(dataset))
         scene = Scene(dataset, gaussians, depth_piror_model=None, load_iteration=iteration, shuffle=False)
         
         gaussians.eval()
@@ -833,7 +834,7 @@ if __name__ == "__main__":
 
     args = get_combined_args(parser)
     if args.use_residual:
-        print("[deprecated] checkpoint residual fields are ignored; rendering uses the residual-free primary path.")
+        print("Training residual is excluded from the final primary render.")
     args.use_residual = False
     args.use_dual_transient = False
     if args.dataset_path:

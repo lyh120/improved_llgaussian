@@ -93,7 +93,7 @@ def chunk(it, size):
 
 def load_model_from_config(config, ckpt, verbose=False):
 	print(f"Loading model from {ckpt}")
-	pl_sd = torch.load(ckpt, map_location="cpu")
+	pl_sd = torch.load(ckpt, map_location="cpu", weights_only=False)
 	if "global_step" in pl_sd:
 		print(f"Global Step: {pl_sd['global_step']}")
 	sd = pl_sd["state_dict"]
@@ -150,9 +150,20 @@ class Config:
         self.C = C
         self.f = f
 
-def get_SRModel():
-	gin.parse_config_file('./configs/config.gin')
+def get_SRModel(config_path=None):
+	"""Load the frozen StableSR models using project-relative configuration paths."""
+	project_root = Path(__file__).resolve().parents[1]
+	config_path = Path(config_path or project_root / 'configs' / 'config.gin')
+	if not config_path.is_absolute():
+		config_path = project_root / config_path
+	gin.clear_config()
+	gin.parse_config_file(str(config_path))
 	opt = Config()
+	for key in ('config', 'ckpt', 'vqgan_ckpt'):
+		value = Path(getattr(opt, key))
+		if not value.is_absolute():
+			value = project_root / value
+		setattr(opt, key, str(value))
 
 	seed_everything(opt.seed)
 
@@ -172,7 +183,7 @@ def get_SRModel():
 
 	model.configs = config
 
-	vqgan_config = OmegaConf.load("./StableSR/configs/autoencoder/autoencoder_kl_64x64x4_resi.yaml")
+	vqgan_config = OmegaConf.load(str(project_root / 'submodules' / 'StableSR' / 'configs' / 'autoencoder' / 'autoencoder_kl_64x64x4_resi.yaml'))
 	vq_model = load_model_from_config(vqgan_config, opt.vqgan_ckpt)
 	vq_model = vq_model.to(device)
 	vq_model.decoder.fusion_w = opt.dec_w
@@ -180,6 +191,8 @@ def get_SRModel():
 
 
 
+	model.eval().requires_grad_(False)
+	vq_model.eval().requires_grad_(False)
 	return model, vq_model, opt
 
 def SD_refine(model, vq_model, input_image, sd_opt):
